@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# heart
+runs/
+episodes.jsonl
+
+# local integration runtimes (installed per-machine, never committed)
+.arteries/
+.marrow/
+.claude/settings.local.json
