@@ -1,8 +1,8 @@
 """Mine TaskSpecs from a repo's git history: commits that touched both tests and
-source, where the tests already existed at the parent commit.
-
-ponytail: commits that *introduce* tests are skipped — porting new tests back to
-the base commit is SWE-bench machinery, add when mined-task volume runs dry.
+source. The fix-commit versions of the test files are pinned into the task as
+overlay_files (SWE-bench's port-tests-back step) — without this, the base
+checkout carries the *old* tests, which pass against the old code, and the task
+scores a no-op diff as a pass. Pinning also admits commits that introduce tests.
 """
 from __future__ import annotations
 
@@ -48,14 +48,10 @@ def mine(
             parent = _git(repo, "rev-parse", f"{sha}^").strip()
         except RuntimeError:
             continue  # root commit
-        exists_at_parent = all(
-            subprocess.run(
-                ["git", "-C", repo, "cat-file", "-e", f"{parent}:{f}"], capture_output=True
-            ).returncode == 0
-            for f in tests
-        )
-        if not exists_at_parent:
-            continue
+        try:
+            overlay = {f: _git(repo, "show", f"{sha}:{f}") for f in tests}
+        except RuntimeError:
+            continue  # test deleted by the commit — nothing to pin
 
         subject = _git(repo, "show", "-s", "--format=%s", sha).strip()
         task_id = f"mined-{Path(repo).name}-{sha[:10]}"
@@ -70,6 +66,7 @@ def mine(
                 f"Do not modify the test files."
             ),
             "denied_paths": tests,
+            "overlay_files": overlay,
             "public_verifiers": [{"name": "tests", "command": test_cmd.format(files=" ".join(tests))}],
             "timeout_seconds": timeout_seconds,
             "tags": ["mined"],

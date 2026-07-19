@@ -40,7 +40,7 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
     at fix_commit if present (must pass). Flaky verifiers poison reward signal."""
     runs = []
     for _ in range(n):
-        ws = Workspace(task.repo_path, task.base_commit)
+        ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
         try:
             res = run_verifiers(task.public_verifiers, str(ws.path), task.timeout_seconds)
             runs.append({name: r["passed"] for name, r in res.items()})
@@ -50,18 +50,22 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
 
     fix_passes = None
     if task.fix_commit:
-        ws = Workspace(task.repo_path, task.fix_commit)
+        ws = Workspace(task.repo_path, task.fix_commit, overlay=task.overlay_files)
         try:
             res = run_verifiers(task.public_verifiers, str(ws.path), task.timeout_seconds)
             fix_passes = all(r["passed"] for r in res.values())
         finally:
             ws.destroy()
 
-    ok = deterministic and (fix_passes is not False)
+    # verifiers that already pass at base make the task worthless as signal:
+    # a no-op diff earns full reward
+    base_all_pass = bool(runs and runs[0] and all(runs[0].values()))
+    ok = deterministic and (fix_passes is not False) and not base_all_pass
     return {
         "task_id": task.task_id,
         "deterministic": deterministic,
         "base_results": runs[0] if runs else {},
+        "base_fails": not base_all_pass,
         "fix_passes": fix_passes,
         "ok": ok,
     }

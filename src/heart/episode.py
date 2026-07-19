@@ -184,7 +184,7 @@ def _run_episode(
          agent=agent, memory_mode=memory_mode, retrieval=retrieval,
          base_commit=task.base_commit[:12], fix_rounds=fix_rounds,
          pipeline=[r["name"] for r in roles] if roles else "solo")
-    ws = Workspace(task.repo_path, task.base_commit)
+    ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
     clean = None
     runs_log: list[dict] = []
     verify_rounds: list[dict] = []
@@ -257,7 +257,7 @@ def _run_episode(
         else:
             # verify on a clean worktree with only the agent's diff applied —
             # leftover workspace state (edited tests, caches) can't game the verifier
-            clean = Workspace(task.repo_path, task.base_commit)
+            clean = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
             try:
                 clean.apply(diff)
             except RuntimeError:

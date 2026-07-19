@@ -60,6 +60,7 @@ take down the observed.
 | `turn.observed`, `memory.*`, `prompt.*`, `*.failed` | arteries/capillaries | runlog tee; `store: db\|jsonl` |
 | `decision.<type>` | arteries | chosen, available, cost, `store` |
 | `reward.<type>` | arteries | value, reward_source, `store` |
+| `training.started/progress/finished` | marrow | stage (sft/dpo/grpo), step, loss and other numeric trainer logs |
 | `goal.started/finished` | plexus | goal_id; outcome |
 | `plan.created/approved` | plexus | goal_id, feature count |
 | `feature.started/failed/landed` | plexus | goal_id, feature_id, reason, episode_ids |
