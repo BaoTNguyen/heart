@@ -24,6 +24,10 @@ class TaskSpec:
     denied_paths: list[str] = field(default_factory=list)
     public_verifiers: list[Verifier] = field(default_factory=list)
     hidden_verifiers: list[Verifier] = field(default_factory=list)
+    # files pinned into every workspace regardless of base_commit (path -> content):
+    # mined tasks pin the fix-commit's tests so they actually fail at base.
+    # Overlay paths are excluded from diffs, so agents can't edit them away.
+    overlay_files: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 300
     difficulty: str = "unknown"
     tags: list[str] = field(default_factory=list)

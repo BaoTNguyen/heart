@@ -23,11 +23,16 @@ def _run(args: list[str], cwd: str, input_text: str | None = None) -> subprocess
 
 
 class Workspace:
-    def __init__(self, repo_path: str, commit: str):
+    def __init__(self, repo_path: str, commit: str, overlay: dict[str, str] | None = None):
         self.repo_path = str(repo_path)
+        self.overlay = overlay or {}
         self.path = WS_ROOT / uuid.uuid4().hex[:12]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "worktree", "add", "--detach", str(self.path), commit], cwd=self.repo_path)
+        for rel, content in self.overlay.items():
+            target = self.path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
         for rel in INTEGRATION_FILES:
             src = Path(self.repo_path) / rel
             if src.exists() and not (self.path / rel).exists():
@@ -51,8 +56,9 @@ class Workspace:
     def diff(self) -> str:
         # intent-to-add so untracked files created by the agent show up in the diff
         _run(["git", "add", "-A", "-N"], cwd=str(self.path))
+        overlay_excludes = [f":(exclude){rel}" for rel in self.overlay]
         return _run(
-            ["git", "diff", "--binary", "--", ".", *self.DIFF_EXCLUDES],
+            ["git", "diff", "--binary", "--", ".", *self.DIFF_EXCLUDES, *overlay_excludes],
             cwd=str(self.path),
         ).stdout
 

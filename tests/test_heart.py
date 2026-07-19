@@ -191,6 +191,43 @@ class TestHeart(unittest.TestCase):
         finally:
             ws.destroy()
 
+    def test_mine_pins_fix_tests_as_overlay(self):
+        from heart.mine import mine
+        from heart.taskspec import load_task
+
+        # the trap: base code passes the base tests; the fix commit strengthens
+        # tests and code together. Without pinning the fix-commit tests, the
+        # mined task scores a no-op diff as a pass.
+        repo = self.root / "minerepo"
+        repo.mkdir()
+        weak = TEST.replace("add(2, 3), 5", "add(0, 0), 0")  # passes with a - b
+        (repo / "calc.py").write_text(BUGGY)
+        (repo / "test_calc.py").write_text(weak)
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git[:3], "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "weak"], check=True)
+        (repo / "calc.py").write_text(BUGGY.replace("a - b", "a + b"))
+        (repo / "test_calc.py").write_text(TEST)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "fix add and strengthen test"], check=True)
+
+        written = mine(str(repo), self.root / "mined",
+                       test_cmd="python3 -m unittest -q test_calc")
+        self.assertEqual(len(written), 1)
+        task = load_task(written[0])
+        self.assertIn("add(2, 3), 5", task.overlay_files["test_calc.py"])
+
+        verdict = check_task(task, n=1)
+        self.assertTrue(verdict["base_fails"])  # pinned tests fail at base
+        self.assertTrue(verdict["ok"])
+
+        ep = run_episode(TaskSpec(**{**task.__dict__, "prompt": FIX_CMD}),
+                         agent="shell", runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "pass")
+        diff = (self.runs / ep["episode_id"] / "diff.patch").read_text()
+        self.assertNotIn("test_calc", diff)  # overlay never leaks into the diff
+
     def test_review_reject_triggers_fix(self):
         roles = [
             {"name": "implement", "prompt": "{prompt}"},
