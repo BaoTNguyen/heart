@@ -221,6 +221,9 @@ __marimo__/
 runs/
 episodes.jsonl
 
+# mined tasks embed absolute local repo paths; regenerate with `heart mine`
+tasks/mined-*/
+
 # local integration runtimes (installed per-machine, never committed)
 .arteries/
 .marrow/
