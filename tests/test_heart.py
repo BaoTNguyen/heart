@@ -474,6 +474,18 @@ class TestSandbox(unittest.TestCase):
         self.assertEqual(cmd2[-3:], ["sh", "-c", "echo hi"])
         self.assertFalse(shell2)
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap not installed")
+    def test_wrap_mode_override_forces_nonet(self):
+        from heart.runner import sandbox_wrap
+
+        # HEART_SANDBOX=bwrap in the env, but an explicit mode= must win —
+        # this is how run_verifiers forces the no-network variant regardless
+        # of what agents are configured to use.
+        self.assertEqual(os.environ["HEART_SANDBOX"], "bwrap")
+        cmd, shell = sandbox_wrap(["true"], False, "/tmp/ws", {}, mode="bwrap-nonet")
+        self.assertFalse(shell)
+        self.assertIn("--unshare-net", cmd)
+
     @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
     def test_sandbox_blocks_stray_writes(self):
         from heart.runner import run_agent
@@ -484,6 +496,58 @@ class TestSandbox(unittest.TestCase):
             run_agent("shell", f"touch {marker}; touch {ws}/inside", ws, {}, 30, log)
             self.assertFalse(marker.exists())  # $HOME is read-only
             self.assertTrue((Path(ws) / "inside").exists())
+
+    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
+    def test_bwrap_nonet_blocks_network(self):
+        from heart.runner import sandbox_wrap
+
+        with tempfile.TemporaryDirectory() as ws:
+            cmd, shell = sandbox_wrap(
+                ["python3", "-c",
+                 "import socket; socket.create_connection(('1.1.1.1', 53), timeout=3)"],
+                False, ws, {}, mode="bwrap-nonet",
+            )
+            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
+            self.assertNotEqual(proc.returncode, 0)
+
+    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
+    def test_bwrap_hides_ssh(self):
+        from heart.runner import sandbox_wrap
+
+        ssh_dir = Path.home() / ".ssh"
+        if not ssh_dir.exists():
+            self.skipTest("no ~/.ssh on this host")
+        with tempfile.TemporaryDirectory() as ws:
+            cmd, shell = sandbox_wrap(
+                ["sh", "-c", f"ls -A {ssh_dir} | grep -q ."], False, ws, {}, mode="bwrap",
+            )
+            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
+            self.assertNotEqual(proc.returncode, 0)  # tmpfs-hidden: empty or unreadable
+
+    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
+    def test_bwrap_cwd_stays_writable(self):
+        from heart.runner import sandbox_wrap
+
+        with tempfile.TemporaryDirectory() as ws:
+            cmd, shell = sandbox_wrap(["touch", f"{ws}/probe"], False, ws, {}, mode="bwrap")
+            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
+            self.assertEqual(proc.returncode, 0)
+            self.assertTrue((Path(ws) / "probe").exists())
+
+    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
+    def test_bwrap_git_commit_works(self):
+        from heart.runner import sandbox_wrap
+
+        with tempfile.TemporaryDirectory() as ws:
+            git = ["git", "-C", ws, "-c", "user.name=t", "-c", "user.email=t@t"]
+            subprocess.run([*git[:3], "init", "-q"], check=True)
+            (Path(ws) / "file.txt").write_text("hello\n")
+            subprocess.run([*git, "add", "-A"], check=True)
+            cmd, shell = sandbox_wrap(
+                [*git, "commit", "-qm", "wip"], False, ws, {}, mode="bwrap",
+            )
+            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 class TestPulseServe(unittest.TestCase):

@@ -6,6 +6,7 @@ import subprocess
 import time
 
 from .env import Workspace
+from .runner import sandbox_wrap
 from .taskspec import TaskSpec, Verifier
 
 
@@ -14,12 +15,18 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str
     # agent fix loops) passes the pyc header's mtime+size check and Python
     # silently runs stale code — verifier results must never depend on that.
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    # Policy: agents get network, verifiers never do — when sandboxing is on
+    # at all, verifier subprocesses are always forced into bwrap-nonet.
+    sandboxed = os.environ.get("HEART_SANDBOX") in ("bwrap", "bwrap-nonet")
     results: dict[str, dict] = {}
     for v in verifiers:
         t0 = time.monotonic()
+        cmd, shell = v.command, True
+        if sandboxed:
+            cmd, shell = sandbox_wrap(v.command, True, cwd, {}, mode="bwrap-nonet")
         try:
             proc = subprocess.run(
-                v.command, shell=True, cwd=cwd, capture_output=True, text=True,
+                cmd, shell=shell, cwd=cwd, capture_output=True, text=True,
                 timeout=timeout, env=env,
             )
             passed, code = proc.returncode == 0, proc.returncode
