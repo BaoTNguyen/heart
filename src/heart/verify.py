@@ -14,7 +14,9 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str
     # No bytecode cache: a same-second same-size source edit (common in fast
     # agent fix loops) passes the pyc header's mtime+size check and Python
     # silently runs stale code — verifier results must never depend on that.
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    # HEART_TIER_* scrubbed for the same reason as in runner.run_agent
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HEART_TIER_")}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     # Policy: agents get network, verifiers never do — when sandboxing is on
     # at all, verifier subprocesses are always forced into bwrap-nonet.
     sandboxed = os.environ.get("HEART_SANDBOX") in ("bwrap", "bwrap-nonet")
