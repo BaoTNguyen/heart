@@ -42,14 +42,17 @@ def sandbox_wrap(
     hidden. Network stays shared (agents call APIs). Off by default — turn it
     on for unattended batches.
 
+    HEART_SANDBOX=bwrap-nonet additionally unshares the network — for verifier
+    runs and local-model agents that need no egress at all.
+
     ponytail: containment for accidents and reward hacking, not a security
-    boundary against a hostile model — network is open, $HOME is readable.
-    Upgrade path: --unshare-net + a proxy allowlist."""
+    boundary against a hostile model — in plain bwrap mode network is open and
+    $HOME is readable. Upgrade path for API agents: a proxy allowlist."""
     mode = os.environ.get("HEART_SANDBOX", "off")
     if mode in ("off", ""):
         return cmd, shell
-    if mode != "bwrap":
-        raise ValueError(f"HEART_SANDBOX={mode!r}: only 'bwrap' or 'off' supported")
+    if mode not in ("bwrap", "bwrap-nonet"):
+        raise ValueError(f"HEART_SANDBOX={mode!r}: only 'bwrap', 'bwrap-nonet' or 'off' supported")
     if not shutil.which("bwrap"):
         # a requested sandbox must never silently degrade to no sandbox
         raise RuntimeError("HEART_SANDBOX=bwrap but bubblewrap is not installed")
@@ -59,6 +62,8 @@ def sandbox_wrap(
         "--bind", "/tmp", "/tmp", "--bind", cwd, cwd,
         "--unshare-pid", "--die-with-parent",
     ]
+    if mode == "bwrap-nonet":
+        args.append("--unshare-net")
     for rel in _SANDBOX_WRITABLE:
         p = home / rel
         if p.exists():
