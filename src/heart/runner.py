@@ -109,7 +109,11 @@ def run_agent(
         raise ValueError(f"unknown agent {agent!r}; known: {sorted(AGENT_COMMANDS)}")
 
     cmd, shell = sandbox_wrap(cmd, shell, cwd, extra_env)
-    env = {**os.environ, **extra_env}
+    # HEART_TIER_* is this process's routing config, never the child's: a
+    # nested heart invocation (agents working on heart itself) must not
+    # inherit ambient tier overrides — that leak broke real episodes once
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HEART_TIER_")}
+    env.update(extra_env)
     t0 = time.monotonic()
     timed_out = False
     with _GATE, open(log_path, "w") as log:
