@@ -44,7 +44,6 @@ def render(e: dict, t0: str | None = None) -> str:
     ts = e.get("ts", "")
     if t0:
         try:
-            import datetime
             dt = datetime.datetime.fromisoformat(ts) - datetime.datetime.fromisoformat(t0)
             when = f"+{dt.total_seconds():7.1f}s"
         except ValueError:
@@ -179,6 +178,21 @@ def insights(hours: float = 24) -> list[str]:
     rescued = [eid for eid in attempted if any(p for a, p in rounds[eid] if a > 0)]
     if rounds:
         lines.append(f"fix loop: first-verify-failed={len(attempted)} rescued={len(rescued)}")
+
+    # routing scorecard: a cheap tier that keeps failing is the misroute
+    # signature — the signal that the heuristic (or a future learned gate)
+    # needs its thresholds moved
+    routes = {e["episode_id"]: _payload(e).get("tier") for e in events
+              if e["kind"] == "route.decided" and e.get("episode_id")}
+    if routes:
+        parts = []
+        for tier in ("cheap", "standard", "strong"):
+            outs = [_payload(finished[eid]).get("outcome")
+                    for eid, t in routes.items() if t == tier and eid in finished]
+            if outs:
+                parts.append(f"{tier}={sum(o == 'pass' for o in outs)}/{len(outs)} pass")
+        if parts:
+            lines.append("routing: " + ", ".join(parts))
 
     gate = Counter(_payload(e).get("chosen") for e in events
                    if e["kind"] == "decision.retrieval.gate")

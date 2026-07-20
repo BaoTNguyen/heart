@@ -4,6 +4,7 @@ Run: python3 tests/test_heart.py
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,8 @@ class TestHeart(unittest.TestCase):
         self.runs = self.root / "runs"
         self._old_spool = os.environ.get("HEART_SPOOL_DIR")
         os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_ingest = os.environ.get("HEART_INGEST")
+        os.environ["HEART_INGEST"] = "off"  # toy episodes must not hit the real ledger
         self.task = TaskSpec(
             task_id="toy-add-fix",
             repo_path=str(self.root / "toyrepo"),
@@ -73,6 +76,10 @@ class TestHeart(unittest.TestCase):
             os.environ.pop("HEART_SPOOL_DIR", None)
         else:
             os.environ["HEART_SPOOL_DIR"] = self._old_spool
+        if self._old_ingest is None:
+            os.environ.pop("HEART_INGEST", None)
+        else:
+            os.environ["HEART_INGEST"] = self._old_ingest
         self.tmp.cleanup()
 
     def run_ep(self, prompt: str):
@@ -146,6 +153,9 @@ class TestHeart(unittest.TestCase):
         old = dict(os.environ)
         try:
             os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")  # no models.json
+            for k in list(os.environ):  # ambient tier config must not leak in
+                if k.startswith("HEART_TIER_"):
+                    del os.environ[k]
             os.environ["HEART_TIER_CHEAP"] = "shell"
             self.assertEqual(router.resolve("cheap"), "shell")
             self.assertEqual(router.resolve("strong", default="claude"), "claude")
@@ -161,6 +171,9 @@ class TestHeart(unittest.TestCase):
         old = dict(os.environ)
         try:
             os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
+            for k in list(os.environ):
+                if k.startswith("HEART_TIER_"):
+                    del os.environ[k]
             os.environ["HEART_TIER_CHEAP"] = "shell"
             ep = run_episode(self.task, agent="auto", runs_dir=self.runs)
         finally:
@@ -171,6 +184,9 @@ class TestHeart(unittest.TestCase):
         routed = [e for e in pulse.load_events(episode=ep["episode_id"])
                   if e["kind"] == "route.decided"]
         self.assertEqual(routed[0]["payload"]["tier"], "cheap")
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(cli_main(["pulse", "insights"]), 0)
+        self.assertIn("routing: cheap=1/1 pass", buf.getvalue())
 
     def test_workspace_copies_integration_files(self):
         from heart.env import Workspace
@@ -229,6 +245,24 @@ class TestHeart(unittest.TestCase):
         self.assertNotIn("test_calc", diff)  # overlay never leaks into the diff
 
     def test_review_reject_triggers_fix(self):
+        # reviewer rejects once, then approves on re-review after the fix;
+        # the recorded verdict must be the post-fix one or --apply blocks forever
+        marker = self.root / "reviewed-once"
+        roles = [
+            {"name": "implement", "prompt": "{prompt}"},
+            {"name": "review",
+             "prompt": f"if [ -f {marker} ]; then echo APPROVE ok; "
+                       f"else touch {marker}; echo REJECT needs-work; fi"},
+        ]
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs,
+                         roles=roles, fix_rounds=1)
+        self.assertIn("review-fix", [r["role"] for r in ep["roles"]])
+        self.assertIn("review2", [r["role"] for r in ep["roles"]])
+        self.assertEqual(ep["review_verdict"], "approve")
+        self.assertEqual(ep["verify_rounds"][-1]["passed"], True)  # re-verified after fix
+        self.assertEqual(ep["outcome"], "pass")
+
+    def test_review_reject_sticks_when_rereview_rejects(self):
         roles = [
             {"name": "implement", "prompt": "{prompt}"},
             {"name": "review", "prompt": "echo REJECT needs-work"},
@@ -236,9 +270,25 @@ class TestHeart(unittest.TestCase):
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs,
                          roles=roles, fix_rounds=1)
         self.assertEqual(ep["review_verdict"], "reject")
-        self.assertIn("review-fix", [r["role"] for r in ep["roles"]])
-        self.assertEqual(ep["verify_rounds"][-1]["passed"], True)  # re-verified after fix
-        self.assertEqual(ep["outcome"], "pass")
+
+    def test_batch_resume_skips_done(self):
+        tasks_dir = self.root / "tasks"
+        tasks_dir.mkdir()
+        spec = {**self.task.__dict__,
+                "public_verifiers": [{"name": "unit", "command": "python3 -m unittest -q test_calc"}]}
+        (tasks_dir / "toy.json").write_text(json.dumps(spec))
+        argv = ["batch", str(tasks_dir), "--agent", "shell",
+                "--runs-dir", str(self.runs), "--repeat", "2"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_main(argv), 0)
+        rows = (self.runs / "summary.csv").read_text().strip().splitlines()
+        self.assertEqual(len(rows), 3)  # header + 2 episodes
+        # second invocation resumes: nothing left to run, no duplicate rows
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(cli_main(argv), 0)
+        self.assertIn("resume: 2 episode(s) already", buf.getvalue())
+        rows = (self.runs / "summary.csv").read_text().strip().splitlines()
+        self.assertEqual(len(rows), 3)
 
     def test_hidden_reward_weights(self):
         passed = {"passed": True, "exit_code": 0, "duration_s": 1, "output_tail": ""}
@@ -271,6 +321,23 @@ class TestHeart(unittest.TestCase):
             code = cli_main(["pulse", "tail", "--once", "--episode", ep["episode_id"]])
         self.assertEqual(code, 0)
         self.assertIn("episode.started", buf.getvalue())
+
+    def test_render(self):
+        from heart import pulse
+
+        e = {"ts": "2026-07-19T10:00:01.500000+00:00", "source": "heart",
+             "kind": "role.finished", "role": "dev", "duration_ms": 42,
+             "payload": {"note": "x" * 100}}
+        # relative-timestamp path uses module-level datetime (no local import)
+        line = pulse.render(e, t0="2026-07-19T10:00:00+00:00")
+        self.assertIn("+    1.5s", line)
+        self.assertIn("role=dev", line)
+        self.assertIn("42ms", line)
+        self.assertIn("x" * 57 + "...", line)  # payload truncated at 60
+        # unparseable ts falls back to raw string, not a crash
+        self.assertTrue(pulse.render({"ts": "garbage"}, t0="also-garbage").startswith("garbage"))
+        # no t0: wall-clock slice of the ISO timestamp
+        self.assertIn("10:00:01", pulse.render(e))
 
     def test_episode_crash_emits_failed(self):
         from heart import pulse
@@ -355,6 +422,63 @@ class TestHeart(unittest.TestCase):
             code = cli_main(["stats", "--runs-dir", str(self.runs)])
         self.assertEqual(code, 0)
         self.assertIn("normal/ret-on", buf.getvalue())
+
+
+def _bwrap_usable() -> bool:
+    # Ubuntu 24.04+ AppArmor can block unprivileged user namespaces, in which
+    # case bwrap exists but cannot start; the live test only runs where it can
+    if not shutil.which("bwrap"):
+        return False
+    return subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "true"], capture_output=True
+    ).returncode == 0
+
+
+class TestSandbox(unittest.TestCase):
+    def setUp(self):
+        self._old = os.environ.get("HEART_SANDBOX")
+        os.environ["HEART_SANDBOX"] = "bwrap"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("HEART_SANDBOX", None)
+        else:
+            os.environ["HEART_SANDBOX"] = self._old
+
+    def test_off_by_default(self):
+        from heart.runner import sandbox_wrap
+
+        os.environ.pop("HEART_SANDBOX")
+        self.assertEqual(sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {}),
+                         (["echo", "hi"], False))
+        os.environ["HEART_SANDBOX"] = "chroot"
+        with self.assertRaises(ValueError):
+            sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap not installed")
+    def test_wrap_builds_bwrap_argv(self):
+        from heart.runner import sandbox_wrap
+
+        cmd, shell = sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
+        self.assertFalse(shell)
+        self.assertEqual(cmd[0], "bwrap")
+        self.assertIn("/tmp/ws", cmd)  # worktree stays writable
+        self.assertEqual(cmd[-2:], ["echo", "hi"])
+        # shell-template agents run under sh -c inside the sandbox
+        cmd2, shell2 = sandbox_wrap("echo hi", True, "/tmp/ws", {})
+        self.assertEqual(cmd2[-3:], ["sh", "-c", "echo hi"])
+        self.assertFalse(shell2)
+
+    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
+    def test_sandbox_blocks_stray_writes(self):
+        from heart.runner import run_agent
+
+        with tempfile.TemporaryDirectory() as ws:
+            marker = Path.home() / f"heart-sbx-{os.getpid()}"
+            log = Path(ws) / "agent.log"
+            run_agent("shell", f"touch {marker}; touch {ws}/inside", ws, {}, 30, log)
+            self.assertFalse(marker.exists())  # $HOME is read-only
+            self.assertTrue((Path(ws) / "inside").exists())
 
 
 if __name__ == "__main__":
