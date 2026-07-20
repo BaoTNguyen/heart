@@ -36,6 +36,7 @@ _SANDBOX_HIDDEN = (".ssh", ".aws", ".gnupg")  # tmpfs'd: not even readable
 
 def sandbox_wrap(
     cmd: list[str] | str, shell: bool, cwd: str, extra_env: dict[str, str],
+    *, mode: str | None = None,
 ) -> tuple[list[str] | str, bool]:
     """HEART_SANDBOX=bwrap wraps the agent in bubblewrap: filesystem read-only
     except the worktree, /tmp, and agent config/cache dirs; ~/.ssh and friends
@@ -48,7 +49,8 @@ def sandbox_wrap(
     ponytail: containment for accidents and reward hacking, not a security
     boundary against a hostile model — in plain bwrap mode network is open and
     $HOME is readable. Upgrade path for API agents: a proxy allowlist."""
-    mode = os.environ.get("HEART_SANDBOX", "off")
+    if mode is None:
+        mode = os.environ.get("HEART_SANDBOX", "off")
     if mode in ("off", ""):
         return cmd, shell
     if mode not in ("bwrap", "bwrap-nonet"):

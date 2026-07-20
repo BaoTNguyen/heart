@@ -124,8 +124,10 @@ Operational switches:
   Off by default; turn it on for unattended batches. Containment for accidents,
   not a boundary against a hostile model. `HEART_SANDBOX=bwrap-nonet` also cuts
   the network — for verifier runs and local-model agents needing no egress.
-  Ubuntu 24.04+ needs a one-time AppArmor profile allowing bwrap to create
-  user namespaces.
+  Whenever sandboxing is on at all (`bwrap` or `bwrap-nonet`), verifier
+  subprocesses always run under `bwrap-nonet` regardless of the agent's mode:
+  agents get network, verifiers never do. Ubuntu 24.04+ needs a one-time
+  AppArmor profile allowing bwrap to create user namespaces.
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
