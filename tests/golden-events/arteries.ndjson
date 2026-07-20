@@ -1,0 +1,12 @@
+{"ts": "2026-07-20T04:11:14.626521+00:00", "source": "arteries", "kind": "assistant.response", "payload": {"store": "db", "assistant_preview": "Explored the repo. The config module reads presets from ARTERIES_MEMORY and the storage layer uses psycopg2 against the capillaries database.", "assistant_preview_truncated": false, "assistant_chars": 141}}
+{"ts": "2026-07-05T22:55:31.236267+00:00", "source": "arteries", "kind": "decision.memory.read_policy", "turn_id": "turn-1", "payload": {"chosen": "read_persistent_relevant", "available": ["read_none", "read_persistent_relevant", "read_recent_ephemeral", "read_evergreen"], "store": "db"}}
+{"ts": "2026-07-05T22:55:31.233408+00:00", "source": "arteries", "kind": "decision.memory.write_policy", "turn_id": "turn-1", "payload": {"chosen": "write_ephemeral", "available": ["write_ephemeral", "discard_ephemeral"], "store": "db"}}
+{"ts": "2026-07-06T13:45:22.457768+00:00", "source": "arteries", "kind": "decision.retrieval.gate", "turn_id": "a17cb4ea-ffdb-43d6-ae8d-ee585a5d2f48", "payload": {"chosen": "abstain", "available": ["abstain", "search"], "store": "db", "cost": {"confidence": 0.8100333142240865}}}
+{"ts": "2026-07-05T05:20:27.220608+00:00", "source": "arteries", "kind": "doctor.write_test"}
+{"ts": "2026-07-16T14:24:55.035583+00:00", "source": "arteries", "kind": "memory.assistant.stored", "turn_id": "28aab1ea-3f52-4c5d-8b72-21fabaa85c42", "payload": {"store": "db", "stored": 1, "input_chars": 152}}
+{"ts": "2026-07-08T17:50:10.253660+00:00", "source": "arteries", "kind": "memory.compile.completed", "payload": {"store": "db", "status": "compiled", "claimed": 1, "new_persistent": 0, "superseded": 0}}
+{"ts": "2026-07-05T05:20:27.231749+00:00", "source": "arteries", "kind": "memory.ephemeral.extracted", "payload": {"count": 2}}
+{"ts": "2026-07-06T13:45:22.393964+00:00", "source": "arteries", "kind": "memory.frame.built", "turn_id": "a17cb4ea-ffdb-43d6-ae8d-ee585a5d2f48", "payload": {"store": "db", "recent_messages": 3, "session_insights": 0, "ground_truth_insights": 1}}
+{"ts": "2026-07-19T05:41:22.669014+00:00", "source": "arteries", "kind": "reward.episode", "episode_id": "20260718-234111-d6ba6168", "task_id": "demo-route-1", "payload": {"value": 1.0, "reward_source": "heart", "store": "db"}}
+{"ts": "2026-07-05T05:20:27.231618+00:00", "source": "arteries", "kind": "run.started"}
+{"ts": "2026-07-05T05:20:27.231023+00:00", "source": "arteries", "kind": "turn.observed", "payload": {"not_json": "<Mock name='not-json' id='123594095495504'>"}}
