@@ -48,7 +48,8 @@ DEFAULT_ROLES: list[dict] = [
         "memory": "readonly",
         "prompt": (
             "Run `git diff` and review all changes for the task below: correctness, "
-            "unintended edits, missing tests. Your final line must be exactly "
+            "unintended edits, missing tests. Tests added by the pipeline's test "
+            "role are expected and in scope. Your final line must be exactly "
             "APPROVE or REJECT followed by a one-line reason.\nTask: {prompt}"
         ),
     },
@@ -90,6 +91,25 @@ def path_violations(diff_text: str, allowed: list[str], denied: list[str]) -> li
     return sorted(bad)
 
 
+def _agent_turn(
+    role: str, agent: str, prompt: str, ws: Workspace, env: dict,
+    task: TaskSpec, out: Path, agent_cmd: str | None, runs_log: list[dict],
+    memory: str | None = None,
+) -> dict:
+    """One agent invocation: run, record in runs_log, emit role.finished."""
+    r = run_agent(
+        agent, prompt, str(ws.path), {**env, "HEART_ROLE": role},
+        task.timeout_seconds, out / f"{role}.log", agent_cmd=agent_cmd,
+    )
+    runs_log.append(
+        {"role": role, "agent": agent, **({"memory": memory} if memory else {}), **r}
+    )
+    emit("heart", "role.finished", episode_id=env.get("ARTERIES_EPISODE_ID"),
+         task_id=task.task_id, role=role, duration_ms=int(r["duration_s"] * 1000),
+         agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"])
+    return r
+
+
 def _fix_loop(
     task: TaskSpec, ws: Workspace, out: Path, agent: str, env: dict,
     fix_rounds: int, escalate: str | None, agent_cmd: str | None,
@@ -112,15 +132,8 @@ def _fix_loop(
             f"Fix the code so they pass. Do not weaken or delete tests.\n"
             f"Original task: {task.prompt}"
         )
-        r = run_agent(
-            fix_agent, prompt, str(ws.path),
-            {**env, "HEART_ROLE": f"fix{attempt + 1}"},
-            task.timeout_seconds, out / f"fix{attempt + 1}.log", agent_cmd=agent_cmd,
-        )
-        runs_log.append({"role": f"fix{attempt + 1}", "agent": fix_agent, **r})
-        emit("heart", "role.finished", episode_id=episode_id, task_id=task.task_id,
-             role=f"fix{attempt + 1}", duration_ms=int(r["duration_s"] * 1000),
-             agent=fix_agent, exit_code=r["exit_code"])
+        _agent_turn(f"fix{attempt + 1}", fix_agent, prompt, ws, env, task, out,
+                    agent_cmd, runs_log)
     return rounds
 
 
@@ -201,22 +214,14 @@ def _run_episode(
             role_env.pop("ARTERIES_MEMORY", None)
             if mem != "normal":
                 role_env["ARTERIES_MEMORY"] = mem
-            role_env["HEART_ROLE"] = role["name"]
             role_agent = role.get("agent") or (
                 router.resolve(role["tier"], default=agent)
                 if routed and role.get("tier") else agent
             )
             emit("heart", "role.started", episode_id=episode_id, task_id=task.task_id,
                  role=role["name"], agent=role_agent, memory=mem)
-            r = run_agent(
-                role_agent, role["prompt"].format(prompt=task.prompt),
-                str(ws.path), role_env, task.timeout_seconds,
-                out / f"{role['name']}.log", agent_cmd=agent_cmd,
-            )
-            runs_log.append({"role": role["name"], "agent": role_agent, "memory": mem, **r})
-            emit("heart", "role.finished", episode_id=episode_id, task_id=task.task_id,
-                 role=role["name"], duration_ms=int(r["duration_s"] * 1000),
-                 agent=role_agent, exit_code=r["exit_code"], timed_out=r["timed_out"])
+            _agent_turn(role["name"], role_agent, role["prompt"].format(prompt=task.prompt),
+                        ws, role_env, task, out, agent_cmd, runs_log, memory=mem)
             if role.get("verify_after") and can_fix:
                 verify_rounds = _fix_loop(
                     task, ws, out, agent, env, fix_rounds, escalate, agent_cmd, runs_log
@@ -232,17 +237,19 @@ def _run_episode(
                     f"Address the review feedback. Do not weaken or delete tests.\n"
                     f"Original task: {task.prompt}"
                 )
-                r = run_agent(
-                    agent, prompt, str(ws.path), {**env, "HEART_ROLE": "review-fix"},
-                    task.timeout_seconds, out / "review-fix.log", agent_cmd=agent_cmd,
-                )
-                runs_log.append({"role": "review-fix", "agent": agent, **r})
-                emit("heart", "role.finished", episode_id=episode_id, task_id=task.task_id,
-                     role="review-fix", duration_ms=int(r["duration_s"] * 1000),
-                     agent=agent, exit_code=r["exit_code"])
+                _agent_turn("review-fix", agent, prompt, ws, env, task, out,
+                            agent_cmd, runs_log)
                 verify_rounds += _fix_loop(
                     task, ws, out, agent, env, 0, None, agent_cmd, runs_log
                 )
+                # the gate must reflect the post-fix state: without re-review,
+                # a resolved rejection still blocks --apply forever
+                review_role = next(r for r in roles if r["name"] == "review")
+                _agent_turn("review2", agent,
+                            review_role["prompt"].format(prompt=task.prompt),
+                            ws, {**env, "ARTERIES_MEMORY": "readonly"}, task, out,
+                            agent_cmd, runs_log)
+                review_verdict = _review_verdict(out / "review2.log") or review_verdict
 
         diff = ws.diff()
         (out / "diff.patch").write_text(diff)
