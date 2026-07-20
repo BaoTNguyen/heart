@@ -464,6 +464,11 @@ class TestSandbox(unittest.TestCase):
         self.assertEqual(cmd[0], "bwrap")
         self.assertIn("/tmp/ws", cmd)  # worktree stays writable
         self.assertEqual(cmd[-2:], ["echo", "hi"])
+        self.assertNotIn("--unshare-net", cmd)  # plain bwrap keeps egress
+        os.environ["HEART_SANDBOX"] = "bwrap-nonet"
+        cmd, _ = sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
+        self.assertIn("--unshare-net", cmd)
+        os.environ["HEART_SANDBOX"] = "bwrap"
         # shell-template agents run under sh -c inside the sandbox
         cmd2, shell2 = sandbox_wrap("echo hi", True, "/tmp/ws", {})
         self.assertEqual(cmd2[-3:], ["sh", "-c", "echo hi"])
@@ -479,6 +484,34 @@ class TestSandbox(unittest.TestCase):
             run_agent("shell", f"touch {marker}; touch {ws}/inside", ws, {}, 30, log)
             self.assertFalse(marker.exists())  # $HOME is read-only
             self.assertTrue((Path(ws) / "inside").exists())
+
+
+class TestPulseServe(unittest.TestCase):
+    def test_page_and_insights_endpoints(self):
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        from heart.serve import Handler
+
+        old = os.environ.get("HEART_SPOOL_DIR")
+        tmp = tempfile.mkdtemp()
+        os.environ["HEART_SPOOL_DIR"] = tmp
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            page = urllib.request.urlopen(base + "/").read().decode()
+            self.assertIn("heart pulse", page)
+            api = json.loads(urllib.request.urlopen(base + "/api/insights?hours=1").read())
+            self.assertIn("insights", api)
+            self.assertIn("health", api)
+        finally:
+            httpd.shutdown()
+            if old is None:
+                os.environ.pop("HEART_SPOOL_DIR", None)
+            else:
+                os.environ["HEART_SPOOL_DIR"] = old
 
 
 if __name__ == "__main__":

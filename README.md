@@ -122,16 +122,23 @@ Operational switches:
   — filesystem read-only except the worktree, /tmp, and agent config/cache
   dirs; `~/.ssh`/`~/.aws`/`~/.gnupg` hidden; network open (agents call APIs).
   Off by default; turn it on for unattended batches. Containment for accidents,
-  not a boundary against a hostile model. Ubuntu 24.04+ needs a one-time
-  AppArmor profile allowing bwrap to create user namespaces.
+  not a boundary against a hostile model. `HEART_SANDBOX=bwrap-nonet` also cuts
+  the network — for verifier runs and local-model agents needing no egress.
+  Ubuntu 24.04+ needs a one-time AppArmor profile allowing bwrap to create
+  user namespaces.
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
 - **Reward ingest**: after `run`/`work`/`batch`, heart calls `art ingest` on
   the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
-  stays stdlib-only). `HEART_INGEST=off` disables.
+  stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
+  re-runs the sweep any time (dedup makes it safe).
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
   a cheap tier that keeps failing means the classifier thresholds need moving.
+- **`heart pulse serve`**: the factory floor as a local web page
+  (http://127.0.0.1:7717) — live episode board, event stream, and insights,
+  all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,
+  one HTML file, no build step, localhost-only.
 
 ## RL environment
 
