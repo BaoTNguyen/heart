@@ -7,6 +7,7 @@ import csv
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -49,6 +50,24 @@ def _episode_kwargs(args) -> dict:
     )
 
 
+def _ingest_rewards(runs_dir) -> None:
+    """Best-effort credit-assignment bridge: hand finished episodes to arteries'
+    reward ledger when its CLI is installed. A subprocess, not an import — heart
+    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips."""
+    art = shutil.which("art")
+    if not art or os.environ.get("HEART_INGEST") == "off":
+        return
+    try:
+        proc = subprocess.run(
+            [art, "ingest", str(runs_dir)], capture_output=True, text=True, timeout=120,
+        )
+        tail = (proc.stdout + proc.stderr).strip().splitlines()
+        if tail:
+            print(f"art ingest: {tail[-1]}")
+    except Exception as exc:  # rewards can always be re-ingested later
+        print(f"art ingest skipped: {exc}", file=sys.stderr)
+
+
 def cmd_run(args) -> int:
     task = load_task(args.task)
     eps = run_candidates(
@@ -61,6 +80,7 @@ def cmd_run(args) -> int:
         for e in eps:
             print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
     print(json.dumps({k: ep[k] for k in ("episode_id", "task_id", "outcome", "reward")}, indent=2))
+    _ingest_rewards(args.runs_dir)
     return 0 if ep["outcome"] == "pass" else 1
 
 
@@ -102,6 +122,7 @@ def cmd_work(args) -> int:
     ep_dir = Path(args.runs_dir) / ep["episode_id"]
     print(json.dumps({k: ep[k] for k in ("episode_id", "outcome", "review_verdict", "reward")}, indent=2))
     print(f"diff: {ep_dir / 'diff.patch'}  logs: {ep_dir}/")
+    _ingest_rewards(args.runs_dir)
 
     if not args.apply:
         return 0 if ep["outcome"] == "pass" else 1
@@ -130,6 +151,17 @@ def cmd_batch(args) -> int:
     summary_path = Path(args.runs_dir) / "summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     new_file = not summary_path.exists()
+    if not new_file:
+        # resume: a batch killed at 60/100 must not re-run (and re-pay for)
+        # the 60. Start a fresh runs-dir to re-run everything.
+        with open(summary_path, newline="") as f:
+            done_keys = {(r[1], r[2], r[3], r[4]) for r in list(csv.reader(f))[1:] if len(r) >= 6}
+        before = len(jobs)
+        jobs = [j for j in jobs
+                if (j[0].task_id, j[1], str(j[2]), str(j[3])) not in done_keys]
+        if before - len(jobs):
+            print(f"resume: {before - len(jobs)} episode(s) already in {summary_path}, "
+                  f"{len(jobs)} to run")
     kwargs = _episode_kwargs(args)
     with open(summary_path, "a", newline="") as f:
         writer = csv.writer(f)
@@ -153,6 +185,7 @@ def cmd_batch(args) -> int:
                 f.flush()
                 print(",".join(str(x) for x in row))
     print(f"summary: {summary_path}")
+    _ingest_rewards(args.runs_dir)
     return 0
 
 

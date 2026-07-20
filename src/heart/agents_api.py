@@ -55,9 +55,8 @@ def resolve_config() -> dict:
             sys.exit(f"profile {profile!r} not in {path} (have: {sorted(profiles)})")
         cfg = profiles[profile]
     endpoint = cfg.get("endpoint") or os.environ.get("HEART_API_ENDPOINT") \
-        or os.environ.get("HEART_LOCAL_ENDPOINT") or "http://127.0.0.1:8000/v1"
-    model = cfg.get("model") or os.environ.get("HEART_API_MODEL") \
-        or os.environ.get("HEART_LOCAL_MODEL") or "default"
+        or "http://127.0.0.1:8000/v1"
+    model = cfg.get("model") or os.environ.get("HEART_API_MODEL") or "default"
     key = ""
     if cfg.get("api_key_env"):
         key = os.environ.get(cfg["api_key_env"], "")

@@ -116,6 +116,23 @@ Three coding-specific mechanisms, composable per run:
 - **Candidates** (`--candidates N`): N independent attempts in parallel
   worktrees, best reward wins. Doubles as the RL data engine.
 
+Operational switches:
+
+- **Sandbox** (`HEART_SANDBOX=bwrap`): agent subprocesses run under bubblewrap
+  — filesystem read-only except the worktree, /tmp, and agent config/cache
+  dirs; `~/.ssh`/`~/.aws`/`~/.gnupg` hidden; network open (agents call APIs).
+  Off by default; turn it on for unattended batches. Containment for accidents,
+  not a boundary against a hostile model. Ubuntu 24.04+ needs a one-time
+  AppArmor profile allowing bwrap to create user namespaces.
+- **Resume**: `heart batch` skips episodes already recorded in the runs dir's
+  `summary.csv`, so an interrupted batch continues where it died. Fresh runs
+  dir = full re-run.
+- **Reward ingest**: after `run`/`work`/`batch`, heart calls `art ingest` on
+  the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
+  stays stdlib-only). `HEART_INGEST=off` disables.
+- `heart pulse insights` includes a routing scorecard (pass rate per tier) —
+  a cheap tier that keeps failing means the classifier thresholds need moving.
+
 ## RL environment
 
 ```bash
