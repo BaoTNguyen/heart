@@ -189,7 +189,22 @@ def cmd_batch(args) -> int:
     return 0
 
 
+def cmd_ingest(args) -> int:
+    """Reconciliation sweep: re-run reward ingest over a runs dir. `art ingest`
+    dedups by episode_id, so this is safe to run any time the best-effort
+    per-run ingest may have missed episodes (Postgres down, art off PATH)."""
+    if not shutil.which("art"):
+        print("art CLI not on PATH; nothing ingested", file=sys.stderr)
+        return 1
+    _ingest_rewards(args.runs_dir)
+    return 0
+
+
 def cmd_pulse(args) -> int:
+    if args.what == "serve":
+        from . import serve as serve_mod
+        serve_mod.serve(port=args.port)
+        return 0
     if args.what == "episode":
         if not args.id:
             print("usage: heart pulse episode <episode-id>", file=sys.stderr)
@@ -319,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("pulse", help="event spine: tail | episode <id> | insights | health")
     p.add_argument("what", nargs="?", default="tail",
-                   choices=["tail", "episode", "insights", "health"])
+                   choices=["tail", "episode", "insights", "health", "serve"])
+    p.add_argument("--port", type=int, default=7717, help="port for `pulse serve`")
     p.add_argument("id", nargs="?", help="episode id (for `pulse episode`)")
     p.add_argument("-n", type=int, default=20, help="history lines before following")
     p.add_argument("--hours", type=float, default=24, help="window for insights/health")
@@ -328,6 +344,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", default=None, help="filter by source (heart|arteries|marrow|agent)")
     p.add_argument("--once", action="store_true", help="print and exit; don't follow")
     p.set_defaults(func=cmd_pulse)
+
+    p = sub.add_parser("ingest", help="re-run reward ingest over a runs dir (safe: dedup)")
+    p.add_argument("runs_dir", nargs="?", default=str(WORK_RUNS_DIR))
+    p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("check-task", help="verify determinism at base and pass at fix_commit")
     p.add_argument("task")
