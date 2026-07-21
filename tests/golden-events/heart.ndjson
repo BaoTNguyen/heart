@@ -6,3 +6,4 @@
 {"ts": "2026-07-19T05:41:11.969932+00:00", "source": "heart", "kind": "role.started", "episode_id": "20260718-234111-d6ba6168", "task_id": "demo-route-1", "role": "solo", "payload": {"agent": "shell", "memory": "normal"}}
 {"ts": "2026-07-19T05:41:11.965317+00:00", "source": "heart", "kind": "route.decided", "episode_id": "20260718-234111-d6ba6168", "task_id": "demo-route-1", "payload": {"tier": "cheap", "agent": "shell", "reason": "heuristic", "score": 0, "words": 8, "hard_hits": [], "easy_hits": []}}
 {"ts": "2026-07-20T04:35:30.263351+00:00", "source": "heart", "kind": "verify.round", "episode_id": "20260719-223506-482409e1", "task_id": "work-20260719-223506", "payload": {"attempt": 0, "passed": false}}
+{"ts": "2026-07-20T19:59:10.100000+00:00", "source": "heart", "kind": "guardrail.hit", "episode_id": "20260718-234111-d6ba6168", "task_id": "demo-route-1", "payload": {"rules": ["aws_access_key"]}}

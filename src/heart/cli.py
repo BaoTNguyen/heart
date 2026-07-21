@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import mine as mine_mod
 from . import pulse as pulse_mod
+from . import reward as reward_mod
 from .detect import detect_verifiers
 from .events import emit
 from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
@@ -112,6 +113,10 @@ def cmd_work(args) -> int:
     task = TaskSpec(
         task_id="work-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
         repo_path=repo, base_commit=base, prompt=args.prompt,
+        # agents must never edit CI config in a work run.
+        # ponytail: lockfile protection deliberately skipped — too many
+        # legitimate dep tasks touch lockfiles.
+        denied_paths=[".github/workflows/"],
         public_verifiers=verifiers, timeout_seconds=args.timeout,
     )
     kwargs = _episode_kwargs(args)
@@ -130,6 +135,12 @@ def cmd_work(args) -> int:
         print("not applying: episode did not pass verification + review")
         return 1
     diff = (ep_dir / "diff.patch").read_text()
+    max_lines = int(os.environ.get("HEART_MAX_DIFF_LINES", "2000"))
+    changed = reward_mod.diff_changed_lines(diff)
+    if changed > max_lines and not args.allow_large:
+        print(f"refusing to apply: diff changes {changed} lines (limit {max_lines}); "
+              f"pass --allow-large to override")
+        return 1
     apply = subprocess.run(
         ["git", "-C", repo, "apply", "--whitespace=nowarn"],
         input=diff, capture_output=True, text=True,
@@ -267,6 +278,62 @@ def cmd_mine(args) -> int:
     return 0
 
 
+def _worktree_source_repo(worktree: Path) -> str | None:
+    """A worktree's `.git` file reads `gitdir: <repo>/.git/worktrees/<id>`;
+    walk back up to the repo root. Best-effort — return None if unreadable."""
+    git_file = worktree / ".git"
+    if not git_file.is_file():
+        return None
+    try:
+        line = git_file.read_text().strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = Path(line.split(":", 1)[1].strip())
+    # <repo>/.git/worktrees/<id> -> <repo>
+    repo = gitdir.parent.parent.parent
+    return str(repo) if repo.is_dir() else None
+
+
+def cmd_clean(args) -> int:
+    """Delete finished-episode directories and stale heart worktrees older
+    than --days. summary.csv (the batch resume ledger) is never touched."""
+    cutoff = datetime.datetime.now().timestamp() - args.days * 86400
+    runs_dir = Path(args.runs_dir)
+    n_runs = 0
+    if runs_dir.is_dir():
+        for ep_dir in runs_dir.iterdir():
+            if not ep_dir.is_dir():
+                continue
+            ep_json = ep_dir / "episode.json"
+            if not ep_json.exists() or ep_json.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(ep_dir, ignore_errors=True)
+            n_runs += 1
+
+    # read fresh each call (not env.WS_ROOT's import-time constant) so tests
+    # can point this at a fabricated dir via HEART_WS_ROOT without touching
+    # the real worktree cache
+    ws_root = Path(os.environ.get("HEART_WS_ROOT", str(Path.home() / ".cache" / "heart-ws")))
+    n_worktrees = 0
+    source_repos: set[str] = set()
+    if ws_root.is_dir():
+        for wt in ws_root.iterdir():
+            if not wt.is_dir() or wt.stat().st_mtime >= cutoff:
+                continue
+            repo = _worktree_source_repo(wt)
+            shutil.rmtree(wt, ignore_errors=True)
+            n_worktrees += 1
+            if repo:
+                source_repos.add(repo)
+    for repo in source_repos:
+        subprocess.run(["git", "-C", repo, "worktree", "prune"], capture_output=True)
+
+    print(f"heart clean: {n_runs} run(s) removed, {n_worktrees} worktree(s) removed")
+    return 0
+
+
 def cmd_export(args) -> int:
     n = export_episodes(args.runs_dir, args.out)
     print(f"{n} episodes -> {args.out}")
@@ -317,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--verify", default=None, help="verifier command (else auto-detected)")
     p.add_argument("--timeout", type=int, default=600, help="per-role timeout seconds")
     p.add_argument("--apply", action="store_true", help="apply diff to the repo if pass+approve")
+    p.add_argument("--allow-large", action="store_true",
+                    help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
     p.set_defaults(func=cmd_work, runs_dir=str(WORK_RUNS_DIR), fix_rounds=2)
 
@@ -361,6 +430,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scan", type=int, default=500)
     p.add_argument("--test-cmd", default="python3 -m pytest -x {files}")
     p.set_defaults(func=cmd_mine)
+
+    p = sub.add_parser("clean", help="prune old runs and stale worktrees")
+    p.add_argument("--days", type=int, default=7, help="age cutoff in days (default 7)")
+    p.add_argument("--runs-dir", default=str(WORK_RUNS_DIR))
+    p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("export", help="episodes -> JSONL")
     p.add_argument("--runs-dir", default="runs")

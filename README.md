@@ -146,6 +146,23 @@ Operational switches:
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
   all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
+- **Static verifiers**: `detect_verifiers` also picks up `ruff`, `mypy`,
+  `tsc`, `eslint`, and `biome` when both the tool's config and the tool
+  itself are locally installed — never anything that downloads (no `npx`,
+  no `pip install`), since sandboxed verifiers have no network. They run
+  after the test verifiers and score under `lint_typecheck`.
+- **Guardrails**: `heart work` refuses to hand back or apply dangerous diffs.
+  `guard.scan_secrets` scans added lines for AWS keys, private key headers,
+  GitHub/Slack tokens, and generic `key/secret/token/password = "..."`
+  assignments — a hit zeroes reward with outcome `guardrail_violation`,
+  mirroring a path violation. A size fuse in `cmd_work --apply` refuses diffs
+  over `HEART_MAX_DIFF_LINES` (default 2000) changed lines unless
+  `--allow-large` is passed. `.github/workflows/` is always a denied path in
+  `heart work` — agents never edit CI config in a work run.
+- **`heart clean [--days N] [--runs-dir DIR]`**: deletes episode directories
+  older than N days (default 7; `summary.csv` is kept) and removes stale
+  heart worktrees under `~/.cache/heart-ws`, pruning them from their source
+  repo with `git worktree prune` when the source repo is discoverable.
 
 ## RL environment
 

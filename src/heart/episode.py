@@ -25,6 +25,7 @@ from . import reward as reward_mod
 from . import router
 from .env import Workspace
 from .events import emit
+from .guard import scan_secrets
 from .runner import run_agent
 from .taskspec import TaskSpec
 from .verify import run_verifiers
@@ -259,10 +260,17 @@ def _run_episode(
              diff_lines=reward_mod.diff_changed_lines(diff))
 
         violations = path_violations(diff, task.allowed_paths, task.denied_paths)
+        secret_hits = scan_secrets(diff)
         if not diff.strip():
             outcome = "no_change"
         elif violations:
             outcome = "path_violation"
+        elif secret_hits:
+            # mirrors path_violation handling: a secret in the diff zeroes
+            # reward exactly like an out-of-bounds edit, no verify run
+            outcome = "guardrail_violation"
+            emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
+                 rules=sorted({h.split(":", 1)[0] for h in secret_hits}))
         else:
             # verify on a clean worktree with only the agent's diff applied —
             # leftover workspace state (edited tests, caches) can't game the verifier
@@ -319,7 +327,8 @@ def _run_episode(
         "memory_mode": memory_mode,
         "retrieval": retrieval,
         "outcome": outcome,
-        "violations": violations if outcome == "path_violation" else [],
+        "violations": violations if outcome == "path_violation"
+        else secret_hits if outcome == "guardrail_violation" else [],
         "agent_result": agent_result,
         "roles": runs_log,
         "verify_rounds": verify_rounds,

@@ -21,7 +21,7 @@ WEIGHTS_HIDDEN = {
     "efficiency": 0.05,
 }
 
-LINT_NAMES = {"lint", "typecheck", "format", "mypy", "ruff", "eslint", "tsc"}
+LINT_NAMES = {"lint", "typecheck", "format", "mypy", "ruff", "eslint", "tsc", "biome"}
 
 
 def diff_changed_lines(diff_text: str) -> int:

@@ -31,7 +31,7 @@ GOLDEN_DIR = Path(__file__).resolve().parent / "golden-events"
 KINDS_REQUIRING_EPISODE_ID = {
     "episode.started", "episode.finished", "episode.failed",
     "role.started", "role.finished",
-    "route.decided", "verify.round", "diff.captured",
+    "route.decided", "verify.round", "diff.captured", "guardrail.hit",
 }
 
 
