@@ -214,13 +214,20 @@ def cmd_ingest(args) -> int:
 def cmd_pulse(args) -> int:
     if args.what == "serve":
         from . import serve as serve_mod
-        serve_mod.serve(port=args.port)
+        serve_mod.serve(port=args.port, runs_dir=args.serve_runs_dir)
         return 0
     if args.what == "episode":
         if not args.id:
             print("usage: heart pulse episode <episode-id>", file=sys.stderr)
             return 2
         for line in pulse_mod.episode_timeline(args.id):
+            print(line)
+        return 0
+    if args.what == "goal":
+        if not args.id:
+            print("usage: heart pulse goal <goal-id>", file=sys.stderr)
+            return 2
+        for line in pulse_mod.goal_timeline(args.id):
             print(line)
         return 0
     if args.what == "insights":
@@ -401,11 +408,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--runs-dir", default="runs")
     p.set_defaults(func=cmd_stats)
 
-    p = sub.add_parser("pulse", help="event spine: tail | episode <id> | insights | health")
+    p = sub.add_parser("pulse", help="event spine: tail | episode <id> | goal <id> | insights | health")
     p.add_argument("what", nargs="?", default="tail",
-                   choices=["tail", "episode", "insights", "health", "serve"])
+                   choices=["tail", "episode", "goal", "insights", "health", "serve"])
     p.add_argument("--port", type=int, default=7717, help="port for `pulse serve`")
-    p.add_argument("id", nargs="?", help="episode id (for `pulse episode`)")
+    p.add_argument("--runs-dir", dest="serve_runs_dir", default=None,
+                   help="runs dir `pulse serve` writes steer.txt into (default WORK_RUNS_DIR)")
+    p.add_argument("id", nargs="?", help="episode id (for `pulse episode`) or goal id (for `pulse goal`)")
     p.add_argument("-n", type=int, default=20, help="history lines before following")
     p.add_argument("--hours", type=float, default=24, help="window for insights/health")
     p.add_argument("--episode", default=None, help="filter by episode id")

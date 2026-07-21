@@ -63,6 +63,28 @@
                   border-radius: 10px; padding: 12px 14px; overflow-x: auto;
                   font: 12px/1.7 ui-monospace, monospace; color: var(--ink-2); }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .steer { margin-top: 6px; display: flex; gap: 6px; }
+  .steer input { flex: 1; background: var(--page); border: 1px solid var(--border);
+                 border-radius: 6px; color: var(--ink); padding: 3px 8px; font: inherit; }
+  .steer button { background: none; border: 1px solid var(--border); color: var(--ink-2);
+                  border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit; }
+  .card .id.clickable { cursor: pointer; text-decoration: underline; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+             align-items: center; justify-content: center; z-index: 50; }
+  .overlay.hidden { display: none; }
+  .overlay .panel { background: var(--surface); border: 1px solid var(--border);
+                    border-radius: 10px; padding: 16px 20px; width: 900px; max-width: 92vw;
+                    max-height: 88vh; overflow-y: auto; }
+  .overlay .panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+                        color: var(--muted); margin: 14px 0 6px; }
+  .overlay .panel pre { background: var(--page); border: 1px solid var(--border);
+                         border-radius: 8px; padding: 10px; overflow-x: auto;
+                         font: 12px/1.6 ui-monospace, monospace; white-space: pre-wrap;
+                         max-height: 320px; overflow-y: auto; }
+  .overlay #dd-close { float: right; background: none; border: none; color: var(--ink-2);
+                        font-size: 20px; line-height: 1; cursor: pointer; }
+  .overlay details { margin-top: 6px; }
+  .overlay summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -85,6 +107,18 @@
     <pre id="insight-lines">…</pre>
   </section>
 </main>
+<div id="drilldown" class="overlay hidden">
+  <div class="panel">
+    <button id="dd-close" onclick="closeDrilldown()">×</button>
+    <h2 id="dd-title"></h2>
+    <h3>Timeline</h3>
+    <pre id="dd-timeline"></pre>
+    <h3>Diff</h3>
+    <pre id="dd-diff"></pre>
+    <h3>Logs</h3>
+    <div id="dd-logs"></div>
+  </div>
+</div>
 <script>
 "use strict";
 const SRC = { heart: "--heart", arteries: "--arteries", capillaries: "--capillaries",
@@ -94,6 +128,8 @@ let hours = 6, es = null;
 const eps = new Map();          // episode_id -> state built from events
 
 function short(v) { const s = String(v); return s.length > 60 ? s.slice(0, 57) + "…" : s; }
+const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(v) { return String(v).replace(/[&<>"']/g, c => ESC_MAP[c]); }
 
 function fold(e) {              // fold one spine event into episode state
   const id = e.episode_id;
@@ -124,30 +160,67 @@ function renderBoard() {
     const verify = ep.verify.length
       ? `<span>verify ${ep.verify.map(p => p ? "✓" : "✗").join("")}</span>` : "";
     const roles = ep.roles.map(r =>
-      `<span>${r.role} ${(r.ms / 1000).toFixed(0)}s${r.exit ? " ✗" : ""}</span>`).join("");
+      `<span>${esc(r.role)} ${(r.ms / 1000).toFixed(0)}s${r.exit ? " ✗" : ""}</span>`).join("");
+    const steerBox = ep.status === "running" ? `
+      <div class="steer">
+        <input type="text" placeholder="steer note…" data-ep="${esc(ep.id)}"
+               onkeydown="if(event.key==='Enter')sendSteer(this.nextElementSibling)">
+        <button onclick="sendSteer(this)">Send</button>
+      </div>` : "";
     return `<div class="card">
       <div class="top">
         <span class="status ${ep.status}">${mark}</span>
-        <span class="task">${short(ep.task || "?")}</span>
-        ${ep.tier ? `<span class="chip">${ep.tier}</span>` : ""}
-        ${ep.verdict ? `<span class="chip">review: ${ep.verdict}</span>` : ""}
+        <span class="task">${esc(short(ep.task || "?"))}</span>
+        ${ep.tier ? `<span class="chip">${esc(ep.tier)}</span>` : ""}
+        ${ep.verdict ? `<span class="chip">review: ${esc(ep.verdict)}</span>` : ""}
         ${ep.reward != null ? `<span class="chip">r=${Number(ep.reward).toFixed(2)}</span>` : ""}
         ${ep.cost != null ? `<span class="chip">$${Number(ep.cost).toFixed(2)}</span>` : ""}
-        <span class="id">${ep.id}</span>
+        <span class="id clickable" onclick="openDrilldown('${esc(ep.id)}')">${esc(ep.id)}</span>
       </div>
       ${roles || verify ? `<div class="roles">${roles}${verify}</div>` : ""}
+      ${steerBox}
     </div>`;
   }).join("");
 }
+
+async function sendSteer(btn) {
+  const input = btn.previousElementSibling;
+  const text = input.value;
+  if (!text.trim()) return;
+  try {
+    const r = await fetch(`/api/steer?episode=${encodeURIComponent(input.dataset.ep)}`,
+                           { method: "POST", body: text });
+    if (r.ok) input.value = "";
+  } catch { /* best effort; operator can retry */ }
+}
+
+async function openDrilldown(id) {
+  $("dd-title").textContent = id;
+  $("dd-timeline").textContent = "loading…";
+  $("dd-diff").textContent = "";
+  $("dd-logs").innerHTML = "";
+  $("drilldown").classList.remove("hidden");
+  try {
+    const r = await (await fetch(`/api/episode?id=${encodeURIComponent(id)}`)).json();
+    $("dd-timeline").textContent = (r.timeline || []).join("\n");
+    $("dd-diff").textContent = r.diff || "(no diff)";
+    $("dd-logs").innerHTML = Object.entries(r.logs || {}).map(([role, text]) =>
+      `<details><summary>${esc(role)}</summary><pre>${esc(text)}</pre></details>`).join("")
+      || '<div class="empty">no logs</div>';
+  } catch {
+    $("dd-timeline").textContent = "failed to load";
+  }
+}
+function closeDrilldown() { $("drilldown").classList.add("hidden"); }
 
 function renderTail(e) {
   const box = $("tailbox"), stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
   const div = document.createElement("div");
   const color = `var(${SRC[e.source] || "--muted"})`;
-  const kv = Object.entries(e.payload || {}).map(([k, v]) => `${k}=${short(v)}`).join("  ");
-  div.innerHTML = `<span class="ts">${(e.ts || "").slice(11, 19)}</span>  ` +
-    `<span class="src" style="color:${color}">${e.source || "?"}</span>` +
-    `${e.kind || "?"}${e.role ? " role=" + e.role : ""}  <span class="kv">${kv}</span>`;
+  const kv = Object.entries(e.payload || {}).map(([k, v]) => `${esc(k)}=${esc(short(v))}`).join("  ");
+  div.innerHTML = `<span class="ts">${esc((e.ts || "").slice(11, 19))}</span>  ` +
+    `<span class="src" style="color:${color}">${esc(e.source || "?")}</span>` +
+    `${esc(e.kind || "?")}${e.role ? " role=" + esc(e.role) : ""}  <span class="kv">${kv}</span>`;
   const tail = $("tail");
   tail.appendChild(div);
   while (tail.childElementCount > 400) tail.firstElementChild.remove();

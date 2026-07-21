@@ -32,6 +32,7 @@ KINDS_REQUIRING_EPISODE_ID = {
     "episode.started", "episode.finished", "episode.failed",
     "role.started", "role.finished",
     "route.decided", "verify.round", "diff.captured", "guardrail.hit",
+    "steer.received",
 }
 
 

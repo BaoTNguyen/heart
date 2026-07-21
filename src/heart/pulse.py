@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -109,6 +110,46 @@ def episode_timeline(episode_id: str) -> list[str]:
         return [f"no events for episode {episode_id}"]
     t0 = events[0].get("ts")
     return [render(e, t0=t0) for e in events]
+
+
+def goal_timeline(goal_id: str) -> list[str]:
+    """Goal lineage: goal -> features -> episodes -> outcome/reward/cost, a
+    groupby over episode.finished events carrying payload.goal_id (stamped
+    from PLEXUS_GOAL_ID by events.emit)."""
+    events = [e for e in load_events() if _payload(e).get("goal_id") == goal_id]
+    if not events:
+        return [f"no events for goal {goal_id}"]
+    finished = {e["episode_id"]: e for e in events
+                if e["kind"] == "episode.finished" and e.get("episode_id")}
+    features: dict[str, list[str]] = defaultdict(list)
+    for e in events:
+        eid = e.get("episode_id")
+        if not eid or eid in features[_payload(e).get("feature_id") or "?"]:
+            continue
+        features[_payload(e).get("feature_id") or "?"].append(eid)
+    outcomes = Counter(
+        _payload(finished[eid]).get("outcome")
+        for eids in features.values() for eid in eids if eid in finished
+    )
+    total_episodes = sum(len(eids) for eids in features.values())
+    lines = [
+        f"goal {goal_id}: features={len(features)} episodes={total_episodes} "
+        "outcomes: " + ", ".join(f"{k}={v}" for k, v in outcomes.most_common())
+    ]
+    for fid in sorted(features):
+        for eid in features[fid]:
+            fe = finished.get(eid)
+            if not fe:
+                lines.append(f"feature {fid}: episode {eid} outcome=pending")
+                continue
+            p = _payload(fe)
+            parts = [f"outcome={p.get('outcome')}"]
+            if p.get("reward") is not None:
+                parts.append(f"reward={p['reward']}")
+            if p.get("cost_usd") is not None:
+                parts.append(f"cost=${p['cost_usd']:.2f}")
+            lines.append(f"feature {fid}: episode {eid} " + " ".join(parts))
+    return lines
 
 
 def _pct(values: list[float], q: float) -> float:
@@ -268,6 +309,36 @@ def health(hours: float = 24, zombie_minutes: float = 10) -> tuple[list[str], in
     degraded = sum(1 for e in events if _payload(e).get("store") in ("jsonl", "lost"))
     if degraded:
         warns.append(f"WARN  {degraded} ledger write(s) fell back from Postgres — check the DB")
+
+    # review2-reject streak: the heart review ceiling's tripwire — if the last
+    # three reviewed episodes were all rejected, the re-review loop isn't
+    # actually fixing anything
+    reviewed = sorted(
+        (e for e in events if e["kind"] == "episode.finished" and _payload(e).get("review_verdict")),
+        key=lambda e: e.get("ts", ""),
+    )
+    recent_verdicts = [_payload(e)["review_verdict"] for e in reviewed[-3:]]
+    if len(recent_verdicts) == 3 and all(v == "reject" for v in recent_verdicts):
+        warns.append("WARN  3 most recent reviewed episodes all rejected (review2-reject streak)")
+
+    # cost alert: opt-in dollar ceiling for the window
+    cost_alert = os.environ.get("HEART_COST_ALERT")
+    if cost_alert:
+        total_cost = sum(
+            _payload(e).get("cost_usd") or 0
+            for e in events if e["kind"] == "episode.finished"
+        )
+        threshold = float(cost_alert)
+        if total_cost > threshold:
+            warns.append(
+                f"WARN  window cost ${total_cost:.2f} exceeds HEART_COST_ALERT=${threshold:.2f}"
+            )
+
+    # silent-stall: "factory silently stalled" — zero events while a plexus
+    # goal claims to be active. ponytail: plexus setting PLEXUS_GOAL_ACTIVE is
+    # future wiring; this rule is inert until something sets the env var.
+    if os.environ.get("PLEXUS_GOAL_ACTIVE") and not _window(0.5):
+        warns.append("WARN  factory silently stalled: no events in the last 30m (PLEXUS_GOAL_ACTIVE set)")
 
     if warns:
         return warns, 1

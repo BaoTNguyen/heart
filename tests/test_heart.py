@@ -3,6 +3,7 @@ Run: python3 tests/test_heart.py
 """
 from __future__ import annotations
 
+import datetime
 import json
 import shutil
 import subprocess
@@ -270,6 +271,38 @@ class TestHeart(unittest.TestCase):
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs,
                          roles=roles, fix_rounds=1)
         self.assertEqual(ep["review_verdict"], "reject")
+
+    def test_consume_steer_helper(self):
+        from heart.episode import _consume_steer
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self.assertIsNone(_consume_steer(out))  # no file yet
+            (out / "steer.txt").write_text("   \n")
+            self.assertIsNone(_consume_steer(out))  # whitespace-only counts as empty
+            (out / "steer.txt").write_text("do X instead")
+            self.assertEqual(_consume_steer(out), "do X instead")
+            self.assertEqual((out / "steer.txt").read_text(), "")  # truncated after consuming
+
+    def test_steer_mid_run_appends_to_next_role_and_emits_event(self):
+        from heart import pulse
+
+        # role1's own shell script drops a steer note into its own out dir
+        # (known via $ARTERIES_EPISODE_ID + the fixed runs_dir); episode.py's
+        # steer check runs before each subsequent role turn, so role2 must
+        # pick it up and steer.received must be logged.
+        roles = [
+            {"name": "implement",
+             "prompt": f"{FIX_CMD}; echo -n 'focus on edge cases' "
+                       f"> {self.runs}/$ARTERIES_EPISODE_ID/steer.txt"},
+            {"name": "test", "prompt": "true"},
+        ]
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
+        events = pulse.load_events(episode=ep["episode_id"])
+        steer_events = [e for e in events if e["kind"] == "steer.received"]
+        self.assertEqual(len(steer_events), 1)
+        self.assertEqual(steer_events[0]["episode_id"], ep["episode_id"])
+        self.assertEqual(steer_events[0]["payload"]["chars"], len("focus on edge cases"))
 
     def test_batch_resume_skips_done(self):
         tasks_dir = self.root / "tasks"
@@ -813,6 +846,186 @@ class TestClean(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestGoalLineage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
+        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+
+    def tearDown(self):
+        if self._old_spool is None:
+            os.environ.pop("HEART_SPOOL_DIR", None)
+        else:
+            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+        self.tmp.cleanup()
+
+    def _write(self, **event):
+        from heart.events import spool_dir
+
+        d = spool_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "20260101.ndjson", "a") as f:
+            f.write(json.dumps(event) + "\n")
+
+    def test_emit_stamps_goal_lineage_from_env(self):
+        from heart.events import emit, spool_dir
+
+        old_goal = os.environ.get("PLEXUS_GOAL_ID")
+        old_feat = os.environ.get("PLEXUS_FEATURE_ID")
+        os.environ["PLEXUS_GOAL_ID"] = "g-env"
+        os.environ["PLEXUS_FEATURE_ID"] = "f-env"
+        try:
+            emit("heart", "episode.started", episode_id="ep-env", task_id="t-env")
+            # explicit payload kwargs are never overwritten by the env stamp
+            emit("heart", "episode.finished", episode_id="ep-env2", goal_id="explicit-g")
+        finally:
+            if old_goal is None:
+                os.environ.pop("PLEXUS_GOAL_ID", None)
+            else:
+                os.environ["PLEXUS_GOAL_ID"] = old_goal
+            if old_feat is None:
+                os.environ.pop("PLEXUS_FEATURE_ID", None)
+            else:
+                os.environ["PLEXUS_FEATURE_ID"] = old_feat
+
+        lines = sorted(spool_dir().glob("*.ndjson"))[0].read_text().splitlines()
+        events = {json.loads(line)["episode_id"]: json.loads(line) for line in lines}
+        self.assertEqual(events["ep-env"]["payload"]["goal_id"], "g-env")
+        self.assertEqual(events["ep-env"]["payload"]["feature_id"], "f-env")
+        self.assertEqual(events["ep-env2"]["payload"]["goal_id"], "explicit-g")
+
+    def test_goal_timeline_groups_by_feature_then_episode(self):
+        from heart import pulse
+
+        self._write(ts="2026-01-01T00:00:00+00:00", source="heart", kind="episode.finished",
+                    episode_id="ep1", task_id="t1",
+                    payload={"outcome": "pass", "reward": 0.9, "cost_usd": 0.12,
+                             "goal_id": "g1", "feature_id": "f1"})
+        self._write(ts="2026-01-01T00:01:00+00:00", source="heart", kind="episode.finished",
+                    episode_id="ep2", task_id="t2",
+                    payload={"outcome": "fail", "reward": 0.0, "cost_usd": 0.05,
+                             "goal_id": "g1", "feature_id": "f2"})
+        self._write(ts="2026-01-01T00:02:00+00:00", source="heart", kind="episode.finished",
+                    episode_id="ep-other", task_id="t3",
+                    payload={"outcome": "pass", "goal_id": "g-other", "feature_id": "fx"})
+
+        lines = pulse.goal_timeline("g1")
+        self.assertIn("goal g1: features=2 episodes=2", lines[0])
+        self.assertIn("pass=1", lines[0])
+        self.assertIn("fail=1", lines[0])
+        self.assertTrue(any(
+            "feature f1: episode ep1 outcome=pass reward=0.9 cost=$0.12" in l for l in lines))
+        self.assertTrue(any("feature f2: episode ep2 outcome=fail" in l for l in lines))
+        self.assertFalse(any("ep-other" in l for l in lines))
+
+    def test_goal_timeline_empty(self):
+        from heart import pulse
+
+        self.assertEqual(pulse.goal_timeline("nope"), ["no events for goal nope"])
+
+    def test_cli_pulse_goal(self):
+        self._write(ts="2026-01-01T00:00:00+00:00", source="heart", kind="episode.finished",
+                    episode_id="ep1", task_id="t1",
+                    payload={"outcome": "pass", "reward": 1.0, "cost_usd": 0.1,
+                             "goal_id": "g2", "feature_id": "f1"})
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(cli_main(["pulse", "goal", "g2"]), 0)
+        self.assertIn("goal g2:", buf.getvalue())
+
+
+class TestHealthRules(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
+        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+
+    def tearDown(self):
+        if self._old_spool is None:
+            os.environ.pop("HEART_SPOOL_DIR", None)
+        else:
+            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+        self.tmp.cleanup()
+
+    def _write(self, **event):
+        from heart.events import spool_dir
+
+        d = spool_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "20260101.ndjson", "a") as f:
+            f.write(json.dumps(event) + "\n")
+
+    def test_review2_reject_streak_warns(self):
+        from heart import pulse
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for i, verdict in enumerate(["approve", "reject", "reject", "reject"]):
+            ts = (now - datetime.timedelta(minutes=10 - i)).isoformat()
+            self._write(ts=ts, source="heart", kind="episode.finished", episode_id=f"ep{i}",
+                        payload={"outcome": "fail", "review_verdict": verdict})
+        lines, code = pulse.health(hours=1)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("reject" in l.lower() and "streak" in l.lower() for l in lines))
+
+    def test_review2_reject_streak_ok_when_mixed(self):
+        from heart import pulse
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for i, verdict in enumerate(["reject", "approve", "reject"]):
+            ts = (now - datetime.timedelta(minutes=10 - i)).isoformat()
+            self._write(ts=ts, source="heart", kind="episode.finished", episode_id=f"ep{i}",
+                        payload={"outcome": "fail", "review_verdict": verdict})
+        lines, code = pulse.health(hours=1)
+        self.assertFalse(any("streak" in l.lower() for l in lines))
+
+    def test_cost_alert(self):
+        from heart import pulse
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._write(ts=now, source="heart", kind="episode.finished", episode_id="ep1",
+                    payload={"outcome": "pass", "cost_usd": 5.0})
+        self._write(ts=now, source="heart", kind="episode.finished", episode_id="ep2",
+                    payload={"outcome": "pass", "cost_usd": 6.0})
+        old = os.environ.get("HEART_COST_ALERT")
+        os.environ["HEART_COST_ALERT"] = "10"
+        try:
+            lines, code = pulse.health(hours=1)
+        finally:
+            if old is None:
+                os.environ.pop("HEART_COST_ALERT", None)
+            else:
+                os.environ["HEART_COST_ALERT"] = old
+        self.assertEqual(code, 1)
+        self.assertTrue(any("cost" in l.lower() and "10.00" in l for l in lines))
+
+    def test_silent_stall_warns_when_goal_active(self):
+        from heart import pulse
+
+        old_ts = "2026-01-01T00:00:00+00:00"
+        self._write(ts=old_ts, source="heart", kind="episode.started", episode_id="ep-old")
+        old = os.environ.get("PLEXUS_GOAL_ACTIVE")
+        os.environ["PLEXUS_GOAL_ACTIVE"] = "1"
+        try:
+            lines, code = pulse.health(hours=999999)
+        finally:
+            if old is None:
+                os.environ.pop("PLEXUS_GOAL_ACTIVE", None)
+            else:
+                os.environ["PLEXUS_GOAL_ACTIVE"] = old
+        self.assertEqual(code, 1)
+        self.assertTrue(any("stall" in l.lower() for l in lines))
+
+    def test_silent_stall_inert_without_env(self):
+        from heart import pulse
+
+        old_ts = "2026-01-01T00:00:00+00:00"
+        self._write(ts=old_ts, source="heart", kind="episode.started", episode_id="ep-old")
+        os.environ.pop("PLEXUS_GOAL_ACTIVE", None)
+        lines, code = pulse.health(hours=999999)
+        self.assertFalse(any("stall" in l.lower() for l in lines))
+
+
 class TestPulseServe(unittest.TestCase):
     def test_page_and_insights_endpoints(self):
         import threading
@@ -839,6 +1052,54 @@ class TestPulseServe(unittest.TestCase):
                 os.environ.pop("HEART_SPOOL_DIR", None)
             else:
                 os.environ["HEART_SPOOL_DIR"] = old
+
+    def test_steer_and_episode_drilldown_endpoints(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        from heart import serve as serve_mod
+        from heart.serve import Handler
+
+        old_spool = os.environ.get("HEART_SPOOL_DIR")
+        os.environ["HEART_SPOOL_DIR"] = tempfile.mkdtemp()
+        runs_dir = Path(tempfile.mkdtemp())
+        ep_dir = runs_dir / "ep-drill"
+        ep_dir.mkdir()
+        (ep_dir / "diff.patch").write_text("--- a/x\n+++ b/x\n")
+        (ep_dir / "implement.log").write_text("did the thing\n")
+
+        old_runs_dir = serve_mod.RUNS_DIR
+        serve_mod.RUNS_DIR = runs_dir
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+            req = urllib.request.Request(
+                base + "/api/steer?episode=ep-drill", data=b"focus on edge cases", method="POST")
+            resp = urllib.request.urlopen(req)
+            self.assertEqual(resp.status, 204)
+            self.assertEqual((ep_dir / "steer.txt").read_text(), "focus on edge cases")
+
+            req2 = urllib.request.Request(
+                base + "/api/steer?episode=nope", data=b"x", method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req2)
+            self.assertEqual(ctx.exception.code, 404)
+
+            api = json.loads(urllib.request.urlopen(base + "/api/episode?id=ep-drill").read())
+            self.assertEqual(api["diff"], "--- a/x\n+++ b/x\n")
+            self.assertIn("implement", api["logs"])
+            self.assertIn("did the thing", api["logs"]["implement"])
+        finally:
+            httpd.shutdown()
+            serve_mod.RUNS_DIR = old_runs_dir
+            if old_spool is None:
+                os.environ.pop("HEART_SPOOL_DIR", None)
+            else:
+                os.environ["HEART_SPOOL_DIR"] = old_spool
 
 
 if __name__ == "__main__":
