@@ -44,6 +44,14 @@ def emit(
         ):
             if value is not None:
                 event[key] = value
+        # goal lineage: plexus sets these env vars around its dispatch; every
+        # event heart emits picks them up unless the call site already set
+        # them explicitly (additive payload fields, SPINE.md-legal)
+        for key, env_var in (("goal_id", "PLEXUS_GOAL_ID"), ("feature_id", "PLEXUS_FEATURE_ID")):
+            if key not in payload:
+                value = os.environ.get(env_var)
+                if value:
+                    payload[key] = value
         if payload:
             event["payload"] = payload
         d = spool_dir()

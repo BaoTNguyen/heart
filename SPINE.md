@@ -30,7 +30,11 @@ Append-only NDJSON, one event per line:
 Correlation model: `episode_id > run_id > role / turn_id > decision_id`.
 Above episodes, plexus threads goal lineage through `task_id` by convention —
 `<goal_id>-<feature_id>-a<attempt>` — plus `goal_id`/`feature_id` payload
-fields on its own events; no field changes here were needed.
+fields on its own events; no field changes here were needed. heart's own
+`events.emit()` mirrors this: when `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` are set
+in the environment, it stamps `payload.goal_id`/`payload.feature_id` onto
+every event it emits (optional, additive, skipped if the call site already
+set them) — `pulse goal <goal-id>` reads this back.
 
 ## Spool location
 

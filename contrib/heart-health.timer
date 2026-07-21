@@ -1,0 +1,29 @@
+# heart pulse health, alerted every 10 minutes via a systemd --user timer.
+# No sudo required.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/heart-health.service contrib/heart-health.timer ~/.config/systemd/user/
+#   # edit ExecStart in ~/.config/systemd/user/heart-health.service to the
+#   # absolute path of contrib/heart-health-check.sh in this checkout, and
+#   # make sure `heart` is on PATH for that unit (or hardcode its path too)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now heart-health.timer
+#
+# Verify:
+#   systemctl --user status heart-health.timer
+#   journalctl --user -u heart-health.service -n 20
+#
+# Optional: set NTFY_TOPIC in heart-health.service's [Service] section to
+# also push alerts to https://ntfy.sh/<topic> (see that file).
+
+[Unit]
+Description=Run heart pulse health every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=heart-health.service
+
+[Install]
+WantedBy=timers.target

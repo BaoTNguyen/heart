@@ -64,6 +64,20 @@ def _review_verdict(log_path: Path) -> str | None:
     return hits[-1].lower() if hits else None
 
 
+def _consume_steer(out: Path) -> str | None:
+    """Read+clear a mid-run steer note the dashboard dropped into the
+    episode's own out dir (`serve.py`'s POST /api/steer writes steer.txt
+    there). Returns None when absent or whitespace-only."""
+    path = out / "steer.txt"
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return None
+    path.write_text("")
+    return text
+
+
 def _failure_tail(results: dict[str, dict]) -> str:
     return "\n".join(
         f"[{name}] FAILED (exit {r['exit_code']}):\n{r['output_tail'][-1500:]}"
@@ -135,6 +149,11 @@ def _fix_loop(
             f"Fix the code so they pass. Do not weaken or delete tests.\n"
             f"Original task: {task.prompt}"
         )
+        steer = _consume_steer(out)
+        if steer:
+            prompt += f"\n\nOperator note (mid-run steer): {steer}"
+            emit("heart", "steer.received", episode_id=episode_id, task_id=task.task_id,
+                 chars=len(steer))
         _agent_turn(f"fix{attempt + 1}", fix_agent, prompt, ws, env, task, out,
                     agent_cmd, runs_log)
     return rounds
@@ -221,9 +240,15 @@ def _run_episode(
                 router.resolve(role["tier"], default=agent)
                 if routed and role.get("tier") else agent
             )
+            prompt = role["prompt"].format(prompt=task.prompt)
+            steer = _consume_steer(out)
+            if steer:
+                prompt += f"\n\nOperator note (mid-run steer): {steer}"
+                emit("heart", "steer.received", episode_id=episode_id, task_id=task.task_id,
+                     chars=len(steer))
             emit("heart", "role.started", episode_id=episode_id, task_id=task.task_id,
                  role=role["name"], agent=role_agent, memory=mem)
-            _agent_turn(role["name"], role_agent, role["prompt"].format(prompt=task.prompt),
+            _agent_turn(role["name"], role_agent, prompt,
                         ws, role_env, task, out, agent_cmd, runs_log, memory=mem)
             if role.get("verify_after") and can_fix:
                 verify_rounds = _fix_loop(
