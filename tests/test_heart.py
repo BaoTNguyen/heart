@@ -662,6 +662,157 @@ class TestCost(unittest.TestCase):
                 os.environ["HEART_INGEST"] = old_ingest
 
 
+class TestGuardrails(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.commit = make_repo(self.root)
+        self.runs = self.root / "runs"
+        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
+        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_ingest = os.environ.get("HEART_INGEST")
+        os.environ["HEART_INGEST"] = "off"
+
+    def tearDown(self):
+        if self._old_spool is None:
+            os.environ.pop("HEART_SPOOL_DIR", None)
+        else:
+            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+        if self._old_ingest is None:
+            os.environ.pop("HEART_INGEST", None)
+        else:
+            os.environ["HEART_INGEST"] = self._old_ingest
+        self.tmp.cleanup()
+
+    def test_scan_secrets_true_positives(self):
+        from heart.guard import scan_secrets
+
+        cases = {
+            "aws_access_key": '+AWS_KEY = "AKIAEXAMPLE0EXAMPLE0"',
+            "private_key": "+-----BEGIN RSA PRIVATE KEY-----",
+            "github_token": '+token = "ghp_' + "x" * 36 + '"',
+            "slack_token": '+SLACK_TOKEN = "xoxb-1234567890-abcdefghij"',
+            "generic_secret_assignment": '+api_key: "abcdefghijklmnopqrstuvwx"',
+        }
+        for rule, line in cases.items():
+            with self.subTest(rule=rule):
+                hits = scan_secrets(line)
+                self.assertTrue(hits, f"expected a hit for {rule}: {line}")
+                self.assertTrue(any(h.startswith(rule) for h in hits), hits)
+                # never leak the full secret value into the hit description:
+                # each hit is "<rule>: <snippet<=60 chars>", never the raw line
+                for h in hits:
+                    _, _, snippet = h.partition(": ")
+                    self.assertLessEqual(len(snippet), 60)
+
+    def test_scan_secrets_ignores_benign_lookalikes(self):
+        from heart.guard import scan_secrets
+
+        diff = "\n".join([
+            '+sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"',
+            "+# the user's password is stored in the vault, not here",
+            "+thisisnotanAKIAsecretjustalongword",
+            "+++ b/some/file.py",  # file header, not an added line
+        ])
+        self.assertEqual(scan_secrets(diff), [])
+
+    def test_secret_in_diff_yields_guardrail_violation(self):
+        prompt = 'printf \'AWS_KEY = "AKIAEXAMPLE0EXAMPLE0"\\n\' >> calc.py'
+        task = TaskSpec(
+            task_id="toy-secret",
+            repo_path=str(self.root / "toyrepo"),
+            base_commit=self.commit,
+            prompt=prompt,
+            public_verifiers=[Verifier(name="unit", command="python3 -m unittest -q test_calc")],
+            timeout_seconds=60,
+        )
+        ep = run_episode(task, agent="shell", runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "guardrail_violation")
+        self.assertEqual(ep["reward"]["total"], 0.0)
+        self.assertTrue(ep["violations"])
+
+
+class TestDetectStatic(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_tsc_requires_installed_binary(self):
+        repo = self.root / "tsrepo"
+        repo.mkdir()
+        (repo / "tsconfig.json").write_text("{}")
+        # tsconfig.json present but no node_modules/.bin/tsc: must not detect
+        names = [v.name for v in detect_verifiers(repo)]
+        self.assertNotIn("tsc", names)
+
+    def test_tsc_detected_when_binary_present(self):
+        repo = self.root / "tsrepo2"
+        binp = repo / "node_modules" / ".bin"
+        binp.mkdir(parents=True)
+        (repo / "tsconfig.json").write_text("{}")
+        (binp / "tsc").write_text("#!/bin/sh\n")
+        (binp / "tsc").chmod(0o755)
+        names = [v.name for v in detect_verifiers(repo)]
+        self.assertIn("tsc", names)
+
+    @unittest.skipUnless(shutil.which("ruff"), "ruff not installed")
+    def test_ruff_detected_when_config_and_tool_present(self):
+        repo = self.root / "pyrepo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n")
+        names = [v.name for v in detect_verifiers(repo)]
+        self.assertIn("ruff", names)
+
+    def test_ruff_not_detected_without_config(self):
+        repo = self.root / "pyrepo2"
+        repo.mkdir()
+        names = [v.name for v in detect_verifiers(repo)]
+        self.assertNotIn("ruff", names)
+
+
+class TestClean(unittest.TestCase):
+    def test_clean_removes_old_episodes_keeps_fresh_and_summary(self):
+        import time
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            runs_dir = Path(tmp.name) / "runs"
+            old_dir = runs_dir / "old-episode"
+            fresh_dir = runs_dir / "fresh-episode"
+            old_dir.mkdir(parents=True)
+            fresh_dir.mkdir(parents=True)
+            (old_dir / "episode.json").write_text("{}")
+            (fresh_dir / "episode.json").write_text("{}")
+            summary = runs_dir / "summary.csv"
+            summary.write_text("episode_id,task_id\n")
+
+            old_ts = time.time() - 20 * 86400  # 20 days old
+            os.utime(old_dir / "episode.json", (old_ts, old_ts))
+
+            old_ws_root = os.environ.get("HEART_WS_ROOT")
+            os.environ["HEART_WS_ROOT"] = str(Path(tmp.name) / "no-such-ws-root")
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["clean", "--runs-dir", str(runs_dir), "--days", "7"])
+            finally:
+                if old_ws_root is None:
+                    os.environ.pop("HEART_WS_ROOT", None)
+                else:
+                    os.environ["HEART_WS_ROOT"] = old_ws_root
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(fresh_dir.exists())
+            self.assertTrue(summary.exists())
+            self.assertIn("1 run(s) removed", buf.getvalue())
+        finally:
+            tmp.cleanup()
+
+
 class TestPulseServe(unittest.TestCase):
     def test_page_and_insights_endpoints(self):
         import threading
