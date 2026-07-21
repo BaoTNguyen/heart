@@ -17,9 +17,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import pulse
+from .cli import WORK_RUNS_DIR
 from .events import spool_dir
 
 PAGE = Path(__file__).with_name("pulse.html")
+
+# episode dirs for steering (§6.4 item 1) and drill-down (§6.4 item 2) live
+# here; cli.py imports serve lazily inside cmd_pulse, so importing WORK_RUNS_DIR
+# here at module scope creates no import cycle
+RUNS_DIR = WORK_RUNS_DIR
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,8 +51,40 @@ class Handler(BaseHTTPRequestHandler):
                 "health": {"lines": h_lines, "code": h_code},
             }).encode()
             return self._send(body, "application/json")
+        if url.path == "/api/episode":
+            episode = parse_qs(url.query).get("id", [None])[0]
+            if not episode:
+                return self.send_error(400)
+            ep_dir = RUNS_DIR / episode
+            diff_path = ep_dir / "diff.patch"
+            diff = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else None
+            logs = {
+                log_path.stem: log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                for log_path in sorted(ep_dir.glob("*.log"))
+            } if ep_dir.is_dir() else {}
+            body = json.dumps({
+                "timeline": pulse.episode_timeline(episode), "diff": diff, "logs": logs,
+            }).encode()
+            return self._send(body, "application/json")
         if url.path == "/stream":
             return self._stream(float(parse_qs(url.query).get("hours", ["24"])[0]))
+        self.send_error(404)
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        url = urlparse(self.path)
+        if url.path == "/api/steer":
+            episode = parse_qs(url.query).get("episode", [None])[0]
+            if not episode:
+                return self.send_error(400)
+            ep_dir = RUNS_DIR / episode
+            if not ep_dir.is_dir():
+                return self.send_error(404)
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else b""
+            (ep_dir / "steer.txt").write_bytes(body)
+            self.send_response(204)
+            self.end_headers()
+            return
         self.send_error(404)
 
     def _stream(self, hours: float) -> None:
@@ -87,7 +125,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def serve(port: int = 7717) -> None:
+def serve(port: int = 7717, runs_dir: str | Path | None = None) -> None:
+    global RUNS_DIR
+    if runs_dir is not None:
+        RUNS_DIR = Path(runs_dir)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"heart pulse: http://127.0.0.1:{port}  (Ctrl-C to stop)")
     try:

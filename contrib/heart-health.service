@@ -1,0 +1,11 @@
+# heart pulse health, as a systemd --user oneshot unit. Install alongside
+# heart-health.timer — see that file's header comments for the one-liner.
+[Unit]
+Description=heart pulse health check
+
+[Service]
+Type=oneshot
+# Edit this path to the absolute path of heart-health-check.sh in your checkout.
+ExecStart=/bin/sh /path/to/heart/contrib/heart-health-check.sh
+# Uncomment and set to also push alerts to https://ntfy.sh/<topic>:
+# Environment=NTFY_TOPIC=your-topic-here

@@ -146,6 +146,23 @@ Operational switches:
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
   all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
+- **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
+  outcome/reward/cost, grouped from `episode.finished` events whose payload
+  carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
+  from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
+- **Steering + episode drill-down** (`pulse serve`): running-episode cards get
+  a one-line text box — `POST /api/steer?episode=<id>` drops a note into that
+  episode's runs dir, which the next role turn (or fix-loop attempt) appends
+  to its prompt as an operator note and logs a `steer.received` event.
+  Clicking a card's episode id opens a drill-down overlay with the full
+  timeline, the captured diff, and per-role log tails.
+- **Health alerting timer**: `contrib/heart-health.timer` + `.service` are
+  systemd **user** units (no sudo) that run `heart pulse health --hours 1`
+  every 10 minutes and fire a `notify-send` (plus an optional `ntfy.sh` push
+  via `NTFY_TOPIC`) on the first WARN line. `pulse health` also now flags a
+  review2-reject streak (3 most recent reviewed episodes all rejected), a
+  `HEART_COST_ALERT` dollar ceiling on window spend, and (once plexus wires
+  `PLEXUS_GOAL_ACTIVE`) a silently-stalled factory.
 - **Static verifiers**: `detect_verifiers` also picks up `ruff`, `mypy`,
   `tsc`, `eslint`, and `biome` when both the tool's config and the tool
   itself are locally installed — never anything that downloads (no `npx`,
