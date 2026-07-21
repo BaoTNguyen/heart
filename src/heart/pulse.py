@@ -190,9 +190,36 @@ def insights(hours: float = 24) -> list[str]:
             outs = [_payload(finished[eid]).get("outcome")
                     for eid, t in routes.items() if t == tier and eid in finished]
             if outs:
-                parts.append(f"{tier}={sum(o == 'pass' for o in outs)}/{len(outs)} pass")
+                part = f"{tier}={sum(o == 'pass' for o in outs)}/{len(outs)} pass"
+                costs = [_payload(finished[eid])["cost_usd"]
+                         for eid, t in routes.items()
+                         if t == tier and eid in finished
+                         and _payload(finished[eid]).get("cost_usd") is not None]
+                if costs:
+                    part += f" ${sum(costs) / len(costs):.2f}/ep"
+                parts.append(part)
         if parts:
             lines.append("routing: " + ", ".join(parts))
+
+    # cost: heart's own pricing map, not CLI-reported dollars (subscription
+    # seats carry tokens only, by design — see runner._extract_usage)
+    costs = [_payload(e)["cost_usd"] for e in finished.values()
+             if _payload(e).get("cost_usd") is not None]
+    pass_costs = [_payload(e)["cost_usd"] for e in finished.values()
+                  if _payload(e).get("cost_usd") is not None and _payload(e).get("outcome") == "pass"]
+    tok_in = [_payload(e)["tokens_in"] for e in finished.values()
+              if _payload(e).get("tokens_in") is not None]
+    tok_out = [_payload(e)["tokens_out"] for e in finished.values()
+               if _payload(e).get("tokens_out") is not None]
+    if costs or tok_in or tok_out:
+        parts = []
+        if costs:
+            parts.append(f"total=${sum(costs):.2f}")
+            if pass_costs:
+                parts.append(f"per-pass=${sum(pass_costs) / len(pass_costs):.2f}")
+        if tok_in or tok_out:
+            parts.append(f"tokens in={sum(tok_in)} out={sum(tok_out)}")
+        lines.append("cost: " + "  ".join(parts))
 
     gate = Counter(_payload(e).get("chosen") for e in events
                    if e["kind"] == "decision.retrieval.gate")

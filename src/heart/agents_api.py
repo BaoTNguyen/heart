@@ -73,7 +73,7 @@ def _chat(cfg: dict, messages: list[dict]) -> dict:
     }).encode()
     req = urllib.request.Request(cfg["endpoint"] + "/chat/completions", data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.load(resp)["choices"][0]["message"]
+        return json.load(resp)
 
 
 def _bash(command: str) -> str:
@@ -109,18 +109,33 @@ def _arteries_context(prompt: str) -> str:
         return ""
 
 
+def _accumulate_usage(totals: dict, response: dict) -> None:
+    usage = response.get("usage") or {}
+    tin = usage.get("prompt_tokens", usage.get("input_tokens"))
+    tout = usage.get("completion_tokens", usage.get("output_tokens"))
+    if tin is not None:
+        totals["tokens_in"] = totals.get("tokens_in", 0) + tin
+    if tout is not None:
+        totals["tokens_out"] = totals.get("tokens_out", 0) + tout
+
+
 def main() -> int:
     cfg = resolve_config()
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM + _repo_map()},
         {"role": "user", "content": sys.argv[1] + _arteries_context(sys.argv[1])},
     ]
+    usage_totals: dict = {}
     for _ in range(int(os.environ.get("HEART_API_MAX_TURNS", "20"))):
-        msg = _chat(cfg, messages)
+        response = _chat(cfg, messages)
+        _accumulate_usage(usage_totals, response)
+        msg = response["choices"][0]["message"]
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         if not calls:
             print(msg.get("content") or "")
+            if usage_totals:
+                print(f"HEART_USAGE={json.dumps(usage_totals)}")
             return 0
         for call in calls:
             args = json.loads(call["function"]["arguments"] or "{}")
@@ -133,6 +148,8 @@ def main() -> int:
                 "content": result,
             })
     print("max turns reached", file=sys.stderr)
+    if usage_totals:
+        print(f"HEART_USAGE={json.dumps(usage_totals)}")
     return 1
 
 

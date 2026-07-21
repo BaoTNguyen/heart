@@ -1,6 +1,7 @@
 """Headless agent execution inside a workspace."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -13,7 +14,8 @@ from pathlib import Path
 #   any paid or local model; select a profile with "api:<name>".
 # "shell" runs the prompt as a bash script — tests and scripted baselines.
 AGENT_COMMANDS: dict[str, list[str]] = {
-    "claude": ["claude", "-p", "{prompt}", "--dangerously-skip-permissions"],
+    "claude": ["claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+               "--output-format", "json"],
     "codex": ["codex", "exec", "--full-auto", "{prompt}"],
     "gemini": ["gemini", "--yolo", "-p", "{prompt}"],
     "opencode": ["opencode", "run", "{prompt}"],
@@ -83,6 +85,66 @@ def sandbox_wrap(
     return [*args, *cmd], False
 
 
+def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
+    """Pull tokens_in/tokens_out out of a role log, per agent family. Never
+    raises: a log that doesn't parse (older CLI, crash, empty timeout log)
+    just means honest Nones, not a broken episode."""
+    none = {"tokens_in": None, "tokens_out": None}
+    log_path = Path(log_path)
+    if base_agent == "claude":
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            envelope = json.loads(text)
+            result = envelope["result"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return none
+        usage = envelope.get("usage") or {}
+        # total_cost_usd is deliberately ignored here: cost comes only from
+        # our own pricing map (_price) so subscription seats never report
+        # fake dollars — Claude CLI's cost field assumes metered pricing that
+        # a Pro/Max seat doesn't actually pay.
+        tokens_in = usage.get("input_tokens")
+        tokens_out = usage.get("output_tokens")
+        # downstream code greps role logs for verdicts/failure tails and
+        # expects plain text, so rewrite the log to just the result
+        log_path.write_text(result, encoding="utf-8")
+        return {"tokens_in": tokens_in, "tokens_out": tokens_out}
+    if base_agent == "api":
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return none
+        for line in reversed(lines):
+            if line.startswith("HEART_USAGE="):
+                try:
+                    payload = json.loads(line[len("HEART_USAGE="):])
+                except json.JSONDecodeError:
+                    return none
+                return {"tokens_in": payload.get("tokens_in"), "tokens_out": payload.get("tokens_out")}
+        return none
+    return none
+
+
+def _price(agent: str, tokens_in: int | None, tokens_out: int | None) -> float | None:
+    if tokens_in is None or tokens_out is None:
+        return None
+    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+    try:
+        pricing = json.loads(path.read_text()).get("pricing", {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    base = agent.partition(":")[0]
+    entry = pricing.get(agent) or pricing.get(base)
+    if not entry:
+        return None
+    try:
+        in_rate = entry["in_per_mtok"]
+        out_rate = entry["out_per_mtok"]
+    except KeyError:
+        return None
+    return round(tokens_in * in_rate / 1e6 + tokens_out * out_rate / 1e6, 6)
+
+
 def run_agent(
     agent: str,
     prompt: str,
@@ -125,8 +187,12 @@ def run_agent(
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             exit_code, timed_out = -1, True
+    u = _extract_usage(log_path, base)
     return {
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_s": round(time.monotonic() - t0, 2),
+        "tokens_in": u["tokens_in"],
+        "tokens_out": u["tokens_out"],
+        "cost_usd": _price(agent, u["tokens_in"], u["tokens_out"]),
     }

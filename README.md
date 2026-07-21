@@ -137,6 +137,11 @@ Operational switches:
   re-runs the sweep any time (dedup makes it safe).
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
   a cheap tier that keeps failing means the classifier thresholds need moving.
+- **Cost capture**: `runner.run_agent` extracts tokens (and, with a
+  `~/.config/heart/models.json` `"pricing"` map keyed by agent string,
+  dollars) per role and rolls them into `episode["usage"]` and the spine.
+  Subscription CLI seats (`claude`) get tokens only unless priced explicitly —
+  no fake dollars for a quota you already paid for.
 - **`heart pulse serve`**: the factory floor as a local web page
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
   all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,

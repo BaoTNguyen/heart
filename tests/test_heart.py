@@ -550,6 +550,118 @@ class TestSandbox(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+class TestCost(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_extract_usage_claude_envelope(self):
+        from heart.runner import _extract_usage
+
+        log = self.root / "implement.log"
+        log.write_text(json.dumps({
+            "result": "did the thing",
+            "usage": {"input_tokens": 100, "output_tokens": 40},
+            "total_cost_usd": 1.23,
+        }))
+        usage = _extract_usage(log, "claude")
+        self.assertEqual(usage, {"tokens_in": 100, "tokens_out": 40})
+        # downstream code greps the log for plain text (verdicts, failure tails)
+        self.assertEqual(log.read_text(), "did the thing")
+
+    def test_extract_usage_garbage_log(self):
+        from heart.runner import _extract_usage
+
+        log = self.root / "implement.log"
+        log.write_text("not json at all\njust agent chatter\n")
+        self.assertEqual(_extract_usage(log, "claude"), {"tokens_in": None, "tokens_out": None})
+
+        missing = self.root / "missing.log"
+        self.assertEqual(_extract_usage(missing, "claude"), {"tokens_in": None, "tokens_out": None})
+
+    def test_extract_usage_api_heart_usage_line(self):
+        from heart.runner import _extract_usage
+
+        log = self.root / "solo.log"
+        log.write_text("$ echo hi\nhi\nHEART_USAGE={\"tokens_in\": 12, \"tokens_out\": 34}\n")
+        self.assertEqual(_extract_usage(log, "api"), {"tokens_in": 12, "tokens_out": 34})
+
+        log2 = self.root / "no-usage.log"
+        log2.write_text("$ echo hi\nhi\n")
+        self.assertEqual(_extract_usage(log2, "api"), {"tokens_in": None, "tokens_out": None})
+
+        self.assertEqual(_extract_usage(log, "shell"), {"tokens_in": None, "tokens_out": None})
+
+    def test_price(self):
+        from heart.runner import _price
+
+        cfgdir = self.root / "cfg" / "heart"
+        cfgdir.mkdir(parents=True)
+        (cfgdir / "models.json").write_text(json.dumps({
+            "pricing": {
+                "api:qwen": {"in_per_mtok": 1.0, "out_per_mtok": 2.0},
+                "claude": {"in_per_mtok": 3.0, "out_per_mtok": 15.0},
+            }
+        }))
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
+        try:
+            # exact match
+            self.assertEqual(_price("api:qwen", 1_000_000, 1_000_000), 3.0)
+            # base fallback: "claude:opus" -> "claude" entry
+            self.assertEqual(_price("claude:opus", 1_000_000, 1_000_000), 18.0)
+            # no pricing entry for this agent
+            self.assertIsNone(_price("gemini", 1_000_000, 1_000_000))
+            # missing tokens
+            self.assertIsNone(_price("claude", None, 100))
+        finally:
+            if old is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+
+    def test_episode_usage_is_none_for_shell_agent_and_insights_survives(self):
+        from heart import pulse
+        from heart.episode import run_episode
+
+        old_spool = os.environ.get("HEART_SPOOL_DIR")
+        old_ingest = os.environ.get("HEART_INGEST")
+        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        os.environ["HEART_INGEST"] = "off"
+        try:
+            commit = make_repo(self.root)
+            task = TaskSpec(
+                task_id="toy-add-fix",
+                repo_path=str(self.root / "toyrepo"),
+                base_commit=commit,
+                prompt=FIX_CMD,
+                denied_paths=["test_calc.py"],
+                public_verifiers=[Verifier(name="unit", command="python3 -m unittest -q test_calc")],
+                timeout_seconds=60,
+            )
+            ep = run_episode(task, agent="shell", runs_dir=self.root / "runs")
+            for r in ep["roles"]:
+                self.assertIn("tokens_in", r)
+                self.assertIsNone(r["tokens_in"])
+                self.assertIsNone(r["tokens_out"])
+                self.assertIsNone(r["cost_usd"])
+            self.assertEqual(ep["usage"], {"tokens_in": None, "tokens_out": None, "cost_usd": None})
+            # must not crash even though no episode in this window carries cost
+            pulse.insights(hours=24)
+        finally:
+            if old_spool is None:
+                os.environ.pop("HEART_SPOOL_DIR", None)
+            else:
+                os.environ["HEART_SPOOL_DIR"] = old_spool
+            if old_ingest is None:
+                os.environ.pop("HEART_INGEST", None)
+            else:
+                os.environ["HEART_INGEST"] = old_ingest
+
+
 class TestPulseServe(unittest.TestCase):
     def test_page_and_insights_endpoints(self):
         import threading
