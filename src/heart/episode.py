@@ -106,7 +106,9 @@ def _agent_turn(
     )
     emit("heart", "role.finished", episode_id=env.get("ARTERIES_EPISODE_ID"),
          task_id=task.task_id, role=role, duration_ms=int(r["duration_s"] * 1000),
-         agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"])
+         agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"],
+         tokens_in=r.get("tokens_in"), tokens_out=r.get("tokens_out"),
+         cost_usd=r.get("cost_usd"))
     return r
 
 
@@ -297,6 +299,16 @@ def _run_episode(
     else:
         score = {"total": 0.0, "components": {}}
 
+    def _sum(key: str) -> float | int | None:
+        vals = [r[key] for r in runs_log if r.get(key) is not None]
+        return sum(vals) if vals else None
+
+    cost_total = _sum("cost_usd")
+    usage = {
+        "tokens_in": _sum("tokens_in"), "tokens_out": _sum("tokens_out"),
+        "cost_usd": round(cost_total, 6) if cost_total is not None else None,
+    }
+
     episode = {
         "episode_id": episode_id,
         "task_id": task.task_id,
@@ -317,12 +329,14 @@ def _run_episode(
         "hidden_verifier_results": hidden_results,
         "diff_lines": reward_mod.diff_changed_lines(diff),
         "reward": score,
+        "usage": usage,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     (out / "episode.json").write_text(json.dumps(episode, indent=2))
+    usage_payload = {k: v for k, v in usage.items() if v is not None}
     emit("heart", "episode.finished", episode_id=episode_id, task_id=task.task_id,
          duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
-         reward=score["total"], review_verdict=review_verdict)
+         reward=score["total"], review_verdict=review_verdict, **usage_payload)
     return episode
 
 
