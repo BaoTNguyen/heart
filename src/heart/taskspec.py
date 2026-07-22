@@ -32,6 +32,10 @@ class TaskSpec:
     difficulty: str = "unknown"
     tags: list[str] = field(default_factory=list)
     fix_commit: str | None = None  # known-good commit; check-task verifies it passes
+    # Marker the caller told the agent to emit when a decision is missing, e.g.
+    # "PLEXUS_BLOCKED:". Seeing it makes the episode `blocked` — the agent chose
+    # not to guess. Heart supplies the mechanism; the vocabulary is the caller's.
+    blocked_marker: str | None = None
 
 
 def load_task(path: str | Path) -> TaskSpec:

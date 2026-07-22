@@ -18,7 +18,7 @@ from . import pulse as pulse_mod
 from . import reward as reward_mod
 from .detect import detect_verifiers
 from .events import emit
-from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
+from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode, run_swarm
 from .export import export_episodes
 from .taskspec import TaskSpec, Verifier, load_task, load_tasks
 from .training import datasets
@@ -51,6 +51,16 @@ def _episode_kwargs(args) -> dict:
     )
 
 
+def _swarm_agents(args) -> list[str]:
+    return [a.strip() for a in args.swarm.split(",") if a.strip()]
+
+
+def _swarm_kwargs(args) -> dict:
+    kwargs = _episode_kwargs(args)
+    kwargs.pop("agent", None)
+    return kwargs
+
+
 def _ingest_rewards(runs_dir) -> None:
     """Best-effort credit-assignment bridge: hand finished episodes to arteries'
     reward ledger when its CLI is installed. A subprocess, not an import — heart
@@ -71,15 +81,22 @@ def _ingest_rewards(runs_dir) -> None:
 
 def cmd_run(args) -> int:
     task = load_task(args.task)
-    eps = run_candidates(
-        task, args.candidates,
-        memory_mode=args.memory, retrieval=not args.no_retrieval,
-        **_episode_kwargs(args),
-    )
-    ep = best_episode(eps)
-    if len(eps) > 1:
-        for e in eps:
-            print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
+    if args.swarm:
+        ep = run_swarm(
+            task, _swarm_agents(args),
+            memory_mode=args.memory, retrieval=not args.no_retrieval,
+            **_swarm_kwargs(args),
+        )
+    else:
+        eps = run_candidates(
+            task, args.candidates,
+            memory_mode=args.memory, retrieval=not args.no_retrieval,
+            **_episode_kwargs(args),
+        )
+        ep = best_episode(eps)
+        if len(eps) > 1:
+            for e in eps:
+                print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
     print(json.dumps({k: ep[k] for k in ("episode_id", "task_id", "outcome", "reward")}, indent=2))
     _ingest_rewards(args.runs_dir)
     return 0 if ep["outcome"] == "pass" else 1
@@ -119,10 +136,16 @@ def cmd_work(args) -> int:
         denied_paths=[".github/workflows/"],
         public_verifiers=verifiers, timeout_seconds=args.timeout,
     )
-    kwargs = _episode_kwargs(args)
-    if not args.solo:
-        kwargs["roles"] = kwargs["roles"] or DEFAULT_ROLES
-    ep = best_episode(run_candidates(task, args.candidates, **kwargs))
+    if args.swarm:
+        kwargs = _swarm_kwargs(args)
+        if not args.solo:
+            kwargs["roles"] = kwargs["roles"] or DEFAULT_ROLES
+        ep = run_swarm(task, _swarm_agents(args), **kwargs)
+    else:
+        kwargs = _episode_kwargs(args)
+        if not args.solo:
+            kwargs["roles"] = kwargs["roles"] or DEFAULT_ROLES
+        ep = best_episode(run_candidates(task, args.candidates, **kwargs))
 
     ep_dir = Path(args.runs_dir) / ep["episode_id"]
     print(json.dumps({k: ep[k] for k in ("episode_id", "outcome", "review_verdict", "reward")}, indent=2))
@@ -263,7 +286,10 @@ def cmd_stats(args) -> int:
     for key in sorted(groups):
         eps = groups[key]
         passed = sum(e["outcome"] == "pass" for e in eps)
-        mean_r = sum(e["reward"]["total"] for e in eps) / len(eps)
+        # blocked/unverified episodes carry no reward; averaging them in as 0
+        # would drag the mean down for episodes that were never scored at all
+        scored = [e["reward"]["total"] for e in eps if e["reward"]["total"] is not None]
+        mean_r = sum(scored) / len(scored) if scored else float("nan")
         print(f"{key:<22}{len(eps):>4}{100 * passed / len(eps):>7.0f}%{mean_r:>13.3f}")
     print("outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
     return 0
@@ -363,12 +389,18 @@ def main(argv: list[str] | None = None) -> int:
             "--agent", default=os.environ.get("HEART_AGENT", "claude"),
             help="claude | codex | gemini | opencode | api[:profile] | shell | "
                  "auto (route by task complexity; tiers in models.json) "
-                 "(default $HEART_AGENT or claude)",
+                 "(default $HEART_AGENT or claude; ignored when --swarm is set)",
         )
         p.add_argument("--agent-cmd", default=None, help="custom shell template; prompt in $HEART_PROMPT")
         p.add_argument("--runs-dir", default="runs")
         p.add_argument("--fix-rounds", type=int, default=0, help="verify-fix loop attempts in-workspace")
         p.add_argument("--escalate", default=None, help="stronger agent for the final fix attempt")
+        p.add_argument(
+            "--swarm", default=None,
+            help="comma-separated heterogeneous agents for best-of-N + judge, "
+                 "e.g. claude,codex,api:qwen (overrides --agent/--candidates; "
+                 "escalation-grade tasks only, not a default)",
+        )
 
     def add_role_flags(p):
         p.add_argument("--pipeline", action="store_true", help="use implement/test/review roles")

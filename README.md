@@ -115,6 +115,15 @@ Three coding-specific mechanisms, composable per run:
   its own `agent`, `memory`, `prompt`, `verify_after`.
 - **Candidates** (`--candidates N`): N independent attempts in parallel
   worktrees, best reward wins. Doubles as the RL data engine.
+- **Swarm** (`--swarm claude,codex,api:qwen`): best-of-N with *heterogeneous*
+  agents (one per listed name, in parallel, memory-isolated) plus one judge
+  turn — overrides `--agent`/`--candidates`. Ranked by reward total; a judge
+  only runs when the top two are both a verified `pass` and within epsilon of
+  each other, and a mute/unparseable judge just falls back to the reward
+  ranking rather than failing the run. Not a default — it's the priciest
+  mechanism here, meant for escalation-grade tasks. Plexus is the intended
+  caller: a feature that exhausts its retry budget re-dispatches as a swarm
+  before reaching the human queue.
 
 Operational switches:
 
