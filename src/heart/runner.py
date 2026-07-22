@@ -85,6 +85,31 @@ def sandbox_wrap(
     return [*args, *cmd], False
 
 
+def _claude_envelope(text: str) -> dict | None:
+    """The result envelope from a Claude CLI log.
+
+    The log is not necessarily pure JSON: the CLI writes advisories to stdout
+    ahead of the envelope ("Warning: no stdin data received in 3s..."), and a
+    whole-text json.loads then fails. That failure used to be silent and
+    expensive — usage came back as None *and* the log was left as raw JSON, so
+    every downstream consumer that greps it for plain text (review verdicts,
+    failure tails, plexus's planner) got an envelope it could not read.
+    Scanning from the end also picks the final envelope if the CLI emitted
+    more than one object.
+    """
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("result"), str):
+            return obj
+    return None
+
+
 def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
     """Pull tokens_in/tokens_out out of a role log, per agent family. Never
     raises: a log that doesn't parse (older CLI, crash, empty timeout log)
@@ -94,10 +119,12 @@ def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
     if base_agent == "claude":
         try:
             text = log_path.read_text(encoding="utf-8", errors="replace")
-            envelope = json.loads(text)
-            result = envelope["result"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        except OSError:
             return none
+        envelope = _claude_envelope(text)
+        if envelope is None:
+            return none
+        result = envelope["result"]
         usage = envelope.get("usage") or {}
         # total_cost_usd is deliberately ignored here: cost comes only from
         # our own pricing map (_price) so subscription seats never report

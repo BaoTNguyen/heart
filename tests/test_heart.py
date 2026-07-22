@@ -22,7 +22,7 @@ from heart import reward as reward_mod  # noqa: E402
 from heart.agents_api import resolve_config  # noqa: E402
 from heart.cli import main as cli_main  # noqa: E402
 from heart.detect import detect_verifiers  # noqa: E402
-from heart.episode import best_episode, run_candidates, run_episode  # noqa: E402
+from heart.episode import best_episode, run_candidates, run_episode, run_swarm  # noqa: E402
 from heart.export import export_episodes  # noqa: E402
 from heart.taskspec import TaskSpec, Verifier  # noqa: E402
 from heart.training import datasets  # noqa: E402
@@ -99,6 +99,62 @@ class TestHeart(unittest.TestCase):
         ep = self.run_ep("sed -i 's/add(2, 3), 5/add(2, 3), -1/' test_calc.py")
         self.assertEqual(ep["outcome"], "path_violation")
         self.assertEqual(ep["reward"]["total"], 0.0)
+
+    def test_blocked_outcome_withholds_reward(self):
+        """An agent that declines to guess must not be scored. Without this,
+        reward.compute renormalizes over diff_quality + efficiency — small diff,
+        finished fast — which is precisely what blocking looks like, so a block
+        scored ~0.97 and taught the policy to block instead of work."""
+        task = TaskSpec(**{**self.task.__dict__,
+                           "prompt": "echo 'PLEXUS_BLOCKED: sync or async?' > PLEXUS_BLOCKED",
+                           "blocked_marker": "PLEXUS_BLOCKED:"})
+        ep = run_episode(task, agent="shell", runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "blocked")
+        self.assertEqual(ep["blocked_reason"], "sync or async?")
+        self.assertIsNone(ep["reward"]["total"])
+        # blocking beats no marker at all: "wrote nothing" and "asked instead of
+        # writing" are different events even though both leave a tiny diff
+        plain = run_episode(TaskSpec(**{**self.task.__dict__, "prompt": "true"}),
+                            agent="shell", runs_dir=self.runs)
+        self.assertEqual(plain["outcome"], "no_change")
+        # an unscored episode never wins best-of-N over one with a real score
+        self.assertEqual(best_episode([ep, self.run_ep(FIX_CMD)])["outcome"], "pass")
+
+    def test_no_verifiers_is_unverified_not_pass(self):
+        """all([]) is True, so an empty verifier set used to score a vacuous
+        `pass` — the repo shipped no tests and heart claimed correctness."""
+        task = TaskSpec(**{**self.task.__dict__, "public_verifiers": [],
+                           "prompt": "echo 'x = 1' > newfile.py"})
+        ep = run_episode(task, agent="shell", runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "unverified")
+        self.assertIsNone(ep["reward"]["total"])
+
+    def test_guardrails_outrank_a_block(self):
+        """A block must not launder a secret past the scanner."""
+        task = TaskSpec(**{**self.task.__dict__, "blocked_marker": "PLEXUS_BLOCKED:",
+                           "prompt": "printf 'PLEXUS_BLOCKED: q?\\n"
+                                     "AKIAIOSFODNN7EXAMPLE\\n' > PLEXUS_BLOCKED"})
+        ep = run_episode(task, agent="shell", runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "guardrail_violation")
+
+    def test_claude_envelope_survives_stdout_noise(self):
+        """The CLI prints advisories before its JSON envelope. Whole-text
+        json.loads then failed, which silently lost usage *and* left the raw
+        envelope in the log for every downstream text consumer to choke on."""
+        from heart.runner import _claude_envelope
+        env = {"type": "result", "result": "```json\n[1]\n```", "usage":
+               {"input_tokens": 7, "output_tokens": 9}}
+        body = json.dumps(env)
+        noisy = "Warning: no stdin data received in 3s, proceeding without it.\n" + body
+        for text, expect in ((body, 7), (noisy, 7), ("no json here at all", None)):
+            got = _claude_envelope(text)
+            if expect is None:
+                self.assertIsNone(got)
+            else:
+                self.assertEqual(got["usage"]["input_tokens"], expect)
+        # the last envelope wins when the CLI emits more than one
+        two = body + "\n" + json.dumps({**env, "result": "second"})
+        self.assertEqual(_claude_envelope(two)["result"], "second")
 
     def test_role_pipeline(self):
         roles = [
@@ -1100,6 +1156,93 @@ class TestPulseServe(unittest.TestCase):
                 os.environ.pop("HEART_SPOOL_DIR", None)
             else:
                 os.environ["HEART_SPOOL_DIR"] = old_spool
+
+
+class TestSwarm(unittest.TestCase):
+    """Best-of-N with heterogeneous agents + one judge (STACK_READINESS §4.4)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.commit = make_repo(self.root)
+        self.runs = self.root / "runs"
+        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
+        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_ingest = os.environ.get("HEART_INGEST")
+        os.environ["HEART_INGEST"] = "off"
+        self.task = TaskSpec(
+            task_id="toy-swarm",
+            repo_path=str(self.root / "toyrepo"),
+            base_commit=self.commit,
+            prompt=FIX_CMD,
+            denied_paths=["test_calc.py"],
+            public_verifiers=[Verifier(name="unit", command="python3 -m unittest -q test_calc")],
+            timeout_seconds=60,
+        )
+
+    def tearDown(self):
+        if self._old_spool is None:
+            os.environ.pop("HEART_SPOOL_DIR", None)
+        else:
+            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+        if self._old_ingest is None:
+            os.environ.pop("HEART_INGEST", None)
+        else:
+            os.environ["HEART_INGEST"] = self._old_ingest
+        self.tmp.cleanup()
+
+    def test_wrong_candidate_loses_no_judge(self):
+        # both candidates are "shell", branching on the profile string
+        # (run_agent stamps HEART_MODEL_PROFILE from "agent:profile") so each
+        # candidate applies a different fix without touching AGENT_COMMANDS
+        task = TaskSpec(**{**self.task.__dict__, "prompt": (
+            'if [ "$HEART_MODEL_PROFILE" = good ]; then ' + FIX_CMD + "; "
+            "else sed -i 's/a - b/a * b/' calc.py; fi"
+        )})
+        ep = run_swarm(task, ["shell:good", "shell:bad"], runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertEqual(ep["agent"], "shell:good")
+        self.assertEqual(ep["swarm"]["agents"], ["shell:good", "shell:bad"])
+        self.assertEqual(len(ep["swarm"]["rewards"]), 2)
+        self.assertFalse(ep["swarm"]["judged"])
+        self.assertEqual(ep["swarm"]["winner_agent"], "shell:good")
+
+    def test_judge_breaks_tie_between_two_passes(self):
+        # both candidates apply the identical correct fix -> rewards within
+        # epsilon -> the judge decides; judge_cmd is the test-door escape
+        # hatch since a real judge agent can't be made to print WINNER here
+        ep = run_swarm(
+            self.task, ["shell:cand1", "shell:cand2"],
+            judge_cmd="echo 'WINNER: 2'", runs_dir=self.runs,
+        )
+        self.assertTrue(ep["swarm"]["judged"])
+        self.assertEqual(ep["agent"], "shell:cand2")
+        self.assertEqual(ep["swarm"]["winner_agent"], "shell:cand2")
+        self.assertEqual(ep["swarm"]["agents"], ["shell:cand1", "shell:cand2"])
+
+    def test_mute_judge_falls_back_to_reward_ranking(self):
+        ep = run_swarm(
+            self.task, ["shell:cand1", "shell:cand2"],
+            judge_cmd="true", runs_dir=self.runs,
+        )
+        self.assertFalse(ep["swarm"]["judged"])
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertIn(ep["agent"], ("shell:cand1", "shell:cand2"))
+
+    def test_cli_run_swarm(self):
+        task_path = self.root / "task.json"
+        task_path.write_text(json.dumps({
+            "task_id": "toy-swarm-cli",
+            "repo_path": str(self.root / "toyrepo"),
+            "base_commit": self.commit,
+            "prompt": FIX_CMD,
+            "public_verifiers": [{"name": "unit", "command": "python3 -m unittest -q test_calc"}],
+            "timeout_seconds": 60,
+        }))
+        code = cli_main([
+            "run", str(task_path), "--swarm", "shell,shell", "--runs-dir", str(self.runs),
+        ])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
