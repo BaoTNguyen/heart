@@ -18,6 +18,7 @@ import concurrent.futures
 import datetime
 import json
 import re
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -104,6 +105,20 @@ def path_violations(diff_text: str, allowed: list[str], denied: list[str]) -> li
         elif allowed and not any(p.startswith(a) for a in allowed):
             bad.append(p)
     return sorted(bad)
+
+
+def _blocked_reason(diff_text: str, marker: str | None) -> str | None:
+    """The decision the agent stopped for, if it stopped for one. Scans the
+    captured diff rather than the agent log: callers tell agents to write the
+    marker to a file (heart captures untracked files in the diff), which
+    survives an agent that streams nothing useful to stdout."""
+    if not marker:
+        return None
+    for line in diff_text.splitlines():
+        stripped = (line[1:] if line.startswith("+") else line).strip()
+        if stripped.startswith(marker):
+            return stripped[len(marker):].strip() or "(no reason given)"
+    return None
 
 
 def _agent_turn(
@@ -226,6 +241,7 @@ def _run_episode(
     review_verdict: str | None = None
     verifier_results: dict[str, dict] = {}
     hidden_results: dict[str, dict] = {}
+    blocked_reason: str | None = None
     diff = ""
     can_fix = fix_rounds > 0 and bool(task.public_verifiers)
     try:
@@ -286,9 +302,8 @@ def _run_episode(
 
         violations = path_violations(diff, task.allowed_paths, task.denied_paths)
         secret_hits = scan_secrets(diff)
-        if not diff.strip():
-            outcome = "no_change"
-        elif violations:
+        blocked_reason = _blocked_reason(diff, task.blocked_marker)
+        if violations:
             outcome = "path_violation"
         elif secret_hits:
             # mirrors path_violation handling: a secret in the diff zeroes
@@ -296,6 +311,13 @@ def _run_episode(
             outcome = "guardrail_violation"
             emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
                  rules=sorted({h.split(":", 1)[0] for h in secret_hits}))
+        elif blocked_reason:
+            # the agent declined to act rather than guess. Checked before
+            # no_change because a block is usually an (almost) empty diff, and
+            # "wrote nothing" and "asked instead of writing" are not the same event.
+            outcome = "blocked"
+        elif not diff.strip():
+            outcome = "no_change"
         else:
             # verify on a clean worktree with only the agent's diff applied —
             # leftover workspace state (edited tests, caches) can't game the verifier
@@ -312,7 +334,15 @@ def _run_episode(
                     hidden_results = run_verifiers(
                         task.hidden_verifiers, str(clean.path), task.timeout_seconds
                     )
-                outcome = "pass" if all(r["passed"] for r in verifier_results.values()) else "fail"
+                if not verifier_results:
+                    # all([]) is True, so "pass" here would be a vacuous claim:
+                    # nothing was checked. check_task already refuses tasks whose
+                    # verifiers pass at base for the same reason — absence of
+                    # evidence must not score like evidence of correctness.
+                    outcome = "unverified"
+                else:
+                    outcome = ("pass" if all(r["passed"] for r in verifier_results.values())
+                               else "fail")
     finally:
         ws.destroy()
         if clean is not None:
@@ -329,6 +359,14 @@ def _run_episode(
             verifier_results, diff, agent_result["duration_s"], budget,
             hidden_results=hidden_results,
         )
+    elif outcome in ("blocked", "unverified"):
+        # No correctness signal exists, so there is nothing to score. 0.0 would
+        # assert the episode did badly; None says the axes don't apply. Scoring
+        # these is actively harmful: compute() renormalizes over the surviving
+        # components, and the survivors are diff_quality and efficiency — small
+        # diff, finished fast — which is exactly what stopping early looks like.
+        # A blocked episode would score ~0.97 for doing nothing.
+        score = {"total": None, "components": {}}
     else:
         score = {"total": 0.0, "components": {}}
 
@@ -352,6 +390,7 @@ def _run_episode(
         "memory_mode": memory_mode,
         "retrieval": retrieval,
         "outcome": outcome,
+        "blocked_reason": blocked_reason,
         "violations": violations if outcome == "path_violation"
         else secret_hits if outcome == "guardrail_violation" else [],
         "agent_result": agent_result,
@@ -370,12 +409,20 @@ def _run_episode(
     usage_payload = {k: v for k, v in usage.items() if v is not None}
     emit("heart", "episode.finished", episode_id=episode_id, task_id=task.task_id,
          duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
-         reward=score["total"], review_verdict=review_verdict, **usage_payload)
+         reward=score["total"], review_verdict=review_verdict,
+         blocked_reason=blocked_reason, **usage_payload)
     return episode
 
 
 def best_episode(episodes: list[dict]) -> dict:
-    return max(episodes, key=lambda e: (e["outcome"] == "pass", e["reward"]["total"]))
+    # unscored (blocked/unverified) sorts below every scored episode: with no
+    # correctness signal there is no case for preferring it over one that has one.
+    return max(episodes, key=lambda e: (e["outcome"] == "pass",
+                                        _score(e) if _score(e) is not None else -1.0))
+
+
+def _score(episode: dict) -> float | None:
+    return episode["reward"]["total"]
 
 
 def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs) -> list[dict]:
@@ -386,3 +433,83 @@ def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel or n) as pool:
         futures = [pool.submit(run_episode, task, isolated=True, **kwargs) for _ in range(n)]
         return [f.result() for f in futures]
+
+
+def _run_judge(
+    task: TaskSpec, cand1: dict, cand2: dict, judge_agent: str,
+    judge_cmd: str | None, runs_dir: str | Path,
+) -> int | None:
+    """One judge turn over the top-two diffs by reward. Returns 1, 2, or None
+    (mute or unparseable judge) — a mute judge must never fail the swarm, the
+    caller falls back to the reward ranking."""
+    diff1 = (Path(runs_dir) / cand1["episode_id"] / "diff.patch").read_text(errors="replace")
+    diff2 = (Path(runs_dir) / cand2["episode_id"] / "diff.patch").read_text(errors="replace")
+    prompt = (
+        f"Task: {task.prompt}\n\n"
+        "Two candidate diffs both passed verification. Pick the better one on "
+        "correctness, clarity, and scope.\n\n"
+        f"DIFF 1:\n{diff1[:8000]}\n\nDIFF 2:\n{diff2[:8000]}\n\n"
+        "Reply with brief reasoning, then a final line that is exactly "
+        "`WINNER: 1` or `WINNER: 2`."
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        # the judge only reads the diffs above, no workspace needed
+        log_path = Path(tmp) / "judge.log"
+        run_agent(judge_agent, prompt, tmp, {}, task.timeout_seconds, log_path,
+                  agent_cmd=judge_cmd)
+        text = log_path.read_text(errors="replace") if log_path.exists() else ""
+    hits = re.findall(r"WINNER:\s*([12])\b", text)
+    return int(hits[-1]) if hits else None
+
+
+def run_swarm(
+    task: TaskSpec,
+    agents: list[str],
+    judge_agent: str | None = None,
+    epsilon: float = 0.05,
+    judge_cmd: str | None = None,
+    **kwargs,
+) -> dict:
+    """Best-of-N with heterogeneous agents + one judge (STACK_READINESS §4.4).
+    One candidate per listed agent, run in parallel and memory-isolated exactly
+    like run_candidates. Ranked by reward total; when the top two are both
+    outcome "pass" and within epsilon of each other, a judge breaks the tie —
+    otherwise the reward ranking (best_episode's rule) picks the winner.
+
+    judge_cmd: shell template for the judge, mirrors run_agent's agent_cmd.
+    # ponytail: test/custom-judge escape hatch, exists for deterministic tests
+    # and to let a caller supply its own judge without a new agent string.
+    """
+    kwargs.pop("agent", None)
+    runs_dir = kwargs.get("runs_dir", "runs")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
+        futures = [pool.submit(run_episode, task, agent=a, isolated=True, **kwargs)
+                   for a in agents]
+        episodes = [f.result() for f in futures]
+
+    ranked = sorted(
+        episodes,
+        key=lambda e: (e["outcome"] == "pass", _score(e) if _score(e) is not None else -1.0),
+        reverse=True,
+    )
+    winner = ranked[0]
+    judged = False
+    judge_used = None
+    if (len(ranked) >= 2 and ranked[0]["outcome"] == "pass" and ranked[1]["outcome"] == "pass"
+            and abs(_score(ranked[0]) - _score(ranked[1])) <= epsilon):
+        judge_used = judge_agent or router.resolve("strong", default=None) or agents[0]
+        pick = _run_judge(task, ranked[0], ranked[1], judge_used, judge_cmd, runs_dir)
+        if pick is not None:
+            judged = True
+            winner = ranked[0] if pick == 1 else ranked[1]
+
+    result = dict(winner)
+    rewards = [round(_score(e), 4) if _score(e) is not None else None for e in episodes]
+    result["swarm"] = {
+        "agents": agents, "rewards": rewards, "judged": judged,
+        "winner_agent": winner["agent"],
+    }
+    emit("heart", "swarm.judged", episode_id=result["episode_id"], task_id=task.task_id,
+         agents=agents, rewards=rewards, judged=judged, winner_agent=winner["agent"],
+         **({"judge_agent": judge_used} if judged else {}))
+    return result
