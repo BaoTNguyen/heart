@@ -46,10 +46,15 @@ training data:
   `pulse health` (exit code as the alert primitive), a systemd health timer, and
   `pulse serve` — the whole factory floor as one localhost HTML page with live
   episode cards you can steer mid-run, no build step.
-- **Swarm when a task is hard.** `--swarm claude,codex,api:qwen` runs
-  heterogeneous agents in parallel, ranks by reward, and only spends a judge turn
-  when the top two verified passes are within epsilon. Plexus escalates stuck
-  features into it before bothering a human.
+- **Routing that learns.** `--agent auto` scores each model in a manifest against
+  the task's inferred skills, difficulty, and context size, filters to the ones
+  that can actually run it, and picks the cheapest capable match — with declared
+  scores corrected by a measured-reward sidecar so they can't drift unchecked.
+- **Orchestrator-worker for tasks that split.** A decomposer breaks a task into
+  workers, each routed to its own model and effort and run as an isolated episode;
+  their diffs are 3-way merged by git, the merged tree is verified, and failures
+  recover at the cheapest rung that works before falling back to the single-worktree
+  role pipeline. Coupled work stays on the safe sequential path.
 
 ## Install
 
@@ -104,9 +109,13 @@ a marrow-trained model acts as the coding agent.
 
 ### Model routing (`--agent auto`)
 
-`heart` picks the model tier per task — explicit `task.difficulty` first, else
-a keyword/size heuristic — and per role (test-writing routes to the cheap
-tier). Configure tiers in `models.json` (or `HEART_TIER_<TIER>` env):
+`heart` picks the model per task and per role (test-writing routes cheap). The
+richer form is a **capability manifest**: each model in `models.json` declares a
+`tier` and the few `skills` it's notably strong or weak at, plus a context window
+and difficulty ceiling; `route` filters to the models that can actually run the
+task (skills, difficulty, context) and picks the cheapest capable match, with
+declared scores corrected by a measured-reward sidecar so they can't drift
+unchecked. A bare tier map still works and is synthesized into a manifest:
 
 ```json
 {"tiers": {"cheap": "api:local7b", "standard": "claude", "strong": "api:gpt"}}
@@ -137,7 +146,7 @@ window runs hot, re-point a tier for the day: `HEART_TIER_STANDARD=api:local7b`.
 
 ## Orchestration
 
-Three coding-specific mechanisms, composable per run:
+Four coding-specific mechanisms, composable per run:
 
 - **Verify-fix loop** (`--fix-rounds N`): verifiers run in the workspace after
   implementation; failures are fed back to a fix agent. `--escalate <agent>`
@@ -148,15 +157,14 @@ Three coding-specific mechanisms, composable per run:
   its own `agent`, `memory`, `prompt`, `verify_after`.
 - **Candidates** (`--candidates N`): N independent attempts in parallel
   worktrees, best reward wins. Doubles as the RL data engine.
-- **Swarm** (`--swarm claude,codex,api:qwen`): best-of-N with *heterogeneous*
-  agents (one per listed name, in parallel, memory-isolated) plus one judge
-  turn — overrides `--agent`/`--candidates`. Ranked by reward total; a judge
-  only runs when the top two are both a verified `pass` and within epsilon of
-  each other, and a mute/unparseable judge just falls back to the reward
-  ranking rather than failing the run. Not a default — it's the priciest
-  mechanism here, meant for escalation-grade tasks. Plexus is the intended
-  caller: a feature that exhausts its retry budget re-dispatches as a swarm
-  before reaching the human queue.
+- **Orchestrator-worker** (`orchestrate.py`, Path A/B): a decomposer either keeps
+  the task on the sequential role pipeline in one worktree (Path A, the safe
+  default for coupled work) or splits it into workers — each run as an isolated
+  episode routed to its own model and effort — whose diffs are 3-way merged by
+  git, verified as one tree, and recovered at the cheapest rung that works before
+  falling back to Path A. It replaces the old heterogeneous swarm: same
+  best-of-many payoff, but the work is decomposed rather than duplicated, so the
+  spend buys coverage instead of redundant attempts.
 
 Operational switches:
 
