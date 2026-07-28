@@ -20,21 +20,38 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str
     # Policy: agents get network, verifiers never do — when sandboxing is on
     # at all, verifier subprocesses are always forced into bwrap-nonet.
     sandboxed = os.environ.get("HEART_SANDBOX") in ("bwrap", "bwrap-nonet")
+    # Optional suite-wide ceiling. Each verifier still gets its own `timeout`, but
+    # the whole suite can't exceed HEART_VERIFY_SUITE_TIMEOUT — without it, N
+    # verifiers run serially at `timeout` each, so a 4-linter repo can spend 4×
+    # the budget in the verify phase. Off by default (unset) to avoid silently
+    # starving a legitimately slow second verifier and flipping its reward.
+    suite_budget = float(os.environ.get("HEART_VERIFY_SUITE_TIMEOUT", "0") or 0)
+    suite_start = time.monotonic()
     results: dict[str, dict] = {}
     for v in verifiers:
         t0 = time.monotonic()
+        this_timeout = timeout
+        if suite_budget > 0:
+            remaining = suite_budget - (t0 - suite_start)
+            if remaining <= 0:
+                results[v.name] = {
+                    "passed": False, "exit_code": -1, "duration_s": 0.0,
+                    "output_tail": f"skipped: suite budget {suite_budget:g}s exhausted",
+                }
+                continue
+            this_timeout = min(timeout, remaining)
         cmd, shell = v.command, True
         if sandboxed:
             cmd, shell = sandbox_wrap(v.command, True, cwd, {}, mode="bwrap-nonet")
         try:
             proc = subprocess.run(
                 cmd, shell=shell, cwd=cwd, capture_output=True, text=True,
-                timeout=timeout, env=env,
+                timeout=this_timeout, env=env,
             )
             passed, code = proc.returncode == 0, proc.returncode
             output = (proc.stdout + proc.stderr)[-4000:]
         except subprocess.TimeoutExpired:
-            passed, code, output = False, -1, f"timeout after {timeout}s"
+            passed, code, output = False, -1, f"timeout after {this_timeout:g}s"
         results[v.name] = {
             "passed": passed,
             "exit_code": code,

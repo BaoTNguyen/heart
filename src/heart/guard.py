@@ -14,6 +14,10 @@ _RULES: list[tuple[str, re.Pattern]] = [
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("github_token", re.compile(r"ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}")),
     ("slack_token", re.compile(r"xox[bpars]-[A-Za-z0-9-]{10,}")),
+    ("gcp_api_key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("stripe_secret_key", re.compile(r"sk_live_[0-9A-Za-z]{20,}")),
+    ("openai_key", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}")),
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
     (
         "generic_secret_assignment",
         re.compile(
