@@ -18,7 +18,7 @@ from . import pulse as pulse_mod
 from . import reward as reward_mod
 from .detect import detect_verifiers
 from .events import emit
-from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode, run_swarm
+from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
 from .export import export_episodes
 from .taskspec import TaskSpec, Verifier, load_task, load_tasks
 from .training import datasets
@@ -51,16 +51,6 @@ def _episode_kwargs(args) -> dict:
     )
 
 
-def _swarm_agents(args) -> list[str]:
-    return [a.strip() for a in args.swarm.split(",") if a.strip()]
-
-
-def _swarm_kwargs(args) -> dict:
-    kwargs = _episode_kwargs(args)
-    kwargs.pop("agent", None)
-    return kwargs
-
-
 def _ingest_rewards(runs_dir) -> None:
     """Best-effort credit-assignment bridge: hand finished episodes to arteries'
     reward ledger when its CLI is installed. A subprocess, not an import — heart
@@ -81,22 +71,15 @@ def _ingest_rewards(runs_dir) -> None:
 
 def cmd_run(args) -> int:
     task = load_task(args.task)
-    if args.swarm:
-        ep = run_swarm(
-            task, _swarm_agents(args),
-            memory_mode=args.memory, retrieval=not args.no_retrieval,
-            **_swarm_kwargs(args),
-        )
-    else:
-        eps = run_candidates(
-            task, args.candidates,
-            memory_mode=args.memory, retrieval=not args.no_retrieval,
-            **_episode_kwargs(args),
-        )
-        ep = best_episode(eps)
-        if len(eps) > 1:
-            for e in eps:
-                print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
+    eps = run_candidates(
+        task, args.candidates,
+        memory_mode=args.memory, retrieval=not args.no_retrieval,
+        **_episode_kwargs(args),
+    )
+    ep = best_episode(eps)
+    if len(eps) > 1:
+        for e in eps:
+            print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
     print(json.dumps({k: ep[k] for k in ("episode_id", "task_id", "outcome", "reward")}, indent=2))
     _ingest_rewards(args.runs_dir)
     return 0 if ep["outcome"] == "pass" else 1
@@ -136,11 +119,13 @@ def cmd_work(args) -> int:
         denied_paths=[".github/workflows/"],
         public_verifiers=verifiers, timeout_seconds=args.timeout,
     )
-    if args.swarm:
-        kwargs = _swarm_kwargs(args)
-        if not args.solo:
-            kwargs["roles"] = kwargs["roles"] or DEFAULT_ROLES
-        ep = run_swarm(task, _swarm_agents(args), **kwargs)
+    if getattr(args, "orchestrate", False):
+        # Path B: decompose into parallel routed workers, git-merge, verify. Falls
+        # back to a single build when not splittable or no integration verifier.
+        from .orchestrate import run_orchestrated
+        ep = run_orchestrated(
+            task, agent=args.agent, runs_dir=args.runs_dir, agent_cmd=args.agent_cmd,
+            roles=None if args.solo else DEFAULT_ROLES)
     else:
         kwargs = _episode_kwargs(args)
         if not args.solo:
@@ -210,8 +195,17 @@ def cmd_batch(args) -> int:
             done = 0
             for fut in concurrent.futures.as_completed(futures):
                 task, mem, ret, i = futures[fut]
-                ep = fut.result()
                 done += 1
+                try:
+                    ep = fut.result()
+                except Exception as exc:
+                    # one episode's hard failure (git error, disk full, OOM) must
+                    # not abort a 100-task batch. Log it and move on; no summary
+                    # row is written, so a later resume retries just this job.
+                    emit("heart", "batch.progress", task_id=task.task_id,
+                         done=done, total=len(jobs), outcome="crashed")
+                    print(f"CRASHED,{task.task_id},{mem},{ret},{i},{type(exc).__name__}: {exc}")
+                    continue
                 emit("heart", "batch.progress", task_id=task.task_id,
                      done=done, total=len(jobs), outcome=ep["outcome"])
                 row = [ep["episode_id"], task.task_id, mem, ret, i, ep["outcome"], ep["reward"]["total"]]
@@ -389,18 +383,12 @@ def main(argv: list[str] | None = None) -> int:
             "--agent", default=os.environ.get("HEART_AGENT", "claude"),
             help="claude | codex | gemini | opencode | api[:profile] | shell | "
                  "auto (route by task complexity; tiers in models.json) "
-                 "(default $HEART_AGENT or claude; ignored when --swarm is set)",
+                 "(default $HEART_AGENT or claude)",
         )
         p.add_argument("--agent-cmd", default=None, help="custom shell template; prompt in $HEART_PROMPT")
         p.add_argument("--runs-dir", default="runs")
         p.add_argument("--fix-rounds", type=int, default=0, help="verify-fix loop attempts in-workspace")
         p.add_argument("--escalate", default=None, help="stronger agent for the final fix attempt")
-        p.add_argument(
-            "--swarm", default=None,
-            help="comma-separated heterogeneous agents for best-of-N + judge, "
-                 "e.g. claude,codex,api:qwen (overrides --agent/--candidates; "
-                 "escalation-grade tasks only, not a default)",
-        )
 
     def add_role_flags(p):
         p.add_argument("--pipeline", action="store_true", help="use implement/test/review roles")
@@ -426,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-large", action="store_true",
                     help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
+    p.add_argument("--orchestrate", action="store_true",
+                   help="decompose into parallel routed workers merged with git "
+                        "(Path B); auto-falls back to a single build when the task "
+                        "isn't splittable or has no integration verifier")
     p.set_defaults(func=cmd_work, runs_dir=str(WORK_RUNS_DIR), fix_rounds=2)
 
     p = sub.add_parser("batch", help="run tasks x variants x repeats")
