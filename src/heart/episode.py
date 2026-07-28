@@ -18,7 +18,6 @@ import concurrent.futures
 import datetime
 import json
 import re
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -97,12 +96,20 @@ def _diff_paths(diff_text: str) -> set[str]:
     return paths
 
 
+def _within(path: str, prefix: str) -> bool:
+    """True if `path` is `prefix` (a file) or lives under it (a dir), matched at
+    path boundaries — so `src` covers `src/a.py` but NOT `src_gen/a.py`, which a
+    bare startswith would wrongly allow/deny."""
+    prefix = prefix.rstrip("/")
+    return path == prefix or path.startswith(prefix + "/")
+
+
 def path_violations(diff_text: str, allowed: list[str], denied: list[str]) -> list[str]:
     bad = []
     for p in _diff_paths(diff_text):
-        if any(p.startswith(d) for d in denied):
+        if any(_within(p, d) for d in denied):
             bad.append(p)
-        elif allowed and not any(p.startswith(a) for a in allowed):
+        elif allowed and not any(_within(p, a) for a in allowed):
             bad.append(p)
     return sorted(bad)
 
@@ -185,6 +192,7 @@ def run_episode(
     fix_rounds: int = 0,
     escalate: str | None = None,
     isolated: bool = False,
+    parent_agent_id: str | None = None,
 ) -> dict:
     episode_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     out = Path(runs_dir) / episode_id
@@ -201,6 +209,7 @@ def run_episode(
         return _run_episode(
             task, agent, memory_mode, retrieval, agent_cmd, roles,
             fix_rounds, escalate, episode_id, out, routed, isolated,
+            parent_agent_id,
         )
     except Exception as exc:
         # a crash must be a visible error signal, not a silent gap in the spool
@@ -209,11 +218,44 @@ def run_episode(
         raise
 
 
+def _subagent_env(parent_agent_id: str) -> dict[str, str]:
+    """Mark this episode as a subagent of `parent_agent_id`, using arteries'
+    identity contract as the source of truth. Falls back to an inline copy so
+    heart still runs where arteries isn't installed — heart imports arteries,
+    never the reverse."""
+    try:
+        from arteries.subagent import subagent_env
+        return subagent_env(parent_agent_id)
+    except Exception:
+        return {"ARTERIES_PARENT_AGENT_ID": parent_agent_id,
+                "ARTERIES_AGENT_ID": f"{parent_agent_id}-sub-{uuid.uuid4().hex[:8]}",
+                "ARTERIES_AGENT_ROLE": "subagent"}
+
+
+def _memory_env(memory_mode: str, retrieval: bool, isolated: bool,
+                parent_agent_id: str | None) -> dict[str, str]:
+    """The arteries memory policy for one episode's child process. The one branch
+    that matters: an orchestration subagent (parent_agent_id set) inherits the
+    parent lineage and MUST NOT get ARTERIES_EPHEMERAL=discard — its ephemeral has
+    to survive to compile up under the parent. Only a redundant best-of-N
+    candidate (isolated, no parent) discards, so its arm can't feed the others."""
+    env: dict[str, str] = {}
+    if parent_agent_id:
+        env.update(_subagent_env(parent_agent_id))
+    if memory_mode != "normal":
+        env["ARTERIES_MEMORY"] = memory_mode
+    if not retrieval:
+        env["ARTERIES_RETRIEVAL"] = "off"
+    if isolated and not parent_agent_id:
+        env["ARTERIES_EPHEMERAL"] = "discard"
+    return env
+
+
 def _run_episode(
     task: TaskSpec, agent: str, memory_mode: str, retrieval: bool,
     agent_cmd: str | None, roles: list[dict] | None,
     fix_rounds: int, escalate: str | None, episode_id: str, out: Path,
-    routed: bool = False, isolated: bool = False,
+    routed: bool = False, isolated: bool = False, parent_agent_id: str | None = None,
 ) -> dict:
     repo = Path(task.repo_path).resolve()
     env = {
@@ -222,13 +264,7 @@ def _run_episode(
         # ARTERIES_REPO also anchors JSONL fallbacks somewhere that survives destroy
         "ARTERIES_PROJECT": repo.name, "ARTERIES_REPO": str(repo),
     }
-    if memory_mode != "normal":
-        env["ARTERIES_MEMORY"] = memory_mode
-    if not retrieval:
-        env["ARTERIES_RETRIEVAL"] = "off"
-    if isolated:
-        # parallel candidates must not feed each other memories mid-flight
-        env["ARTERIES_EPHEMERAL"] = "discard"
+    env.update(_memory_env(memory_mode, retrieval, isolated, parent_agent_id))
 
     emit("heart", "episode.started", episode_id=episode_id, task_id=task.task_id,
          agent=agent, memory_mode=memory_mode, retrieval=retrieval,
@@ -407,10 +443,16 @@ def _run_episode(
     }
     (out / "episode.json").write_text(json.dumps(episode, indent=2))
     usage_payload = {k: v for k, v in usage.items() if v is not None}
+    # skills/difficulty ride the event so route.aggregate can build per-(model,
+    # skill,difficulty) reward stats — the measured signal that corrects declared
+    # manifest scores. Empty skills (unrouted task) simply don't feed the loop.
+    route_payload = {}
+    if getattr(task, "skills", None):
+        route_payload = {"skills": task.skills, "difficulty": task.difficulty}
     emit("heart", "episode.finished", episode_id=episode_id, task_id=task.task_id,
          duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
-         reward=score["total"], review_verdict=review_verdict,
-         blocked_reason=blocked_reason, **usage_payload)
+         reward=score["total"], review_verdict=review_verdict, agent=agent,
+         blocked_reason=blocked_reason, **usage_payload, **route_payload)
     return episode
 
 
@@ -435,81 +477,3 @@ def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs
         return [f.result() for f in futures]
 
 
-def _run_judge(
-    task: TaskSpec, cand1: dict, cand2: dict, judge_agent: str,
-    judge_cmd: str | None, runs_dir: str | Path,
-) -> int | None:
-    """One judge turn over the top-two diffs by reward. Returns 1, 2, or None
-    (mute or unparseable judge) — a mute judge must never fail the swarm, the
-    caller falls back to the reward ranking."""
-    diff1 = (Path(runs_dir) / cand1["episode_id"] / "diff.patch").read_text(errors="replace")
-    diff2 = (Path(runs_dir) / cand2["episode_id"] / "diff.patch").read_text(errors="replace")
-    prompt = (
-        f"Task: {task.prompt}\n\n"
-        "Two candidate diffs both passed verification. Pick the better one on "
-        "correctness, clarity, and scope.\n\n"
-        f"DIFF 1:\n{diff1[:8000]}\n\nDIFF 2:\n{diff2[:8000]}\n\n"
-        "Reply with brief reasoning, then a final line that is exactly "
-        "`WINNER: 1` or `WINNER: 2`."
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        # the judge only reads the diffs above, no workspace needed
-        log_path = Path(tmp) / "judge.log"
-        run_agent(judge_agent, prompt, tmp, {}, task.timeout_seconds, log_path,
-                  agent_cmd=judge_cmd)
-        text = log_path.read_text(errors="replace") if log_path.exists() else ""
-    hits = re.findall(r"WINNER:\s*([12])\b", text)
-    return int(hits[-1]) if hits else None
-
-
-def run_swarm(
-    task: TaskSpec,
-    agents: list[str],
-    judge_agent: str | None = None,
-    epsilon: float = 0.05,
-    judge_cmd: str | None = None,
-    **kwargs,
-) -> dict:
-    """Best-of-N with heterogeneous agents + one judge (STACK_READINESS §4.4).
-    One candidate per listed agent, run in parallel and memory-isolated exactly
-    like run_candidates. Ranked by reward total; when the top two are both
-    outcome "pass" and within epsilon of each other, a judge breaks the tie —
-    otherwise the reward ranking (best_episode's rule) picks the winner.
-
-    judge_cmd: shell template for the judge, mirrors run_agent's agent_cmd.
-    # ponytail: test/custom-judge escape hatch, exists for deterministic tests
-    # and to let a caller supply its own judge without a new agent string.
-    """
-    kwargs.pop("agent", None)
-    runs_dir = kwargs.get("runs_dir", "runs")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
-        futures = [pool.submit(run_episode, task, agent=a, isolated=True, **kwargs)
-                   for a in agents]
-        episodes = [f.result() for f in futures]
-
-    ranked = sorted(
-        episodes,
-        key=lambda e: (e["outcome"] == "pass", _score(e) if _score(e) is not None else -1.0),
-        reverse=True,
-    )
-    winner = ranked[0]
-    judged = False
-    judge_used = None
-    if (len(ranked) >= 2 and ranked[0]["outcome"] == "pass" and ranked[1]["outcome"] == "pass"
-            and abs(_score(ranked[0]) - _score(ranked[1])) <= epsilon):
-        judge_used = judge_agent or router.resolve("strong", default=None) or agents[0]
-        pick = _run_judge(task, ranked[0], ranked[1], judge_used, judge_cmd, runs_dir)
-        if pick is not None:
-            judged = True
-            winner = ranked[0] if pick == 1 else ranked[1]
-
-    result = dict(winner)
-    rewards = [round(_score(e), 4) if _score(e) is not None else None for e in episodes]
-    result["swarm"] = {
-        "agents": agents, "rewards": rewards, "judged": judged,
-        "winner_agent": winner["agent"],
-    }
-    emit("heart", "swarm.judged", episode_id=result["episode_id"], task_id=task.task_id,
-         agents=agents, rewards=rewards, judged=judged, winner_agent=winner["agent"],
-         **({"judge_agent": judge_used} if judged else {}))
-    return result

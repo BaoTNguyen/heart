@@ -22,7 +22,7 @@ from heart import reward as reward_mod  # noqa: E402
 from heart.agents_api import resolve_config  # noqa: E402
 from heart.cli import main as cli_main  # noqa: E402
 from heart.detect import detect_verifiers  # noqa: E402
-from heart.episode import best_episode, run_candidates, run_episode, run_swarm  # noqa: E402
+from heart.episode import best_episode, run_candidates, run_episode  # noqa: E402
 from heart.export import export_episodes  # noqa: E402
 from heart.taskspec import TaskSpec, Verifier  # noqa: E402
 from heart.training import datasets  # noqa: E402
@@ -386,6 +386,35 @@ class TestHeart(unittest.TestCase):
         without = reward_mod.compute({"unit": passed}, "", 1, 100)
         self.assertIn("hidden_tests", with_hidden["components"])
         self.assertLess(with_hidden["total"], without["total"])
+
+    def test_path_violations_match_at_boundaries(self):
+        from heart.episode import path_violations
+        diff = ("diff --git a/src_gen/x.py b/src_gen/x.py\n"
+                "--- a/src_gen/x.py\n+++ b/src_gen/x.py\n@@ -0,0 +1 @@\n+x\n")
+        # allowed=["src"] must NOT admit src_gen/ (a bare startswith would)
+        self.assertEqual(path_violations(diff, ["src"], []), ["src_gen/x.py"])
+        # a real child of an allowed dir is fine
+        ok = ("diff --git a/src/x.py b/src/x.py\n"
+              "--- a/src/x.py\n+++ b/src/x.py\n@@ -0,0 +1 @@\n+x\n")
+        self.assertEqual(path_violations(ok, ["src"], []), [])
+        # denied is boundary-matched too: "secret" must not trip "secretly/"
+        d2 = ("diff --git a/secretly/x.py b/secretly/x.py\n"
+              "--- a/secretly/x.py\n+++ b/secretly/x.py\n@@ -0,0 +1 @@\n+x\n")
+        self.assertEqual(path_violations(d2, [], ["secret"]), [])
+
+    def test_efficiency_only_credited_when_all_checks_pass(self):
+        passed = {"passed": True, "exit_code": 0, "duration_s": 1, "output_tail": ""}
+        failed = {**passed, "passed": False}
+        # a fast *failing* episode earns no speed credit — no reward for bailing early
+        self.assertEqual(
+            reward_mod.compute({"unit": failed}, "", 1, 100)["components"]["efficiency"], 0.0)
+        # a fast *passing* episode is rewarded for finishing quickly
+        self.assertGreater(
+            reward_mod.compute({"unit": passed}, "", 1, 100)["components"]["efficiency"], 0.0)
+        # public passes but hidden fails -> not correct -> still no speed credit
+        self.assertEqual(
+            reward_mod.compute({"unit": passed}, "", 1, 100,
+                               hidden_results={"h": failed})["components"]["efficiency"], 0.0)
 
     def test_event_spine(self):
         from heart import pulse
@@ -1156,93 +1185,6 @@ class TestPulseServe(unittest.TestCase):
                 os.environ.pop("HEART_SPOOL_DIR", None)
             else:
                 os.environ["HEART_SPOOL_DIR"] = old_spool
-
-
-class TestSwarm(unittest.TestCase):
-    """Best-of-N with heterogeneous agents + one judge (STACK_READINESS §4.4)."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.commit = make_repo(self.root)
-        self.runs = self.root / "runs"
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
-        self._old_ingest = os.environ.get("HEART_INGEST")
-        os.environ["HEART_INGEST"] = "off"
-        self.task = TaskSpec(
-            task_id="toy-swarm",
-            repo_path=str(self.root / "toyrepo"),
-            base_commit=self.commit,
-            prompt=FIX_CMD,
-            denied_paths=["test_calc.py"],
-            public_verifiers=[Verifier(name="unit", command="python3 -m unittest -q test_calc")],
-            timeout_seconds=60,
-        )
-
-    def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
-        else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
-        if self._old_ingest is None:
-            os.environ.pop("HEART_INGEST", None)
-        else:
-            os.environ["HEART_INGEST"] = self._old_ingest
-        self.tmp.cleanup()
-
-    def test_wrong_candidate_loses_no_judge(self):
-        # both candidates are "shell", branching on the profile string
-        # (run_agent stamps HEART_MODEL_PROFILE from "agent:profile") so each
-        # candidate applies a different fix without touching AGENT_COMMANDS
-        task = TaskSpec(**{**self.task.__dict__, "prompt": (
-            'if [ "$HEART_MODEL_PROFILE" = good ]; then ' + FIX_CMD + "; "
-            "else sed -i 's/a - b/a * b/' calc.py; fi"
-        )})
-        ep = run_swarm(task, ["shell:good", "shell:bad"], runs_dir=self.runs)
-        self.assertEqual(ep["outcome"], "pass")
-        self.assertEqual(ep["agent"], "shell:good")
-        self.assertEqual(ep["swarm"]["agents"], ["shell:good", "shell:bad"])
-        self.assertEqual(len(ep["swarm"]["rewards"]), 2)
-        self.assertFalse(ep["swarm"]["judged"])
-        self.assertEqual(ep["swarm"]["winner_agent"], "shell:good")
-
-    def test_judge_breaks_tie_between_two_passes(self):
-        # both candidates apply the identical correct fix -> rewards within
-        # epsilon -> the judge decides; judge_cmd is the test-door escape
-        # hatch since a real judge agent can't be made to print WINNER here
-        ep = run_swarm(
-            self.task, ["shell:cand1", "shell:cand2"],
-            judge_cmd="echo 'WINNER: 2'", runs_dir=self.runs,
-        )
-        self.assertTrue(ep["swarm"]["judged"])
-        self.assertEqual(ep["agent"], "shell:cand2")
-        self.assertEqual(ep["swarm"]["winner_agent"], "shell:cand2")
-        self.assertEqual(ep["swarm"]["agents"], ["shell:cand1", "shell:cand2"])
-
-    def test_mute_judge_falls_back_to_reward_ranking(self):
-        ep = run_swarm(
-            self.task, ["shell:cand1", "shell:cand2"],
-            judge_cmd="true", runs_dir=self.runs,
-        )
-        self.assertFalse(ep["swarm"]["judged"])
-        self.assertEqual(ep["outcome"], "pass")
-        self.assertIn(ep["agent"], ("shell:cand1", "shell:cand2"))
-
-    def test_cli_run_swarm(self):
-        task_path = self.root / "task.json"
-        task_path.write_text(json.dumps({
-            "task_id": "toy-swarm-cli",
-            "repo_path": str(self.root / "toyrepo"),
-            "base_commit": self.commit,
-            "prompt": FIX_CMD,
-            "public_verifiers": [{"name": "unit", "command": "python3 -m unittest -q test_calc"}],
-            "timeout_seconds": 60,
-        }))
-        code = cli_main([
-            "run", str(task_path), "--swarm", "shell,shell", "--runs-dir", str(self.runs),
-        ])
-        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

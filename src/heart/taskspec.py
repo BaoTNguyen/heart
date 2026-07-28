@@ -30,6 +30,14 @@ class TaskSpec:
     overlay_files: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 300
     difficulty: str = "unknown"
+    # routing: which capabilities the task needs (route.SKILLS), how much context
+    # it will touch, and how hard the chosen model should try. Empty/0/"" -> the
+    # router infers from the prompt (route.classify).
+    skills: list[str] = field(default_factory=list)
+    min_context: int = 0
+    # "" -> the router derives effort from difficulty (medium for most, high for
+    # hard); set "low"/"medium"/"high" explicitly to override.
+    effort: str = ""
     tags: list[str] = field(default_factory=list)
     fix_commit: str | None = None  # known-good commit; check-task verifies it passes
     # Marker the caller told the agent to emit when a decision is missing, e.g.

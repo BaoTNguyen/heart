@@ -19,6 +19,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -64,6 +66,9 @@ def resolve_config() -> dict:
     return {"endpoint": endpoint.rstrip("/"), "model": model, "api_key": key}
 
 
+_RETRY_CODES = {429, 500, 502, 503, 504}
+
+
 def _chat(cfg: dict, messages: list[dict]) -> dict:
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
@@ -72,8 +77,24 @@ def _chat(cfg: dict, messages: list[dict]) -> dict:
         "model": cfg["model"], "messages": messages, "tools": TOOLS, "max_tokens": 4096,
     }).encode()
     req = urllib.request.Request(cfg["endpoint"] + "/chat/completions", data=body, headers=headers)
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.load(resp)
+    # Rate limits (429) and transient 5xx are exactly what a hot batch hits;
+    # without a retry one blip fails the whole episode. Exponential backoff.
+    retries = max(1, int(os.environ.get("HEART_API_RETRIES", "3")))
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _RETRY_CODES and attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 def _bash(command: str) -> str:
@@ -138,7 +159,14 @@ def main() -> int:
                 print(f"HEART_USAGE={json.dumps(usage_totals)}")
             return 0
         for call in calls:
-            args = json.loads(call["function"]["arguments"] or "{}")
+            try:
+                args = json.loads(call["function"]["arguments"] or "{}")
+            except json.JSONDecodeError as exc:
+                # feed the parse error back instead of crashing the episode — the
+                # model can correct its own malformed tool call next turn
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                 "content": f"error: tool arguments were not valid JSON: {exc}"})
+                continue
             print(f"$ {args.get('command', '')}", flush=True)
             result = _bash(args.get("command", ""))
             print(result, flush=True)
