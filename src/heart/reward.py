@@ -58,7 +58,15 @@ def compute(
     changed = diff_changed_lines(diff_text)
     components["diff_quality"] = 1.0 if changed <= 50 else max(0.0, 1.0 - (changed - 50) / 450)
 
-    components["efficiency"] = max(0.0, 1.0 - duration_s / timeout_s) if timeout_s else 0.0
+    # Efficiency (faster = better) only counts once the work is correct. Rewarding
+    # speed on a failing/partial episode is a perverse incentive — it pays the
+    # agent to bail fast. So the speed bonus is gated on every present check
+    # (public + hidden) passing; a fast failure earns no efficiency credit.
+    all_checks = list(verifier_results.values()) + list((hidden_results or {}).values())
+    all_pass = bool(all_checks) and all(r["passed"] for r in all_checks)
+    components["efficiency"] = (
+        max(0.0, 1.0 - duration_s / timeout_s) if (all_pass and timeout_s) else 0.0
+    )
 
     weights = WEIGHTS_HIDDEN if hidden_results else WEIGHTS
     active = {k: weights[k] for k in components if k in weights}

@@ -32,6 +32,34 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # keep the terminal quiet
         pass
 
+    def _guard(self) -> bool:
+        """Reject cross-origin / DNS-rebinding requests. This server reads episode
+        files and writes steer text into live episodes, so a page the user merely
+        visits must not be able to drive it over localhost. Require a loopback Host
+        and, when a browser sends Origin, require it loopback too. curl and
+        same-origin fetches pass."""
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host and host not in ("127.0.0.1", "localhost"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost"):
+            return False
+        return True
+
+    def _ep_dir(self, episode: str) -> Path | None:
+        """Resolve an episode id to its dir, or None if it escapes RUNS_DIR.
+        Without this, `id=../../../../etc` reads/writes arbitrary paths."""
+        if not episode:
+            return None
+        base = RUNS_DIR.resolve()
+        try:
+            ep_dir = (RUNS_DIR / episode).resolve()
+        except OSError:
+            return None
+        if ep_dir != base and base not in ep_dir.parents:
+            return None
+        return ep_dir
+
     def _send(self, body: bytes, ctype: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -40,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        if not self._guard():
+            return self.send_error(403)
         url = urlparse(self.path)
         if url.path == "/":
             return self._send(PAGE.read_bytes(), "text/html; charset=utf-8")
@@ -55,7 +85,9 @@ class Handler(BaseHTTPRequestHandler):
             episode = parse_qs(url.query).get("id", [None])[0]
             if not episode:
                 return self.send_error(400)
-            ep_dir = RUNS_DIR / episode
+            ep_dir = self._ep_dir(episode)
+            if ep_dir is None:
+                return self.send_error(404)
             diff_path = ep_dir / "diff.patch"
             diff = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else None
             logs = {
@@ -71,13 +103,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        if not self._guard():
+            return self.send_error(403)
         url = urlparse(self.path)
         if url.path == "/api/steer":
             episode = parse_qs(url.query).get("episode", [None])[0]
             if not episode:
                 return self.send_error(400)
-            ep_dir = RUNS_DIR / episode
-            if not ep_dir.is_dir():
+            ep_dir = self._ep_dir(episode)
+            if ep_dir is None or not ep_dir.is_dir():
                 return self.send_error(404)
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""

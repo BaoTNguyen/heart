@@ -18,6 +18,39 @@ marrow       RL training on heart's exported episodes (separate repo)
 Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
 as a library for reward computation.
 
+## What sets it apart
+
+Most agent frameworks give you a graph DSL and a way to make models talk to each
+other. Heart makes them ship code you can trust, and turns every run into
+training data:
+
+- **Any agent, one interface.** Claude Code, Codex, Gemini, OpenCode, any
+  OpenAI-compatible endpoint, or a plain shell script — all the same `--agent`
+  flag. `--agent auto` routes per task and per role, and because a tier is just
+  an agent string, the same routing minimizes dollars on metered APIs, protects
+  quota on subscription seats, or feeds a local model that doubles as the RL data
+  engine.
+- **Ground truth is a test suite, not a vibe.** Heart auto-detects verifiers
+  (pytest, npm, cargo, go, plus ruff/mypy/tsc/eslint when configured), runs the
+  agent's diff on a clean checkout, and scores it. `--apply` lands the change
+  only when verification passes and the reviewer approves.
+- **Reward hacking is blocked by construction.** Verification happens on a fresh
+  worktree with only the diff applied; editing a test to make it pass doesn't
+  travel. `allowed_paths`/`denied_paths` violations and a secret scanner both
+  zero the reward. `.github/workflows/` is never editable in a work run.
+- **It is an RL environment, not just an orchestrator.** `heart mine` builds
+  TaskSpecs from git history, `heart batch --candidates N` is best-of-N that
+  doubles as a data engine, and `heart export`/`heart dataset` emit SFT and DPO
+  files. Marrow trains on exactly what heart ran.
+- **Observability built for unattended runs.** An append-only NDJSON spine feeds
+  `pulse health` (exit code as the alert primitive), a systemd health timer, and
+  `pulse serve` — the whole factory floor as one localhost HTML page with live
+  episode cards you can steer mid-run, no build step.
+- **Swarm when a task is hard.** `--swarm claude,codex,api:qwen` runs
+  heterogeneous agents in parallel, ranks by reward, and only spends a judge turn
+  when the top two verified passes are within epsilon. Plexus escalates stuck
+  features into it before bothering a human.
+
 ## Install
 
 ```bash
