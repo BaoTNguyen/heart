@@ -34,13 +34,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Source checkouts, no editable installs. heart's suite is stdlib-only and
-      # the sibling code it touches is import-guarded, so PYTHONPATH is the whole
-      # requirement — installing capillaries' ML stack to run a five-second suite
-      # would buy nothing but a slower gate.
-      - run: pip install pytest
+      # The siblings go in editable rather than on PYTHONPATH: the contract test
+      # imports arteries.compile, which reaches httpx, so a bare source checkout
+      # collects and then dies on the first transitive dependency. Installing
+      # from their pyprojects means adding one there does not also mean editing
+      # this file. heart itself has no dependencies and stays a source checkout.
+      - run: pip install -e ./capillaries -e ./arteries pytest
 
       - working-directory: heart
         env:
-          PYTHONPATH: ${{ github.workspace }}/heart/src:${{ github.workspace }}/arteries/src:${{ github.workspace }}/capillaries/src
+          PYTHONPATH: ${{ github.workspace }}/heart/src
         run: python -m pytest -q
