@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: heart
+
+      # heart's own import of arteries is optional (episode.py guards it), but
+      # two tests assert the arteries subagent contract on purpose — that seam is
+      # exactly what a heart PR can break silently. Same matrix rule as the rest
+      # of the stack: PR into main is judged against the siblings' main, work on
+      # dev against their dev.
+      - uses: actions/checkout@v4
+        with:
+          repository: BaoTNguyen/arteries
+          ref: ${{ github.base_ref == 'main' && 'main' || 'dev' }}
+          path: arteries
+      - uses: actions/checkout@v4
+        with:
+          repository: BaoTNguyen/capillaries
+          ref: ${{ github.base_ref == 'main' && 'main' || 'dev' }}
+          path: capillaries
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Source checkouts, no editable installs. heart's suite is stdlib-only and
+      # the sibling code it touches is import-guarded, so PYTHONPATH is the whole
+      # requirement — installing capillaries' ML stack to run a five-second suite
+      # would buy nothing but a slower gate.
+      - run: pip install pytest
+
+      - working-directory: heart
+        env:
+          PYTHONPATH: ${{ github.workspace }}/heart/src:${{ github.workspace }}/arteries/src:${{ github.workspace }}/capillaries/src
+        run: python -m pytest -q
