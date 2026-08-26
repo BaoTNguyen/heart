@@ -167,7 +167,7 @@ def aggregate(events: list[dict]) -> dict:
 
 
 def refresh_stats() -> dict:
-    """Rebuild the sidecar from the spool. Best-effort; returns the stats."""
+    """Rebuild the sidecar from the journal. Best-effort; returns the stats."""
     try:
         from .pulse import load_events
         stats = aggregate(load_events())

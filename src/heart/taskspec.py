@@ -44,6 +44,12 @@ class TaskSpec:
     # "PLEXUS_BLOCKED:". Seeing it makes the episode `blocked` — the agent chose
     # not to guess. Heart supplies the mechanism; the vocabulary is the caller's.
     blocked_marker: str | None = None
+    # Which network the sandbox gets: "none" (default), "model" for the local
+    # model servers, "build" when the task genuinely has to reach a package
+    # registry. Default-deny because a task that cannot reach the network cannot
+    # exfiltrate, and enforcing that costs nothing. Everything else about the
+    # sandbox is derived from fields above -- see sandbox.profile_for.
+    network: str = "none"
 
 
 def load_task(path: str | Path) -> TaskSpec:
