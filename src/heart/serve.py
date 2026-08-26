@@ -1,7 +1,7 @@
 """`heart pulse serve` — the factory floor, as a local web page.
 
 One stdlib HTTP server on localhost: serves a single HTML file, streams the
-event spool over Server-Sent Events, and exposes insights/health as JSON.
+event journal over Server-Sent Events, and exposes insights/health as JSON.
 The browser builds the episode board client-side from the same events the
 terminal `pulse tail` prints — no database, no framework, no build step.
 
@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import pulse
 from .cli import WORK_RUNS_DIR
-from .events import spool_dir
+from .events import journal_dir
 
 PAGE = Path(__file__).with_name("pulse.html")
 
@@ -131,10 +131,10 @@ class Handler(BaseHTTPRequestHandler):
             for e in pulse.load_events():
                 if e.get("ts", "") >= cutoff:
                     self._event(e)
-            # follow the spool exactly the way `pulse tail` does
+            # follow the journal exactly the way `pulse tail` does
             offsets: dict[Path, int] = {}
             while True:
-                for path in sorted(spool_dir().glob("*.ndjson"))[-2:]:
+                for path in sorted(journal_dir().glob("*.ndjson"))[-2:]:
                     if path not in offsets:
                         offsets[path] = path.stat().st_size
                         continue

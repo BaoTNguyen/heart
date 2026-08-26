@@ -1,6 +1,8 @@
 """Episode workspaces: one detached git worktree per episode."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import shutil
 import subprocess
@@ -65,13 +67,43 @@ def _run(args: list[str], cwd: str, input_text: str | None = None) -> subprocess
     return proc
 
 
+@contextlib.contextmanager
+def _worktree_lock(repo_path: str):
+    """Serialise `git worktree add` and `remove` for one repo.
+
+    Both take $GIT_DIR/worktrees.lock and write under .git/worktrees/<id>.
+    Concurrent episodes in one repo therefore race, and the loser dies on
+    "Unable to create '.../index.lock': File exists" -- a hard failure at
+    episode start, not corruption, but a confusing one to read.
+
+    A lock rather than a retry loop: the operation it serialises takes
+    milliseconds, so the throughput cost is nil, and retries would turn real
+    contention into intermittent flakiness with nothing naming the cause. The
+    fd closes on process exit, so a crash cannot strand the lock.
+    """
+    lock_path = Path(repo_path) / ".git" / "heart-worktree.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "w")
+    except OSError:
+        yield  # not a git repo, or unwritable: nothing to serialise against
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
 class Workspace:
     def __init__(self, repo_path: str, commit: str, overlay: dict[str, str] | None = None):
         self.repo_path = str(repo_path)
         self.overlay = overlay or {}
         self.path = WS_ROOT / uuid.uuid4().hex[:12]
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        _run(["git", "worktree", "add", "--detach", str(self.path), commit], cwd=self.repo_path)
+        with _worktree_lock(self.repo_path):
+            _run(["git", "worktree", "add", "--detach", str(self.path), commit],
+                 cwd=self.repo_path)
         for rel, content in self.overlay.items():
             target = self.path / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -105,11 +137,43 @@ class Workspace:
             cwd=str(self.path),
         ).stdout
 
+    def commit(self, message: str, ref: str | None = None) -> str | None:
+        """Commit the worktree's changes and return the sha, or None if clean.
+
+        A patch file is a description of work; a commit is the work itself --
+        content-addressed, verifiable, and cherry-pickable without a fuzz factor.
+        Binary files, renames and mode changes survive it intact, which
+        `git apply` on a captured diff does not reliably manage.
+
+        The worktree is detached, so this creates no branch. Passing `ref` writes
+        the sha under refs/heart/ instead: outside refs/heads, so it never shows
+        in `git branch` or gets pushed by accident, but referenced, so the commit
+        survives `git worktree remove` and the next gc. That is the whole trick
+        for keeping real commits without a thicket of branches.
+        """
+        overlay_excludes = [f":(exclude){rel}" for rel in self.overlay]
+        _run(["git", "add", "-A", "--", ".", *self.DIFF_EXCLUDES, *overlay_excludes],
+             cwd=str(self.path))
+        # --quiet exits 1 when there is something staged, so _run's raise-on-
+        # nonzero is the wrong helper here
+        clean = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                               cwd=str(self.path), capture_output=True,
+                               check=False).returncode == 0
+        if clean:
+            return None  # the agent changed nothing
+        _run(["git", "-c", "user.name=heart", "-c", "user.email=heart@localhost",
+              "commit", "--no-verify", "-q", "-m", message], cwd=str(self.path))
+        sha = _run(["git", "rev-parse", "HEAD"], cwd=str(self.path)).stdout.strip()
+        if ref:
+            _run(["git", "update-ref", f"refs/heart/{ref}", sha], cwd=self.repo_path)
+        return sha
+
     def apply(self, patch: str) -> None:
         _run(["git", "apply", "--whitespace=nowarn"], cwd=str(self.path), input_text=patch)
 
     def destroy(self) -> None:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(self.path)],
-            cwd=self.repo_path, capture_output=True,
-        )
+        with _worktree_lock(self.repo_path):
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(self.path)],
+                cwd=self.repo_path, capture_output=True, check=False,
+            )

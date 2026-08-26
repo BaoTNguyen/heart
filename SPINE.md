@@ -1,7 +1,7 @@
 # The event spine
 
 The contract for cross-stack observability. This file is the canon; emitters in
-other repos (arteries `spool.py`, marrow via `heart.events`) conform to it.
+other repos (arteries `journal.py`, marrow via `heart.events`) conform to it.
 There is deliberately **no shared library** — the standard is this wire format,
 like syslog. Emitters are ~40 lines of stdlib each and stay that dumb.
 
@@ -36,9 +36,9 @@ in the environment, it stamps `payload.goal_id`/`payload.feature_id` onto
 every event it emits (optional, additive, skipped if the call site already
 set them) — `pulse goal <goal-id>` reads this back.
 
-## Spool location
+## Journal location
 
-`$HEART_SPOOL_DIR`, else `~/.local/share/heart/events/`. One file per UTC day:
+`$EVENT_JOURNAL_DIR`, else `~/.local/share/heart/events/`. One file per UTC day:
 `YYYYMMDD.ndjson`. Writers append single lines (atomic enough on Linux);
 readers tolerate torn or malformed lines by skipping them.
 

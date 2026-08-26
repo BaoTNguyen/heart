@@ -228,6 +228,119 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+STALE_AFTER_DAYS = 90
+SCHEDULED_WITHIN_DAYS = 30
+
+PRICING_PAGES = {
+    "claude": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+    "codex": "https://openai.com/api/pricing/",
+}
+
+
+def _models_seen(hours: float) -> "defaultdict[str, int]":
+    """Models the fleet actually ran, from the spine. The point of driving this
+    off observed traffic is that you never track a vendor's whole catalogue —
+    only the handful of models you are actually being billed for."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(hours=hours)).isoformat()
+    seen: defaultdict[str, int] = defaultdict(int)
+    for event in pulse_mod.load_events():
+        if str(event.get("ts") or "") < cutoff:
+            continue
+        model = (event.get("payload") or {}).get("model")
+        if model:
+            seen[str(model)] += 1
+    return seen
+
+
+def _model_pricing_table() -> dict:
+    from .runner import _load_models_json
+    return _load_models_json().get("model_pricing") or {}
+
+
+def cmd_models(args) -> int:
+    """Rate-card coverage: which models ran, which of them have no rate, and
+    how old the rates are. See PRICING.md for what to do about each."""
+    from .runner import model_pricing, models_json_path, pricing_provenance, set_model_price
+
+    if args.what == "set-price":
+        if not (args.model and args.source):
+            print("usage: heart models set-price <model> --input N --output N --source URL",
+                  file=sys.stderr)
+            return 2
+        row = set_model_price(
+            args.model, args.input_rate, args.output_rate,
+            source=args.source, verified=args.verified,
+            effective_from=args.effective_from)
+        when = f" from {row['effective_from']}" if row.get("effective_from") else ""
+        print(f"{args.model}: ${row['in_per_mtok']}/${row['out_per_mtok']} per MTok{when} "
+              f"(verified {row['verified']})")
+        print(f"wrote {models_json_path()}")
+        return 0
+
+    today = datetime.date.today()
+    rates = model_pricing()
+    provenance = pricing_provenance()
+    seen = _models_seen(args.hours)
+
+    missing = {m: n for m, n in seen.items() if m not in rates}
+    print(f"rate card: {models_json_path()}")
+    print(f"{len(rates)} model(s) priced · {len(seen)} model(s) seen in {args.hours:g}h\n")
+
+    if missing:
+        print("UNPRICED MODELS SEEN — billing at a provider fallback, which may be wrong")
+        for model, n in sorted(missing.items(), key=lambda kv: -kv[1]):
+            provider = "claude" if "claude" in model else "codex" if "gpt" in model else "?"
+            print(f"  {model:<24} {n:>5} turn(s)   check {PRICING_PAGES.get(provider, '?')}")
+        print()
+
+    stale, undated = [], []
+    for model in sorted(set(rates) & set(seen)):
+        verified = (provenance.get(model) or {}).get("verified")
+        if not verified:
+            undated.append(model)
+            continue
+        try:
+            age = (today - datetime.date.fromisoformat(verified)).days
+        except ValueError:
+            undated.append(model)
+            continue
+        if age > STALE_AFTER_DAYS:
+            stale.append((model, verified, age))
+    if stale:
+        print(f"STALE — not re-checked in over {STALE_AFTER_DAYS} days")
+        for model, verified, age in stale:
+            print(f"  {model:<24} verified {verified} ({age}d ago)")
+        print()
+    if undated:
+        # a rate with no date cannot be aged, so it never looks stale and is
+        # trusted indefinitely — the quiet version of being wrong
+        print("NO VERIFIED DATE — re-record with `set-price` so these can age")
+        print("  " + ", ".join(undated) + "\n")
+
+    scheduled = []
+    for model, rows in _model_pricing_table().items():
+        for row in (rows if isinstance(rows, list) else [rows]):
+            if not isinstance(row, dict) or not row.get("effective_from"):
+                continue
+            try:
+                days = (datetime.date.fromisoformat(row["effective_from"]) - today).days
+            except ValueError:
+                continue
+            if 0 <= days <= SCHEDULED_WITHIN_DAYS:
+                scheduled.append((model, row["effective_from"], days, row))
+    if scheduled:
+        print("PRICE CHANGES LANDING SOON")
+        for model, starts, days, row in sorted(scheduled, key=lambda s: s[2]):
+            print(f"  {model:<24} ${row['in_per_mtok']}/${row['out_per_mtok']} "
+                  f"on {starts} (in {days}d)")
+        print()
+
+    if not (missing or stale or undated or scheduled):
+        print("card is current for every model in use")
+    return 0
+
+
 def cmd_pulse(args) -> int:
     if args.what == "serve":
         from . import serve as serve_mod
@@ -446,6 +559,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", default=None, help="filter by source (heart|arteries|marrow|agent)")
     p.add_argument("--once", action="store_true", help="print and exit; don't follow")
     p.set_defaults(func=cmd_pulse)
+
+    p = sub.add_parser("models", help="rate card: check | set-price")
+    p.add_argument("what", nargs="?", default="check", choices=["check", "set-price"])
+    p.add_argument("model", nargs="?", help="model id, for set-price")
+    p.add_argument("--hours", type=float, default=24 * 30,
+                   help="window of observed traffic to check coverage against")
+    p.add_argument("--input", dest="input_rate", type=float, default=0.0,
+                   help="USD per million input tokens")
+    p.add_argument("--output", dest="output_rate", type=float, default=0.0,
+                   help="USD per million output tokens")
+    p.add_argument("--source", default=None,
+                   help="vendor pricing URL this rate was read from (required)")
+    p.add_argument("--verified", default=None, help="YYYY-MM-DD; defaults to today")
+    p.add_argument("--effective-from", dest="effective_from", default=None,
+                   help="YYYY-MM-DD a scheduled change takes effect")
+    p.set_defaults(func=cmd_models)
 
     p = sub.add_parser("ingest", help="re-run reward ingest over a runs dir (safe: dedup)")
     p.add_argument("runs_dir", nargs="?", default=str(WORK_RUNS_DIR))
