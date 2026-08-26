@@ -51,7 +51,7 @@ primary.
 | plexus → heart | Python import (`heart.episode`, `heart.taskspec`, `heart.env`) | heart API drift breaks plexus silently — no pinning, same-machine source checkouts |
 | heart → arteries | env (`ARTERIES_PROJECT/REPO/MEMORY/EPHEMERAL`, `HEART_EPISODE_ID`) + `art ingest` subprocess + `.arteries/hooks/observe.sh` | env leakage between roles; ingest schema drift; hooks absent in a fresh worktree |
 | arteries → capillaries | Python import (retrieval gate) + shared Postgres | capillaries import failure takes down arteries eval (seen: `No module named 'capillaries'`) |
-| everyone → spine | NDJSON spool, SPINE.md contract, additive-only fields | a malformed emitter corrupts nothing (tolerant readers) but silently drops observability |
+| everyone → spine | NDJSON journal, SPINE.md contract, additive-only fields | a malformed emitter corrupts nothing (tolerant readers) but silently drops observability |
 | everyone → Postgres | arteries owns `episodes/decisions/rewards`; capillaries owns its retrieval + skills + optimize tables | schema ownership is clean today; keep migrations in the owning repo only |
 
 ### 1.2 Contract tests (per seam, cheap, run in each repo's suite)
@@ -106,7 +106,7 @@ detail.
 **Conflict audit (run once, then guarded by the smoke):** env prefixes are
 already disjoint (`HEART_/ARTERIES_/CAPILLARIES_/PLEXUS_`); ports must be
 declared in one place — adopt: capillaries HTTP 8100, vLLM 8000, pulse serve
-7717, document in each README; Postgres schemas per owner (§1.1); spool is
+7717, document in each README; Postgres schemas per owner (§1.1); journal is
 append-only per-source files so concurrent writers are safe; config files
 (`~/.config/heart/models.json`, capillaries config, `.arteries/`) never shared.
 
