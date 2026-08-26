@@ -14,7 +14,7 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .events import spool_dir
+from .events import journal_dir
 
 
 def _matches(e: dict, episode: str | None, task: str | None, source: str | None) -> bool:
@@ -29,7 +29,7 @@ def load_events(
     episode: str | None = None, task: str | None = None, source: str | None = None
 ) -> list[dict]:
     events = []
-    for path in sorted(spool_dir().glob("*.ndjson")):
+    for path in sorted(journal_dir().glob("*.ndjson")):
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 e = json.loads(line)
@@ -77,11 +77,11 @@ def tail(
         print(render(e))
     if not follow:
         return
-    # follow the newest spool file; new days create new files, so re-resolve
+    # follow the newest journal file; new days create new files, so re-resolve
     offsets: dict[Path, int] = {}
     try:
         while True:
-            files = sorted(spool_dir().glob("*.ndjson"))
+            files = sorted(journal_dir().glob("*.ndjson"))
             for path in files[-2:]:  # current day + rollover window
                 if path not in offsets:
                     offsets[path] = path.stat().st_size  # skip history, printed above
