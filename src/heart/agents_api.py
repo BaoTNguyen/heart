@@ -15,6 +15,7 @@ Config resolution, highest wins:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import subprocess
@@ -23,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 SYSTEM = (
     "You are a coding agent working inside a git repository (the current directory). "
@@ -63,19 +65,75 @@ def resolve_config() -> dict:
     if cfg.get("api_key_env"):
         key = os.environ.get(cfg["api_key_env"], "")
     key = key or os.environ.get("HEART_API_KEY", "")
-    return {"endpoint": endpoint.rstrip("/"), "model": model, "api_key": key}
+    # Per-request reasoning toggle (see the local model manager). The server is
+    # launched with thinking off; a reasoning profile flips `enable_thinking`
+    # per call, so one loaded model serves both a reasoning role and a fast role
+    # without a reload. A reasoning trace can eat the whole budget and return an
+    # empty answer, so the floor rises to 4000 tokens when it's on.
+    reasoning = bool(cfg.get("reasoning")) or os.environ.get("HEART_API_REASONING") == "1"
+    default_max = 4000 if reasoning else 4096
+    max_tokens = int(cfg.get("max_tokens") or os.environ.get("HEART_API_MAX_TOKENS")
+                     or default_max)
+    return {"endpoint": endpoint.rstrip("/"), "model": model, "api_key": key,
+            "reasoning": reasoning, "max_tokens": max(max_tokens, 4000 if reasoning else 1)}
+
+
+def endpoint_for(profile: str) -> str:
+    """The endpoint URL a profile resolves to, for a locality probe only.
+
+    Deliberately tolerant where resolve_config is strict: an unreadable
+    models.json or a missing profile returns the default endpoint instead of
+    exiting, because the caller (runner's slot gate) must never crash or block
+    on an uncertain probe — the child process re-runs resolve_config and
+    reports the real error there.
+    """
+    cfg: dict = {}
+    if profile:
+        try:
+            path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+            cfg = json.loads(path.read_text())["profiles"].get(profile, {})
+        except (OSError, KeyError, json.JSONDecodeError):
+            cfg = {}
+    endpoint = cfg.get("endpoint") or os.environ.get("HEART_API_ENDPOINT") \
+        or "http://127.0.0.1:8000/v1"
+    return endpoint.rstrip("/")
+
+
+def is_local_endpoint(endpoint: str) -> bool:
+    """True if endpoint is a model server on this box or LAN — loopback or a
+    private address. These share one GPU's worth of throughput, so the fleet
+    caps them together; a metered public API scales on its own and is not
+    gated."""
+    host = urlsplit(endpoint).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
 
 
 _RETRY_CODES = {429, 500, 502, 503, 504}
+
+
+def _build_body(cfg: dict, messages: list[dict]) -> dict:
+    """The chat payload, split out so the reasoning/max_tokens wiring is testable
+    without a live endpoint. `chat_template_kwargs.enable_thinking` is the
+    llama.cpp/vLLM per-request thinking switch; absent when reasoning is off so
+    a server that doesn't understand the key is unaffected."""
+    body: dict = {"model": cfg["model"], "messages": messages, "tools": TOOLS,
+                  "max_tokens": cfg.get("max_tokens", 4096)}
+    if cfg.get("reasoning"):
+        body["chat_template_kwargs"] = {"enable_thinking": True}
+    return body
 
 
 def _chat(cfg: dict, messages: list[dict]) -> dict:
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
-    body = json.dumps({
-        "model": cfg["model"], "messages": messages, "tools": TOOLS, "max_tokens": 4096,
-    }).encode()
+    body = json.dumps(_build_body(cfg, messages)).encode()
     req = urllib.request.Request(cfg["endpoint"] + "/chat/completions", data=body, headers=headers)
     # Rate limits (429) and transient 5xx are exactly what a hot batch hits;
     # without a retry one blip fails the whole episode. Exponential backoff.
@@ -131,13 +189,38 @@ def _arteries_context(prompt: str) -> str:
 
 
 def _accumulate_usage(totals: dict, response: dict) -> None:
+    """Fold one API response into the running totals, normalised.
+
+    The stack has exactly one convention: `tokens_in` is *uncached* input, and
+    cache traffic lives in its own buckets. OpenAI reports the opposite —
+    `prompt_tokens` already contains the cached tokens, with
+    `prompt_tokens_details.cached_tokens` naming the subset — so passing it
+    through unchanged bills every cached token at the full input rate instead of
+    a tenth. At the cache-hit rates an agent loop actually sees that is not a
+    rounding error: 93% hits turns $230 of real spend into $1,344 of reported
+    spend. Convert here, at the edge, so nothing downstream has to know which
+    vendor produced the numbers.
+
+    `completion_tokens` needs no such treatment: reasoning tokens are already
+    inside it and are billed as output."""
     usage = response.get("usage") or {}
     tin = usage.get("prompt_tokens", usage.get("input_tokens"))
     tout = usage.get("completion_tokens", usage.get("output_tokens"))
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens")
+    if cached is None:
+        # an Anthropic-shaped response already separates them; a server that
+        # reports no detail block simply had no cache traffic
+        cached = usage.get("cache_read_input_tokens") or 0
+    elif tin is not None:
+        # OpenAI shape: carve the subset out so `tokens_in` means what it says
+        tin = max(0, tin - cached)
     if tin is not None:
         totals["tokens_in"] = totals.get("tokens_in", 0) + tin
     if tout is not None:
         totals["tokens_out"] = totals.get("tokens_out", 0) + tout
+    if cached:
+        totals["cache_read"] = totals.get("cache_read", 0) + cached
 
 
 def main() -> int:
