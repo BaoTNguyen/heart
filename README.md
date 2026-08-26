@@ -96,11 +96,21 @@ Set a default with `HEART_AGENT`. The `api` agent resolves config from
 
 ```json
 {"profiles": {
-  "gpt":      {"endpoint": "https://api.openai.com/v1", "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"},
-  "deepseek": {"endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY"},
-  "local7b":  {"endpoint": "http://127.0.0.1:8000/v1", "model": "default"}
+  "gpt":       {"endpoint": "https://api.openai.com/v1", "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"},
+  "deepseek":  {"endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY"},
+  "local":     {"endpoint": "http://127.0.0.1:8001/v1", "model": "default"},
+  "local-think": {"endpoint": "http://127.0.0.1:8001/v1", "model": "default", "reasoning": true}
 }}
 ```
+
+**Per-request reasoning.** A local server (llama.cpp/vLLM) is launched with
+thinking off; `"reasoning": true` on a profile flips `enable_thinking` per call,
+so `local` and `local-think` share one loaded model on one port — a fast
+executor and a thinking planner without a reload. `HEART_API_REASONING=1`
+forces it for a single run. When on, the token floor rises to 4000 so a
+reasoning trace can't consume the whole budget and return an empty answer.
+Point these at the [hot-swap model manager](../plexus/local_model_ideas/) and
+the model behind the fixed port swaps underneath without the profiles changing.
 
 CLI agents keep arteries memory/retrieval hooks alive if installed in the
 target repo (episode worktrees carry the repo's `.arteries/` and CLI hook
@@ -122,9 +132,40 @@ unchecked. A bare tier map still works and is synthesized into a manifest:
 ```
 
 Every routing call emits a `route.decided` event with its signals, so routing
-quality is auditable in the spool and can later train a learned gate.
+quality is auditable in the journal and can later train a learned gate.
 `--escalate` defaults to the strong tier when routing. `HEART_MAX_AGENTS`
 (default 8) caps concurrent agents across parallel episodes and candidates.
+
+### Fleet concurrency: one local model, many callers
+
+`HEART_MAX_AGENTS` bounds one process. When several processes run at once — a
+`heart batch`, or a few `plexus run` goals working different repos — they each
+get their own cap, and if they route cheap-tier work to the *same* local model
+server they sum to N×8 requests against one GPU. Two knobs bound the total,
+both opt-in (unset or `0` changes nothing):
+
+- **`HEART_MAX_AGENTS_GLOBAL`** — a machine-wide cap on *every* agent, for when
+  the shared limit is a paid API key or aggregate load.
+- **`HEART_LOCAL_SLOTS`** — a cap on agents hitting a *local* model server
+  (loopback or LAN address), and nothing else. Paid APIs and subscription CLIs
+  skip it and keep running, so a fleet's frontier roles aren't throttled to
+  protect the GPU. Slots are keyed by **host:port**, so every profile pointing
+  at the *same* server shares one pool, while two servers get independent pools.
+  That is the multi-GPU story without a supervisor: run one llama.cpp (or vLLM)
+  per GPU — `127.0.0.1:8000` on card 0, `:8001` on card 1 — point a profile at
+  each, and `HEART_LOCAL_SLOTS` becomes the *per-GPU* ceiling, so two GPUs give
+  you `2 × N` local agents, N per card, each queue bounded on its own. Profiles
+  sharing one endpoint (`local7b`, `local-coder`, a trained checkpoint all on
+  `:8000`) contend as one resource — which is why a single server that keeps
+  swapping models between them just thrashes; pin one model per endpoint and
+  make a swap a deliberate restart, not a routing accident. A tensor-parallel
+  server spanning both cards on one port is a single pool, correctly: it is one
+  queue.
+
+Size `HEART_LOCAL_SLOTS` to what one server batches well (2–4 is a sane start);
+excess callers wait on a flock'd slot rather than piling onto the endpoint. A
+crashed agent's slot frees immediately — the kernel drops the lock when the
+holder dies.
 
 Tiers mix pricing models freely — a tier is an agent string, so it can be a
 local server (`api:local7b`), a metered API (`api:gpt`), or a subscription CLI
@@ -187,14 +228,29 @@ Operational switches:
   re-runs the sweep any time (dedup makes it safe).
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
   a cheap tier that keeps failing means the classifier thresholds need moving.
-- **Cost capture**: `runner.run_agent` extracts tokens (and, with a
-  `~/.config/heart/models.json` `"pricing"` map keyed by agent string,
-  dollars) per role and rolls them into `episode["usage"]` and the spine.
-  Subscription CLI seats (`claude`) get tokens only unless priced explicitly —
-  no fake dollars for a quota you already paid for.
+- **Cost capture**: `runner.run_agent` extracts tokens and, from a
+  `~/.config/heart/models.json` `"pricing"` map keyed by agent string, dollars
+  per role, rolled into `episode["usage"]` and the spine. Two rules make the
+  dollar figure a usable routing signal rather than a billing artifact:
+  - **A local model server is always free** — `0.0`, even if a broad `"api"`
+    pricing entry exists — because you pay nothing to run it.
+  - **Everything else prices at the map's API rates, including subscription
+    seats.** A Claude Pro/Max seat's marginal cost is zero, but pricing `claude`
+    at Anthropic's published rates records the spend it *would* cost, so routing
+    and `pulse insights` compare tiers on real dollars. Give each seat its own
+    API-equivalent entry:
+    ```json
+    "pricing": {
+      "api":    {"in_per_mtok": 0.15, "out_per_mtok": 0.60},
+      "claude": {"in_per_mtok": 3.00, "out_per_mtok": 15.00},
+      "codex":  {"in_per_mtok": 2.50, "out_per_mtok": 10.00}
+    }
+    ```
+    (rates are illustrative — set them to the current published API price of the
+    model behind each seat.)
 - **`heart pulse serve`**: the factory floor as a local web page
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
-  all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,
+  all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
 - **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
   outcome/reward/cost, grouped from `episode.finished` events whose payload

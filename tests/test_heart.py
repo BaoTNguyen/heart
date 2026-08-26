@@ -58,8 +58,8 @@ class TestHeart(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.commit = make_repo(self.root)
         self.runs = self.root / "runs"
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
         self._old_ingest = os.environ.get("HEART_INGEST")
         os.environ["HEART_INGEST"] = "off"  # toy episodes must not hit the real ledger
         self.task = TaskSpec(
@@ -73,10 +73,10 @@ class TestHeart(unittest.TestCase):
         )
 
     def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
+        if self._old_journal is None:
+            os.environ.pop("EVENT_JOURNAL_DIR", None)
         else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+            os.environ["EVENT_JOURNAL_DIR"] = self._old_journal
         if self._old_ingest is None:
             os.environ.pop("HEART_INGEST", None)
         else:
@@ -483,9 +483,9 @@ class TestHeart(unittest.TestCase):
         self.assertEqual(cli_main(["pulse", "health"]), 0)
 
         # a zombie episode and a degraded store write must each flip health to 1
-        spool = Path(os.environ["HEART_SPOOL_DIR"])
+        journal = Path(os.environ["EVENT_JOURNAL_DIR"])
         old_ts = "2026-01-01T00:00:00+00:00"
-        with open(sorted(spool.glob("*.ndjson"))[0], "a") as f:
+        with open(sorted(journal.glob("*.ndjson"))[0], "a") as f:
             f.write(json.dumps({"ts": old_ts, "source": "heart",
                                 "kind": "episode.started", "episode_id": "ep-zombie"}) + "\n")
             f.write(json.dumps({"ts": old_ts, "source": "arteries", "kind": "turn.observed",
@@ -686,32 +686,280 @@ class TestCost(unittest.TestCase):
             "total_cost_usd": 1.23,
         }))
         usage = _extract_usage(log, "claude")
-        self.assertEqual(usage, {"tokens_in": 100, "tokens_out": 40})
+        # no cache fields in the envelope means no cache traffic -> 0, not None:
+        # zero is a measurement, None is "we could not read the log"
+        self.assertEqual(usage, {"tokens_in": 100, "tokens_out": 40,
+                                 "cache_read": 0, "cache_write_5m": 0,
+                                 "cache_write_1h": 0})
         # downstream code greps the log for plain text (verdicts, failure tails)
         self.assertEqual(log.read_text(), "did the thing")
+
+    def test_accumulate_usage_normalises_openai_cache_convention(self):
+        """OpenAI's `prompt_tokens` INCLUDES cached tokens; Anthropic's
+        `input_tokens` excludes them. The stack has one convention — tokens_in
+        is uncached — so the OpenAI subset is carved out here, at the edge.
+        Passing it through billed every cached token at the full input rate
+        instead of a tenth, which at real agent cache-hit rates is a ~6x
+        overcharge, not a rounding error."""
+        from heart.agents_api import _accumulate_usage
+
+        t = {}
+        _accumulate_usage(t, {"usage": {
+            "prompt_tokens": 4293, "completion_tokens": 520,
+            "prompt_tokens_details": {"cached_tokens": 3200}}})
+        self.assertEqual(t, {"tokens_in": 1093, "tokens_out": 520,
+                             "cache_read": 3200})
+
+        # an Anthropic-shaped response already separates them: subtracting
+        # would under-report input as badly as adding over-reports it
+        t = {}
+        _accumulate_usage(t, {"usage": {
+            "input_tokens": 15, "output_tokens": 2692,
+            "cache_read_input_tokens": 48_000}})
+        self.assertEqual(t, {"tokens_in": 15, "tokens_out": 2692,
+                             "cache_read": 48_000})
+
+        # no cache traffic at all -> no cache key, not a zero
+        t = {}
+        _accumulate_usage(t, {"usage": {"prompt_tokens": 100, "completion_tokens": 40}})
+        self.assertEqual(t, {"tokens_in": 100, "tokens_out": 40})
+
+        # accumulation across a multi-turn tool loop stays normalised
+        t = {}
+        for _ in range(3):
+            _accumulate_usage(t, {"usage": {
+                "prompt_tokens": 1000, "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 900}}})
+        self.assertEqual(t, {"tokens_in": 300, "tokens_out": 30, "cache_read": 2700})
+
+    def test_extract_usage_counts_cache_tokens(self):
+        """The bug this exists for: an agent turn re-reads a cached prefix every
+        time, so `input_tokens` alone can report 15 against 2,692 out while the
+        real prompt was tens of thousands of cached tokens. Reading only that
+        field understated every Claude turn's cost."""
+        from heart.runner import _extract_usage
+
+        log = self.root / "implement.log"
+        log.write_text(json.dumps({
+            "result": "did the thing",
+            "usage": {
+                "input_tokens": 15, "output_tokens": 2692,
+                "cache_read_input_tokens": 48_000,
+                "cache_creation_input_tokens": 12_000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 9_000,
+                                   "ephemeral_1h_input_tokens": 3_000},
+            },
+        }))
+        self.assertEqual(_extract_usage(log, "claude"), {
+            "tokens_in": 15, "tokens_out": 2692, "cache_read": 48_000,
+            "cache_write_5m": 9_000, "cache_write_1h": 3_000})
+
+    def test_extract_usage_flat_cache_total_when_ttl_absent(self):
+        """An older CLI reports only the flat creation total. Treat it as the
+        5m bucket rather than dropping it: 1.25x is the common case and the
+        cheaper of the two, so the error is small and never an overcharge."""
+        from heart.runner import _extract_usage
+
+        log = self.root / "implement.log"
+        log.write_text(json.dumps({
+            "result": "ok",
+            "usage": {"input_tokens": 10, "output_tokens": 20,
+                      "cache_read_input_tokens": 500,
+                      "cache_creation_input_tokens": 300},
+        }))
+        usage = _extract_usage(log, "claude")
+        self.assertEqual(usage["cache_write_5m"], 300)
+        self.assertEqual(usage["cache_write_1h"], 0)
+
+    def test_model_id_keys_and_effective_dating(self):
+        """A rate entered against the exact model id beats one inferred through
+        a profile, and a scheduled change takes effect on its own date."""
+        from heart.runner import model_pricing
+
+        cfg = self.root / "heart"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "models.json").write_text(json.dumps({
+            "profiles": {"sonnet": {"model": "claude-sonnet-5"}},
+            "pricing": {"claude:sonnet": {"in_per_mtok": 99.0, "out_per_mtok": 99.0}},
+            "model_pricing": {
+                "claude-opus-5": {"in_per_mtok": 5.0, "out_per_mtok": 25.0,
+                                  "source": "https://example/pricing",
+                                  "verified": "2026-08-05"},
+                "claude-sonnet-5": [
+                    {"in_per_mtok": 2.0, "out_per_mtok": 10.0,
+                     "effective_from": "2026-01-01"},
+                    {"in_per_mtok": 3.0, "out_per_mtok": 15.0,
+                     "effective_from": "2026-09-01"},
+                ],
+            },
+        }))
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        try:
+            # model-id entry wins over the profile join, which said $99
+            day = model_pricing(on="2026-08-05")
+            self.assertEqual(day["claude-opus-5"], {"input": 5.0, "output": 25.0})
+            self.assertEqual(day["claude-sonnet-5"], {"input": 2.0, "output": 10.0})
+            # the announced change lands on its date without anyone editing
+            self.assertEqual(model_pricing(on="2026-08-31")["claude-sonnet-5"],
+                             {"input": 2.0, "output": 10.0})
+            self.assertEqual(model_pricing(on="2026-09-01")["claude-sonnet-5"],
+                             {"input": 3.0, "output": 15.0})
+            # a future-only row must not apply early
+            self.assertEqual(model_pricing(on="2025-06-01").get("claude-sonnet-5"),
+                             {"input": 99.0, "output": 99.0})
+        finally:
+            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
+                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+
+    def test_set_model_price_demands_provenance(self):
+        """A rate with no source cannot be re-verified later, so it is refused
+        rather than written — an unauditable cost is one people stop asking
+        about, which is how a stale number survives a price change."""
+        from heart.runner import model_pricing, set_model_price
+
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root / "prov")
+        try:
+            with self.assertRaises(ValueError):
+                set_model_price("m", 1.0, 2.0, source="")
+            with self.assertRaises(ValueError):
+                set_model_price("m", -1.0, 2.0, source="https://example/pricing")
+            row = set_model_price("claude-x", 4.0, 8.0,
+                                  source="https://example/pricing",
+                                  verified="2026-08-05")
+            self.assertEqual(row["source"], "https://example/pricing")
+            self.assertEqual(model_pricing()["claude-x"],
+                             {"input": 4.0, "output": 8.0})
+            # a scheduled row is added beside the current one, not on top of it
+            set_model_price("claude-x", 6.0, 12.0,
+                            source="https://example/pricing",
+                            effective_from="2099-01-01")
+            self.assertEqual(model_pricing()["claude-x"],
+                             {"input": 4.0, "output": 8.0})
+            self.assertEqual(model_pricing(on="2099-06-01")["claude-x"],
+                             {"input": 6.0, "output": 12.0})
+        finally:
+            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
+                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+
+    def test_model_pricing_joins_profiles_to_rates(self):
+        """models.json keys rates by provider:profile and models by profile.
+        A CLI transcript reports neither — only a concrete model id — so the
+        two have to be joined before an interactive turn can be priced."""
+        from heart.runner import model_pricing
+
+        cfg = self.root / "heart"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "models.json").write_text(json.dumps({
+            "profiles": {
+                "haiku": {"model": "claude-haiku-4-5"},
+                "terra": {"model": "gpt-5.6-terra"},
+                "local": {"model": "qwen3.6-27b"},
+                "orphan": {"model": "no-rate-for-this"},   # profile, no rate
+                "nomodel": {},                              # rate, no model id
+            },
+            "pricing": {
+                "claude:haiku": {"in_per_mtok": 1.0, "out_per_mtok": 5.0},
+                "codex:terra": {"in_per_mtok": 2.0, "out_per_mtok": 12.0},
+                "api:local": {"in_per_mtok": 0.0, "out_per_mtok": 0.0},
+                "claude:nomodel": {"in_per_mtok": 9.0, "out_per_mtok": 9.0},
+                "claude": {"in_per_mtok": 5.0, "out_per_mtok": 25.0},
+            },
+        }))
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        try:
+            rates = model_pricing()
+            self.assertEqual(rates["claude-haiku-4-5"], {"input": 1.0, "output": 5.0})
+            self.assertEqual(rates["gpt-5.6-terra"], {"input": 2.0, "output": 12.0})
+            # a free local model is 0/0, not absent: the caller must bill it as
+            # zero rather than falling back to a provider rate
+            self.assertEqual(rates["qwen3.6-27b"], {"input": 0.0, "output": 0.0})
+            # unjoinable entries are absent, so the caller falls back instead
+            # of billing a model at a rate that was never meant for it
+            self.assertNotIn("no-rate-for-this", rates)
+            # the provider-wide key has no profile and must not become a model
+            self.assertNotIn("claude", rates)
+        finally:
+            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
+                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+
+    def test_model_pricing_survives_a_missing_or_broken_config(self):
+        """No card is "we cannot price this", never "everything is free"."""
+        from heart.runner import model_pricing
+
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root / "nonexistent")
+        try:
+            self.assertEqual(model_pricing(), {})
+            cfg = self.root / "broken" / "heart"
+            cfg.mkdir(parents=True, exist_ok=True)
+            (cfg / "models.json").write_text("{not json")
+            os.environ["XDG_CONFIG_HOME"] = str(self.root / "broken")
+            self.assertEqual(model_pricing(), {})
+        finally:
+            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
+                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+
+    def test_price_applies_cache_multipliers(self):
+        """Read 0.1x, 5m write 1.25x, 1h write 2x, all off the base input rate."""
+        from heart.runner import _price
+
+        cfg = self.root / "heart"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "models.json").write_text(json.dumps({"pricing": {
+            "claude": {"in_per_mtok": 5.0, "out_per_mtok": 25.0}}}))
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        try:
+            # 1M uncached in = $5; 1M read = $0.50; 1M 5m write = $6.25;
+            # 1M 1h write = $10; 1M out = $25
+            self.assertAlmostEqual(
+                _price("claude", 1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000),
+                5.0 + 25.0 + 0.5 + 6.25 + 10.0, places=6)
+            # the two-argument call every existing caller makes is unchanged
+            self.assertAlmostEqual(_price("claude", 1_000_000, 0), 5.0, places=6)
+            # cache-only traffic still costs money
+            self.assertAlmostEqual(_price("claude", 0, 0, 1_000_000), 0.5, places=6)
+            # the understated case, priced both ways
+            bare = _price("claude", 15, 2692)
+            full = _price("claude", 15, 2692, 48_000, 9_000, 3_000)
+            self.assertGreater(full, bare)
+        finally:
+            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
+                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
 
     def test_extract_usage_garbage_log(self):
         from heart.runner import _extract_usage
 
         log = self.root / "implement.log"
         log.write_text("not json at all\njust agent chatter\n")
-        self.assertEqual(_extract_usage(log, "claude"), {"tokens_in": None, "tokens_out": None})
+        self.assertEqual(_extract_usage(log, "claude"),
+                         {"tokens_in": None, "tokens_out": None, "cache_read": None,
+                          "cache_write_5m": None, "cache_write_1h": None})
 
         missing = self.root / "missing.log"
-        self.assertEqual(_extract_usage(missing, "claude"), {"tokens_in": None, "tokens_out": None})
+        self.assertEqual(_extract_usage(missing, "claude"),
+                         {"tokens_in": None, "tokens_out": None, "cache_read": None,
+                          "cache_write_5m": None, "cache_write_1h": None})
 
     def test_extract_usage_api_heart_usage_line(self):
         from heart.runner import _extract_usage
 
         log = self.root / "solo.log"
         log.write_text("$ echo hi\nhi\nHEART_USAGE={\"tokens_in\": 12, \"tokens_out\": 34}\n")
-        self.assertEqual(_extract_usage(log, "api"), {"tokens_in": 12, "tokens_out": 34})
+        self.assertEqual(_extract_usage(log, "api"),
+                         {"tokens_in": 12, "tokens_out": 34, "cache_read": 0,
+                          "cache_write_5m": 0, "cache_write_1h": 0})
 
         log2 = self.root / "no-usage.log"
         log2.write_text("$ echo hi\nhi\n")
-        self.assertEqual(_extract_usage(log2, "api"), {"tokens_in": None, "tokens_out": None})
+        none = {"tokens_in": None, "tokens_out": None, "cache_read": None,
+                "cache_write_5m": None, "cache_write_1h": None}
+        self.assertEqual(_extract_usage(log2, "api"), none)
 
-        self.assertEqual(_extract_usage(log, "shell"), {"tokens_in": None, "tokens_out": None})
+        self.assertEqual(_extract_usage(log, "shell"), none)
 
     def test_price(self):
         from heart.runner import _price
@@ -719,17 +967,23 @@ class TestCost(unittest.TestCase):
         cfgdir = self.root / "cfg" / "heart"
         cfgdir.mkdir(parents=True)
         (cfgdir / "models.json").write_text(json.dumps({
+            "profiles": {
+                "qwen": {"endpoint": "https://api.example.com/v1", "model": "qwen"},
+                "local": {"endpoint": "http://127.0.0.1:8000/v1", "model": "q"},
+            },
             "pricing": {
-                "api:qwen": {"in_per_mtok": 1.0, "out_per_mtok": 2.0},
+                "api": {"in_per_mtok": 1.0, "out_per_mtok": 2.0},
                 "claude": {"in_per_mtok": 3.0, "out_per_mtok": 15.0},
             }
         }))
         old = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
         try:
-            # exact match
+            # metered profile prices via the base "api" entry
             self.assertEqual(_price("api:qwen", 1_000_000, 1_000_000), 3.0)
-            # base fallback: "claude:opus" -> "claude" entry
+            # a local endpoint is free even under a broad "api" entry
+            self.assertEqual(_price("api:local", 1_000_000, 1_000_000), 0.0)
+            # base fallback: "claude:opus" -> "claude" entry (subscription seat priced)
             self.assertEqual(_price("claude:opus", 1_000_000, 1_000_000), 18.0)
             # no pricing entry for this agent
             self.assertIsNone(_price("gemini", 1_000_000, 1_000_000))
@@ -745,9 +999,9 @@ class TestCost(unittest.TestCase):
         from heart import pulse
         from heart.episode import run_episode
 
-        old_spool = os.environ.get("HEART_SPOOL_DIR")
+        old_journal = os.environ.get("EVENT_JOURNAL_DIR")
         old_ingest = os.environ.get("HEART_INGEST")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
         os.environ["HEART_INGEST"] = "off"
         try:
             commit = make_repo(self.root)
@@ -766,14 +1020,16 @@ class TestCost(unittest.TestCase):
                 self.assertIsNone(r["tokens_in"])
                 self.assertIsNone(r["tokens_out"])
                 self.assertIsNone(r["cost_usd"])
-            self.assertEqual(ep["usage"], {"tokens_in": None, "tokens_out": None, "cost_usd": None})
+            self.assertEqual(ep["usage"], {"tokens_in": None, "tokens_out": None,
+                                       "cache_read": None, "cache_write_5m": None,
+                                       "cache_write_1h": None, "cost_usd": None})
             # must not crash even though no episode in this window carries cost
             pulse.insights(hours=24)
         finally:
-            if old_spool is None:
-                os.environ.pop("HEART_SPOOL_DIR", None)
+            if old_journal is None:
+                os.environ.pop("EVENT_JOURNAL_DIR", None)
             else:
-                os.environ["HEART_SPOOL_DIR"] = old_spool
+                os.environ["EVENT_JOURNAL_DIR"] = old_journal
             if old_ingest is None:
                 os.environ.pop("HEART_INGEST", None)
             else:
@@ -786,16 +1042,16 @@ class TestGuardrails(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.commit = make_repo(self.root)
         self.runs = self.root / "runs"
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
         self._old_ingest = os.environ.get("HEART_INGEST")
         os.environ["HEART_INGEST"] = "off"
 
     def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
+        if self._old_journal is None:
+            os.environ.pop("EVENT_JOURNAL_DIR", None)
         else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+            os.environ["EVENT_JOURNAL_DIR"] = self._old_journal
         if self._old_ingest is None:
             os.environ.pop("HEART_INGEST", None)
         else:
@@ -935,26 +1191,26 @@ class TestGoalLineage(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
 
     def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
+        if self._old_journal is None:
+            os.environ.pop("EVENT_JOURNAL_DIR", None)
         else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+            os.environ["EVENT_JOURNAL_DIR"] = self._old_journal
         self.tmp.cleanup()
 
     def _write(self, **event):
-        from heart.events import spool_dir
+        from heart.events import journal_dir
 
-        d = spool_dir()
+        d = journal_dir()
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "20260101.ndjson", "a") as f:
             f.write(json.dumps(event) + "\n")
 
     def test_emit_stamps_goal_lineage_from_env(self):
-        from heart.events import emit, spool_dir
+        from heart.events import emit, journal_dir
 
         old_goal = os.environ.get("PLEXUS_GOAL_ID")
         old_feat = os.environ.get("PLEXUS_FEATURE_ID")
@@ -974,7 +1230,7 @@ class TestGoalLineage(unittest.TestCase):
             else:
                 os.environ["PLEXUS_FEATURE_ID"] = old_feat
 
-        lines = sorted(spool_dir().glob("*.ndjson"))[0].read_text().splitlines()
+        lines = sorted(journal_dir().glob("*.ndjson"))[0].read_text().splitlines()
         events = {json.loads(line)["episode_id"]: json.loads(line) for line in lines}
         self.assertEqual(events["ep-env"]["payload"]["goal_id"], "g-env")
         self.assertEqual(events["ep-env"]["payload"]["feature_id"], "f-env")
@@ -1023,20 +1279,20 @@ class TestHealthRules(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
 
     def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
+        if self._old_journal is None:
+            os.environ.pop("EVENT_JOURNAL_DIR", None)
         else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+            os.environ["EVENT_JOURNAL_DIR"] = self._old_journal
         self.tmp.cleanup()
 
     def _write(self, **event):
-        from heart.events import spool_dir
+        from heart.events import journal_dir
 
-        d = spool_dir()
+        d = journal_dir()
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "20260101.ndjson", "a") as f:
             f.write(json.dumps(event) + "\n")
@@ -1119,9 +1375,9 @@ class TestPulseServe(unittest.TestCase):
 
         from heart.serve import Handler
 
-        old = os.environ.get("HEART_SPOOL_DIR")
+        old = os.environ.get("EVENT_JOURNAL_DIR")
         tmp = tempfile.mkdtemp()
-        os.environ["HEART_SPOOL_DIR"] = tmp
+        os.environ["EVENT_JOURNAL_DIR"] = tmp
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
@@ -1134,9 +1390,9 @@ class TestPulseServe(unittest.TestCase):
         finally:
             httpd.shutdown()
             if old is None:
-                os.environ.pop("HEART_SPOOL_DIR", None)
+                os.environ.pop("EVENT_JOURNAL_DIR", None)
             else:
-                os.environ["HEART_SPOOL_DIR"] = old
+                os.environ["EVENT_JOURNAL_DIR"] = old
 
     def test_steer_and_episode_drilldown_endpoints(self):
         import threading
@@ -1147,8 +1403,8 @@ class TestPulseServe(unittest.TestCase):
         from heart import serve as serve_mod
         from heart.serve import Handler
 
-        old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = tempfile.mkdtemp()
+        old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = tempfile.mkdtemp()
         runs_dir = Path(tempfile.mkdtemp())
         ep_dir = runs_dir / "ep-drill"
         ep_dir.mkdir()
@@ -1181,10 +1437,10 @@ class TestPulseServe(unittest.TestCase):
         finally:
             httpd.shutdown()
             serve_mod.RUNS_DIR = old_runs_dir
-            if old_spool is None:
-                os.environ.pop("HEART_SPOOL_DIR", None)
+            if old_journal is None:
+                os.environ.pop("EVENT_JOURNAL_DIR", None)
             else:
-                os.environ["HEART_SPOOL_DIR"] = old_spool
+                os.environ["EVENT_JOURNAL_DIR"] = old_journal
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ from .runner import sandbox_wrap
 from .taskspec import TaskSpec, Verifier
 
 
-def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str, dict]:
+def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
+                  profile=None) -> dict[str, dict]:
     # No bytecode cache: a same-second same-size source edit (common in fast
     # agent fix loops) passes the pyc header's mtime+size check and Python
     # silently runs stale code — verifier results must never depend on that.
@@ -18,8 +19,12 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str
     env = {k: v for k, v in os.environ.items() if not k.startswith("HEART_TIER_")}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     # Policy: agents get network, verifiers never do — when sandboxing is on
-    # at all, verifier subprocesses are always forced into bwrap-nonet.
-    sandboxed = os.environ.get("HEART_SANDBOX") in ("bwrap", "bwrap-nonet")
+    # at all, verifier subprocesses are always forced into the no-network
+    # variant of whichever mode is in force. `profile` carries that for docker
+    # (verifier_profile_for pins network="none" and a read-only worktree); for
+    # bwrap it is the -nonet mode below.
+    mode = os.environ.get("HEART_SANDBOX", "off")
+    sandboxed = mode in ("bwrap", "bwrap-nonet") or (mode == "docker" and profile is not None)
     # Optional suite-wide ceiling. Each verifier still gets its own `timeout`, but
     # the whole suite can't exceed HEART_VERIFY_SUITE_TIMEOUT — without it, N
     # verifiers run serially at `timeout` each, so a 4-linter repo can spend 4×
@@ -42,7 +47,11 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int) -> dict[str
             this_timeout = min(timeout, remaining)
         cmd, shell = v.command, True
         if sandboxed:
-            cmd, shell = sandbox_wrap(v.command, True, cwd, {}, mode="bwrap-nonet")
+            cmd, shell = sandbox_wrap(
+                v.command, True, cwd, {},
+                mode="docker" if profile is not None else "bwrap-nonet",
+                profile=profile,
+            )
         try:
             proc = subprocess.run(
                 cmd, shell=shell, cwd=cwd, capture_output=True, text=True,

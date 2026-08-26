@@ -30,23 +30,23 @@ def _task(prompt="add a function", **kw):
     return TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt=prompt, **kw)
 
 
-# route.route() emits route.decided to the event spool. Without this, synthetic
-# test decisions (api:twin, task_id="t") leak into the real ~/.local spool and
-# show up on `pulse serve`. Isolate the spool for the whole module, mirroring the
+# route.route() emits route.decided to the event journal. Without this, synthetic
+# test decisions (api:twin, task_id="t") leak into the real ~/.local journal and
+# show up on `pulse serve`. Isolate the journal for the whole module, mirroring the
 # XDG_CONFIG_HOME isolation the orchestration classes already do for config.
-_spool_tmp: tempfile.TemporaryDirectory | None = None
+_journal_tmp: tempfile.TemporaryDirectory | None = None
 
 
 def setUpModule():
-    global _spool_tmp
-    _spool_tmp = tempfile.TemporaryDirectory()
-    os.environ["HEART_SPOOL_DIR"] = _spool_tmp.name
+    global _journal_tmp
+    _journal_tmp = tempfile.TemporaryDirectory()
+    os.environ["EVENT_JOURNAL_DIR"] = _journal_tmp.name
 
 
 def tearDownModule():
-    os.environ.pop("HEART_SPOOL_DIR", None)
-    if _spool_tmp is not None:
-        _spool_tmp.cleanup()
+    os.environ.pop("EVENT_JOURNAL_DIR", None)
+    if _journal_tmp is not None:
+        _journal_tmp.cleanup()
 
 
 class TestRouter(unittest.TestCase):
@@ -297,9 +297,9 @@ class TestOrchestrate(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         # save what setUpModule set so tearDown restores it instead of deleting
-        # the module-level spool isolation (which the router tests rely on).
-        self._saved_env = {k: os.environ.get(k) for k in ("HEART_SPOOL_DIR", "HEART_INGEST")}
-        os.environ["HEART_SPOOL_DIR"] = str(root / "spool")
+        # the module-level journal isolation (which the router tests rely on).
+        self._saved_env = {k: os.environ.get(k) for k in ("EVENT_JOURNAL_DIR", "HEART_INGEST")}
+        os.environ["EVENT_JOURNAL_DIR"] = str(root / "journal")
         os.environ["HEART_INGEST"] = "off"
         self.repo, self.head = _make_repo(root)
         self.runs = str(root / "runs")

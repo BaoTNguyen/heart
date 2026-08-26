@@ -18,7 +18,7 @@ export HEART_INGEST=off            # we ingest explicitly, at the end
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-export HEART_SPOOL_DIR="$WORK/spool"   # isolated spine for clean assertions
+export EVENT_JOURNAL_DIR="$WORK/journal"   # isolated spine for clean assertions
 REPO="$WORK/toyrepo"
 mkdir -p "$REPO"; cd "$REPO"
 
@@ -82,7 +82,7 @@ EOF
 )
 echo "episode: $EP  (1/4: plexus ledger)"
 test -f "runs/$EP/episode.json"                     && echo "2/4: heart runs dir"
-grep -rq "$EP" "$HEART_SPOOL_DIR"                   && echo "3/4: spine events"
+grep -rq "$EP" "$EVENT_JOURNAL_DIR"                   && echo "3/4: spine events"
 if command -v art >/dev/null; then
   # writes one tiny row to the real ledger (task stack-smoke-fix-add-a1) —
   # deliberate: 4/4 proves arteries is actually reachable, not stubbed
@@ -90,7 +90,7 @@ if command -v art >/dev/null; then
 else
   echo "4/4 SKIPPED: art CLI not on PATH"
 fi
-grep -rq "prompt.gate" "$HEART_SPOOL_DIR" \
+grep -rq "prompt.gate" "$EVENT_JOURNAL_DIR" \
   && echo "capillaries gate: fired" \
   || echo "capillaries gate: absent (expected for the scripted agent)"
 
