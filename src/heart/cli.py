@@ -14,6 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from . import mine as mine_mod
+from .env import reclaim as env_reclaim
 from . import pulse as pulse_mod
 from . import reward as reward_mod
 from .detect import detect_verifiers
@@ -54,19 +55,31 @@ def _episode_kwargs(args) -> dict:
 def _ingest_rewards(runs_dir) -> None:
     """Best-effort credit-assignment bridge: hand finished episodes to arteries'
     reward ledger when its CLI is installed. A subprocess, not an import — heart
-    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips."""
+    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips.
+
+    `art rewards`, not `art ingest`. `ingest` is arteries' *document* ingester:
+    it globs `*.md` and embeds what it finds as project documents. This called
+    it for as long as it has existed, which did nothing at all -- runs
+    directories held no markdown, so no episode reward was ever ingested and
+    nothing said so. The day heart started writing retrieved-memory packets to
+    `runs/<id>/context/*.md`, the glob matched and arteries tried to embed an
+    agent's memory back into the corpus as documentation.
+
+    A wrong subcommand that silently succeeds is worse than one that fails:
+    this one looked healthy for months by doing nothing.
+    """
     art = shutil.which("art")
     if not art or os.environ.get("HEART_INGEST") == "off":
         return
     try:
         proc = subprocess.run(
-            [art, "ingest", str(runs_dir)], capture_output=True, text=True, timeout=120,
+            [art, "rewards", str(runs_dir)], capture_output=True, text=True, timeout=120,
         )
         tail = (proc.stdout + proc.stderr).strip().splitlines()
         if tail:
-            print(f"art ingest: {tail[-1]}")
+            print(f"art rewards: {tail[-1]}")
     except Exception as exc:  # rewards can always be re-ingested later
-        print(f"art ingest skipped: {exc}", file=sys.stderr)
+        print(f"art rewards skipped: {exc}", file=sys.stderr)
 
 
 def cmd_run(args) -> int:
@@ -418,24 +431,6 @@ def cmd_mine(args) -> int:
     return 0
 
 
-def _worktree_source_repo(worktree: Path) -> str | None:
-    """A worktree's `.git` file reads `gitdir: <repo>/.git/worktrees/<id>`;
-    walk back up to the repo root. Best-effort — return None if unreadable."""
-    git_file = worktree / ".git"
-    if not git_file.is_file():
-        return None
-    try:
-        line = git_file.read_text().strip()
-    except OSError:
-        return None
-    if not line.startswith("gitdir:"):
-        return None
-    gitdir = Path(line.split(":", 1)[1].strip())
-    # <repo>/.git/worktrees/<id> -> <repo>
-    repo = gitdir.parent.parent.parent
-    return str(repo) if repo.is_dir() else None
-
-
 def cmd_clean(args) -> int:
     """Delete finished-episode directories and stale heart worktrees older
     than --days. summary.csv (the batch resume ledger) is never touched."""
@@ -452,23 +447,10 @@ def cmd_clean(args) -> int:
             shutil.rmtree(ep_dir, ignore_errors=True)
             n_runs += 1
 
-    # read fresh each call (not env.WS_ROOT's import-time constant) so tests
-    # can point this at a fabricated dir via HEART_WS_ROOT without touching
-    # the real worktree cache
-    ws_root = Path(os.environ.get("HEART_WS_ROOT", str(Path.home() / ".cache" / "heart-ws")))
-    n_worktrees = 0
-    source_repos: set[str] = set()
-    if ws_root.is_dir():
-        for wt in ws_root.iterdir():
-            if not wt.is_dir() or wt.stat().st_mtime >= cutoff:
-                continue
-            repo = _worktree_source_repo(wt)
-            shutil.rmtree(wt, ignore_errors=True)
-            n_worktrees += 1
-            if repo:
-                source_repos.add(repo)
-    for repo in source_repos:
-        subprocess.run(["git", "-C", repo, "worktree", "prune"], capture_output=True)
+    # one reclaimer, shared with the automatic sweep and with plexus. --days
+    # is a filter now, not the safety mechanism: a live worktree is one whose
+    # lock is held, which reclaim() checks directly.
+    n_worktrees = env_reclaim(older_than=cutoff)
 
     print(f"heart clean: {n_runs} run(s) removed, {n_worktrees} worktree(s) removed")
     return 0
