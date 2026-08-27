@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -28,6 +29,9 @@ AGENT_COMMANDS: dict[str, list[str]] = {
     "codex": ["codex", "exec", "--full-auto", "{prompt}"],
     "gemini": ["gemini", "--yolo", "-p", "{prompt}"],
     "opencode": ["opencode", "run", "{prompt}"],
+    "pi": ["pi", "--print", "{prompt}"],
+    "cursor": ["cursor-agent", "--print", "--force", "--output-format", "text",
+               "{prompt}"],
     "api": ["python3", "-m", "heart.agents_api", "{prompt}"],
     "shell": ["bash", "-c", "{prompt}"],
 }
@@ -36,7 +40,8 @@ AGENT_COMMANDS: dict[str, list[str]] = {
 # on a subscription seat (Claude Pro/Max, ChatGPT/codex) instead of the metered
 # API. `claude:sonnet` -> `claude … --model claude-sonnet-5`. The `api` agent is
 # absent on purpose: it selects its model from the profile inside agents_api.py.
-_MODEL_FLAG = {"claude": "--model", "codex": "--model", "gemini": "--model", "opencode": "--model"}
+_MODEL_FLAG = {"claude": "--model", "codex": "--model", "gemini": "--model",
+               "opencode": "--model", "pi": "--model", "cursor": "--model"}
 
 # per-process cap on concurrent agents: batch --parallel times --candidates can
 # otherwise oversubscribe API rate limits or a single local vLLM
@@ -112,84 +117,86 @@ def _local_slot(endpoint: str | None):
     with _flock_pool(_slots_base() / "heart-local-slots" / key, n):
         yield
 
-# dirs the agent CLIs legitimately write to; everything else in $HOME stays
-# read-only under the sandbox
-_SANDBOX_WRITABLE = (
-    ".cache", ".config", ".local/share", ".local/state",
-    ".claude", ".claude.json", ".codex", ".gemini", ".bun", ".npm",
-)
-_SANDBOX_HIDDEN = (".ssh", ".aws", ".gnupg")  # tmpfs'd: not even readable
-
-
 def sandbox_wrap(
     cmd: list[str] | str, shell: bool, cwd: str, extra_env: dict[str, str],
     *, mode: str | None = None, profile=None,
 ) -> tuple[list[str] | str, bool]:
-    """HEART_SANDBOX=bwrap wraps the agent in bubblewrap: filesystem read-only
-    except the worktree, /tmp, and agent config/cache dirs; ~/.ssh and friends
-    hidden. Network stays shared (agents call APIs). Off by default — turn it
-    on for unattended batches.
+    """HEART_SANDBOX=docker runs the command in a container described by the
+    `profile` a caller built from the task spec (sandbox.profile_for for agent
+    roles, sandbox.verifier_profile_for for verifiers). Off by default.
 
-    HEART_SANDBOX=bwrap-nonet additionally unshares the network — for verifier
-    runs and local-model agents that need no egress at all.
+    There used to be a bubblewrap mode here. It bound the host filesystem
+    read-only and hid ~/.ssh, which is a real boundary but a weaker one than
+    the container already gives, and it could not express the thing the whole
+    feature is for: allowed_paths writable, denied_paths read-only, per task.
+    Two mechanisms enforcing overlapping halves of one policy is how the halves
+    drift apart, so the weaker one went.
 
-    HEART_SANDBOX=docker runs the command in a container instead, described by
-    the `profile` a caller built from the task spec (see sandbox.profile_for and
-    sandbox.verifier_profile_for). The three modes are one axis of increasing
-    strength, so callers keep passing commands through here and never learn
-    which one is in force.
-
-    ponytail: containment for accidents and reward hacking, not a security
-    boundary against a hostile model — in plain bwrap mode network is open and
-    $HOME is readable. Upgrade path for API agents: a proxy allowlist."""
+    ponytail: containment for accidents and reward hacking, not a boundary
+    against a hostile model. A role granted network="api" reaches whatever the
+    egress proxy's allowlist permits, and HEART_API_NETWORK=bridge removes even
+    that.
+    """
     if mode is None:
         mode = os.environ.get("HEART_SANDBOX", "off")
     if mode in ("off", ""):
         return cmd, shell
     if mode == "docker":
-        if profile is None:
-            # a requested sandbox must never silently degrade to no sandbox --
-            # the same rule the missing-bwrap check below enforces
-            raise RuntimeError("HEART_SANDBOX=docker but no sandbox profile was supplied")
-        if not shutil.which("docker"):
-            raise RuntimeError("HEART_SANDBOX=docker but docker is not installed")
-        inner = str(cmd) if shell else " ".join(shlex.quote(c) for c in cmd)
-        # The timeout goes inside the container, not just on the docker client.
-        # subprocess's timeout kills the client; the container it started keeps
-        # running, holding the worktree and its share of the model's slots. A
-        # self-terminating container needs nobody to remember to clean up.
-        if profile.timeout_seconds:
-            inner = f"timeout -s KILL {int(profile.timeout_seconds)}s sh -c {shlex.quote(inner)}"
-        return ["docker", "run", *profile.docker_args(), "sh", "-c", inner], False
-    if mode not in ("bwrap", "bwrap-nonet"):
         raise ValueError(
-            f"HEART_SANDBOX={mode!r}: only 'bwrap', 'bwrap-nonet', 'docker' or 'off' supported")
-    if not shutil.which("bwrap"):
+            "HEART_SANDBOX=docker is no longer a mode; use 'docker-sbx'. "
+            "Note what that costs: the plugin has no network, capability or "
+            "resource flags, so network 'none' is not enforced, the egress "
+            "allowlist becomes advisory rather than a boundary, and verifiers "
+            "can reach the network.")
+    if mode != SANDBOX_MODE:
+        raise ValueError(f"HEART_SANDBOX={mode!r}: only {SANDBOX_MODE!r} or 'off' supported")
+    if profile is None:
         # a requested sandbox must never silently degrade to no sandbox
-        raise RuntimeError("HEART_SANDBOX=bwrap but bubblewrap is not installed")
-    home = Path.home()
-    args = [
-        "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-        "--bind", "/tmp", "/tmp", "--bind", cwd, cwd,
-        "--unshare-pid", "--die-with-parent",
-    ]
-    if mode == "bwrap-nonet":
-        args.append("--unshare-net")
-    for rel in _SANDBOX_WRITABLE:
-        p = home / rel
-        if p.exists():
-            args += ["--bind", str(p), str(p)]
-    for rel in _SANDBOX_HIDDEN:
-        if (home / rel).exists():
-            args += ["--tmpfs", str(home / rel)]
-    # arteries JSONL fallback anchors at the source repo; keep that one dir writable
-    repo = extra_env.get("ARTERIES_REPO")
-    if repo and (Path(repo) / ".arteries").exists():
-        p = str(Path(repo) / ".arteries")
-        args += ["--bind", p, p]
-    if shell:
-        return [*args, "sh", "-c", str(cmd)], False
-    return [*args, *cmd], False
+        raise RuntimeError("HEART_SANDBOX=docker but no sandbox profile was supplied")
+    if not shutil.which("docker"):
+        raise RuntimeError("HEART_SANDBOX=docker but docker is not installed")
+    inner = str(cmd) if shell else " ".join(shlex.quote(c) for c in cmd)
+    # The timeout goes inside the container, not just on the docker client.
+    # subprocess's timeout kills the client; the container it started keeps
+    # running, holding the worktree and its share of the model's slots. A
+    # self-terminating container needs nobody to remember to clean up.
+    if profile.timeout_seconds:
+        inner = f"timeout -s KILL {int(profile.timeout_seconds)}s sh -c {shlex.quote(inner)}"
+    from .sandbox import WORK, decode_env_snippet
+
+    # restore any value base64'd past the plugin's newline truncation, before
+    # the agent command can read it
+    inner = decode_env_snippet() + inner
+    create = " ".join(shlex.quote(a)
+                      for a in ["docker", "sandbox", "run",
+                                *profile.docker_sbx_args(extra_env)])
+    # The plugin has no --network, --memory, --cpus or --pids-limit. It does
+    # leave an ordinary container behind, and with -d nothing has run in it yet
+    # -- so the flags it would not take are applied here, in the gap between
+    # creating the sandbox and exec'ing the agent into it.
+    #
+    # Both steps are fatal on failure. A container that keeps its bridge leg
+    # because the disconnect failed is the silent widening this whole feature
+    # exists to prevent, and one that reaches no network because the connect
+    # failed produces an agent that did nothing -- exit 125 puts docker's own
+    # message in the log, where sandbox_start_failure raises on it.
+    fail = 'docker sandbox rm "$sbx" >/dev/null 2>&1; exit 125'
+    steps = [f"sbx=$({create}) || exit 125",
+             f'docker network disconnect bridge "$sbx" || {{ {fail}; }}']
+    if profile.network != "none":
+        steps.append(f'docker network connect {shlex.quote(profile.network)} '
+                     f'"$sbx" || {{ {fail}; }}')
+    limits = ["docker", "update", "--memory", profile.memory,
+              "--memory-swap", profile.memory, "--cpus", profile.cpus,
+              "--pids-limit", str(profile.pids)]
+    steps.append(" ".join(shlex.quote(a) for a in limits) + ' "$sbx" >/dev/null 2>&1')
+    # -w: `docker exec` starts in the image's workdir, not the worktree, so
+    # without this the agent edits files in / and the episode comes back as
+    # `no_change`.
+    steps += [f'docker exec -w {WORK} "$sbx" sh -c {shlex.quote(inner)}; rc=$?',
+              'docker sandbox rm "$sbx" >/dev/null 2>&1',
+              "exit $rc"]
+    return ["sh", "-c", "\n".join(steps) + "\n"], False
 
 
 def _claude_envelope(text: str) -> dict | None:
@@ -557,6 +564,113 @@ def _agent_command(agent: str, prompt: str, agent_cmd: str | None = None) -> tup
     return cmd, False
 
 
+#: contrib/egress-proxy.py stamps this on every refusal. Kept in sync by being
+#: a constant on both sides rather than a phrase either could reword.
+EGRESS_DENIED_MARKER = "HEART_EGRESS_DENIED"
+
+
+def sandbox_egress_denied(output: str) -> str | None:
+    """The allowlist refusing a host the agent needed, or None.
+
+    An egress denial reaches the agent as an ordinary API error, so the run ends
+    with no diff and the ladder reads it as `no_change` at reward 0.0. Measured
+    against a deliberately narrow allowlist: the agent logged
+    "403 api.anthropic.com is not in the sandbox allowlist" and the episode
+    scored zero. That is the sandbox being wrong about what the work needed,
+    scored as the model being wrong -- the same misattribution as a mount table
+    drawn too tight, arriving through a different door.
+
+    Raised rather than recorded, because an allowlist missing a host the agents
+    need is missing it for every episode in the batch, not this one.
+    """
+    # A window around the marker, not the line: the CLIs wrap it in a JSON
+    # result envelope thousands of characters wide, and the host name is the
+    # only part anyone needs.
+    at = output.find(EGRESS_DENIED_MARKER)
+    if at < 0:
+        return None
+    return output[at:at + 120].splitlines()[0].strip().rstrip('"\\,')
+
+
+#: The one sandbox mode, named once. Spelled out in four places it drifted
+#: apart twice -- both times leaving `heart check-task` raising "no verifier
+#: sandbox profile was supplied", because the caller tested for the old name and
+#: quietly built no profile.
+SANDBOX_MODE = "docker-sbx"
+
+
+def sandbox_start_failure(exit_code: int, output: str) -> str | None:
+    """The docker message when the container never started, or None.
+
+    Exit 125 is the docker CLI's own "could not start this": no such image, no
+    such network, a bind source the daemon will not share. The command inside
+    never ran.
+
+    That has to be told apart from the command running and failing, because
+    every consumer downstream reads a non-zero exit as a verdict on the work. A
+    typo in HEART_SANDBOX_IMAGE otherwise produces an episode per task with an
+    empty diff and reward 0.0 -- a whole batch teaching marrow that the model
+    can do nothing, when in fact nothing ever ran. Verified: it scored
+    `no_change` at 0.0 rather than raising.
+
+    125 alone is not enough -- a verifier is free to exit 125 on its own -- so
+    the docker message has to be there too.
+    """
+    if exit_code != 125:
+        return None
+    for line in output.splitlines():
+        if line.startswith("docker:") or "Error response from daemon" in line:
+            found = line.strip()[:300]
+            if "network" in found and "not found" in found:
+                # the commonest first-run failure now that "api" and "model"
+                # default to an operator-created network rather than bridge
+                found += ("  [heart: create it and run the egress proxy -- see "
+                          "contrib/egress-proxy.py -- or set HEART_API_NETWORK="
+                          "bridge for unrestricted egress]")
+            return found
+    return None
+
+
+@lru_cache(maxsize=None)
+def _agent_version(base: str) -> str | None:
+    """Which build of the agent CLI ran, for the episode record.
+
+    An episode records `agent: "claude:opus"` and nothing about the binary
+    behind it. A CLI that auto-updates mid-batch therefore splits a run across
+    two agents with nothing in the data saying so, and marrow trains on the
+    mixture. The version is the cheapest thing that tells two batches apart
+    afterwards.
+
+    Probed on the host, once per agent per process. That is the same binary the
+    container runs when the CLI is mounted in rather than baked into the image;
+    bake them instead and this becomes the host's version rather than the
+    container's, and would need to move inside.
+
+    Never raises and never blocks an episode: a CLI that will not report a
+    version is worth a None, not a failed run.
+    """
+    if base in ("api", "shell"):
+        return None  # heart's own loop and bash: heart's own commit is the version
+    exe = AGENT_COMMANDS.get(base, [""])[0]
+    path = shutil.which(exe) if exe else None
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True,
+                             timeout=15)
+    except Exception:
+        return None
+    text = (out.stdout or out.stderr).strip()
+    return text.splitlines()[0][:80] if text else None
+
+
+def _tail(path: str | Path, limit: int = 4000) -> str:
+    try:
+        return Path(path).read_text(errors="replace")[-limit:]
+    except OSError:
+        return ""
+
+
 def run_agent(
     agent: str,
     prompt: str,
@@ -567,14 +681,32 @@ def run_agent(
     agent_cmd: str | None = None,
     profile=None,
 ) -> dict:
-    base, _, profile = agent.partition(":")
-    if profile:
-        extra_env = {**extra_env, "HEART_MODEL_PROFILE": profile}
+    # NB: not `profile` -- that name is the sandbox profile parameter, and
+    # shadowing it here is what silently disarmed docker mode once.
+    base, _, model_profile = agent.partition(":")
+    if model_profile:
+        extra_env = {**extra_env, "HEART_MODEL_PROFILE": model_profile}
+    if base == "api" and profile is not None:
+        # containerised: hand over the resolved endpoint/model/key and drop the
+        # profile name, because the file it names does not exist in there
+        from . import sandbox
+
+        extra_env = {k: v for k, v in extra_env.items() if k != "HEART_MODEL_PROFILE"}
+        extra_env.update(sandbox.api_agent_env(model_profile))
     if agent_cmd:
         # custom template runs under sh; prompt is provided as $HEART_PROMPT to
         # avoid shell-quoting the prompt into the command line
         extra_env = {**extra_env, "HEART_PROMPT": prompt}
     cmd, shell = _agent_command(agent, prompt, agent_cmd)
+    if profile is not None and base != "shell" and profile.network == "none":
+        # Every agent but `shell` has to reach a model. Denying it the network
+        # produces a turn that fails on connection, an empty diff, and an
+        # episode that reads as "the agent did nothing" -- the same
+        # misattribution the scope work exists to stop. The task spec has to say
+        # which network: "api" for a vendor endpoint, "model" for a local one.
+        raise RuntimeError(
+            f"agent {agent!r} needs a model but the task spec asks for "
+            f'network "none"; set "network": "api" (vendor) or "model" (local)')
     cmd, shell = sandbox_wrap(cmd, shell, cwd, extra_env, profile=profile)
     # HEART_TIER_* is this process's routing config, never the child's: a
     # nested heart invocation (agents working on heart itself) must not
@@ -587,7 +719,7 @@ def run_agent(
     local_endpoint = None
     if base == "api":
         try:
-            ep = agents_api.endpoint_for(profile)
+            ep = agents_api.endpoint_for(model_profile)
             if agents_api.is_local_endpoint(ep):
                 local_endpoint = ep
         except Exception:
@@ -598,8 +730,7 @@ def run_agent(
         # start_new_session so the agent is its own process-group leader: agent
         # CLIs spawn grandchildren (node, MCP servers, model procs) that a plain
         # subprocess timeout would orphan to init. On timeout we kill the whole
-        # group, so nothing leaks. (bwrap's --die-with-parent covers this only in
-        # sandbox mode, which is off by default.)
+        # group, so nothing leaks.
         proc = subprocess.Popen(
             cmd, shell=shell, cwd=cwd, env=env,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -610,10 +741,21 @@ def run_agent(
             timed_out = True
             exit_code = -1
             _kill_group(proc)
+    tail = _tail(log_path)
+    if failure := sandbox_start_failure(exit_code, tail):
+        # loud, not scored: a sandbox that cannot start must never look like an
+        # agent that did nothing
+        raise RuntimeError(f"sandbox failed to start for role {agent!r}: {failure}")
+    if denied := sandbox_egress_denied(tail):
+        raise RuntimeError(
+            f"the egress allowlist refused a host role {agent!r} needed: {denied}\n"
+            f"add it to ALLOW on the proxy, or read the proxy log for what the "
+            f"agents actually reach")
     u = _extract_usage(log_path, base)
     return {
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "agent_version": _agent_version(base),
         "duration_s": round(time.monotonic() - t0, 2),
         **{k: u[k] for k in _USAGE_KEYS},
         "cost_usd": _price(agent, u["tokens_in"], u["tokens_out"],

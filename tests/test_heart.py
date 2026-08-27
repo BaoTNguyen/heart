@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -99,6 +100,50 @@ class TestHeart(unittest.TestCase):
         ep = self.run_ep("sed -i 's/add(2, 3), 5/add(2, 3), -1/' test_calc.py")
         self.assertEqual(ep["outcome"], "path_violation")
         self.assertEqual(ep["reward"]["total"], 0.0)
+
+    # a real refusal, no container needed: a directory the agent itself made
+    # unwritable. What matters is that the refusal reaches the log.
+    _REFUSED = "mkdir -p locked && chmod 500 locked && touch locked/out.txt"
+
+    def test_a_refusal_is_reported_even_when_the_episode_still_scores(self):
+        """The refusal scan used to run only when the diff came back empty, so
+        the only scopes anyone heard about were the ones so tight the agent
+        produced nothing. A scope tight enough to stop an agent finishing but
+        not starting was recorded nowhere -- and scored as a model failure."""
+        ep = self.run_ep(f"{FIX_CMD}; {self._REFUSED}")
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertGreater(ep["reward"]["total"], 0.5)  # scored on its merits
+        self.assertTrue(ep["scope_suspect"])            # and flagged anyway
+        self.assertEqual(ep["scope_refused_paths"], ["locked/out.txt"])
+
+    def test_the_tag_is_for_episodes_that_carry_a_number(self):
+        # scope_denied already says it in the outcome and withholds the reward;
+        # tagging it too would just be the same fact twice
+        ep = self.run_ep(self._REFUSED)
+        self.assertEqual(ep["outcome"], "scope_denied")
+        self.assertIsNone(ep["reward"]["total"])
+        self.assertFalse(ep["scope_suspect"])
+        self.assertEqual(ep["scope_refused_paths"], ["locked/out.txt"])
+
+    def test_a_forbidden_probe_is_never_reported_as_our_misconfiguration(self):
+        # denied_paths is test_calc.py here; a refusal naming it is the agent's
+        # doing, and must not reach the ledger as ground the task needed
+        ep = self.run_ep("chmod 500 . && touch test_calc.py/x")
+        self.assertEqual(ep["scope_refused_paths"], [])
+        self.assertFalse(ep["scope_suspect"])
+
+    def test_the_episode_records_which_build_of_the_agent_ran(self):
+        """`agent: "claude:opus"` does not say which claude. A CLI that
+        auto-updates mid-batch splits the run across two agents with nothing in
+        the data saying so."""
+        from heart.runner import _agent_version
+
+        ep = self.run_ep(FIX_CMD)
+        self.assertIn("agent_version", ep["roles"][0])
+        # shell is bash, so None here; a real CLI reports a string
+        self.assertIsNone(ep["roles"][0]["agent_version"])
+        if shutil.which("claude"):
+            self.assertTrue(_agent_version("claude"))
 
     def test_blocked_outcome_withholds_reward(self):
         """An agent that declines to guess must not be scored. Without this,
@@ -542,20 +587,37 @@ class TestHeart(unittest.TestCase):
         self.assertIn("normal/ret-on", buf.getvalue())
 
 
-def _bwrap_usable() -> bool:
-    # Ubuntu 24.04+ AppArmor can block unprivileged user namespaces, in which
-    # case bwrap exists but cannot start; the live test only runs where it can
-    if not shutil.which("bwrap"):
+def _docker_usable() -> bool:
+    """A daemon AND the sandbox image, present locally.
+
+    The image is checked, never pulled: a test suite that silently downloads
+    gigabytes is a test suite people stop running. Build it with
+    `docker build -t heart-agent:latest .` and these un-skip."""
+    if not shutil.which("docker"):
         return False
-    return subprocess.run(
-        ["bwrap", "--ro-bind", "/", "/", "true"], capture_output=True
-    ).returncode == 0
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        return False
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from heart.sandbox import DEFAULT_IMAGE
+
+    image = os.environ.get("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
+    return subprocess.run(["docker", "image", "inspect", image],
+                          capture_output=True).returncode == 0
 
 
-class TestSandbox(unittest.TestCase):
+def _run_in(profile, script: str, timeout: int = 120):
+    """Run a shell script through sandbox_wrap exactly as an agent would."""
+    from heart.runner import sandbox_wrap
+
+    cmd, shell = sandbox_wrap(script, True, "/unused", {}, mode="docker-sbx", profile=profile)
+    return subprocess.run(cmd, shell=shell, capture_output=True, text=True, timeout=timeout)
+
+
+class TestSandboxWrap(unittest.TestCase):
+    """The dispatch, without a container."""
+
     def setUp(self):
         self._old = os.environ.get("HEART_SANDBOX")
-        os.environ["HEART_SANDBOX"] = "bwrap"
 
     def tearDown(self):
         if self._old is None:
@@ -566,106 +628,475 @@ class TestSandbox(unittest.TestCase):
     def test_off_by_default(self):
         from heart.runner import sandbox_wrap
 
-        os.environ.pop("HEART_SANDBOX")
+        os.environ.pop("HEART_SANDBOX", None)
         self.assertEqual(sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {}),
                          (["echo", "hi"], False))
-        os.environ["HEART_SANDBOX"] = "chroot"
-        with self.assertRaises(ValueError):
+
+    def test_an_unknown_mode_is_refused_not_ignored(self):
+        from heart.runner import sandbox_wrap
+
+        # including the modes that used to work: a stale HEART_SANDBOX=bwrap in
+        # someone's shell must stop the run, never silently run unsandboxed
+        for mode in ("chroot", "bwrap", "bwrap-nonet", "docker"):
+            os.environ["HEART_SANDBOX"] = mode
+            with self.assertRaises(ValueError):
+                sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
+
+    def test_an_agent_that_needs_a_model_is_not_given_network_none(self):
+        """Denying a model-using agent the network yields a connection failure,
+        an empty diff, and an episode that reads as 'the agent did nothing'."""
+        from heart.runner import run_agent
+        from heart.sandbox import profile_for
+        from heart.taskspec import TaskSpec
+
+        task = TaskSpec(task_id="t", repo_path="/repo", base_commit="c", prompt="p")
+        prof = profile_for(task, "/ws", "/ctx", "/jr")
+        self.assertEqual(prof.network, "none")
+        with tempfile.TemporaryDirectory() as ws:
+            with self.assertRaises(RuntimeError) as cm:
+                run_agent("claude", "p", ws, {}, 5, Path(ws) / "a.log", profile=prof)
+            self.assertIn("network", str(cm.exception))
+            # shell needs no model, so it stays allowed
+            run_agent("shell", "true", ws, {}, 10, Path(ws) / "b.log", profile=prof)
+
+    def test_docker_without_a_profile_fails_loudly(self):
+        from heart.runner import sandbox_wrap
+
+        os.environ["HEART_SANDBOX"] = "docker-sbx"
+        with self.assertRaises(RuntimeError):
             sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
 
-    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap not installed")
-    def test_wrap_builds_bwrap_argv(self):
+    def test_the_caller_env_reaches_the_container_but_cannot_override_the_profile(self):
         from heart.runner import sandbox_wrap
+        from heart.sandbox import JOURNAL, profile_for
+        from heart.taskspec import TaskSpec
 
-        cmd, shell = sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
-        self.assertFalse(shell)
-        self.assertEqual(cmd[0], "bwrap")
-        self.assertIn("/tmp/ws", cmd)  # worktree stays writable
-        self.assertEqual(cmd[-2:], ["echo", "hi"])
-        self.assertNotIn("--unshare-net", cmd)  # plain bwrap keeps egress
-        os.environ["HEART_SANDBOX"] = "bwrap-nonet"
-        cmd, _ = sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
-        self.assertIn("--unshare-net", cmd)
-        os.environ["HEART_SANDBOX"] = "bwrap"
-        # shell-template agents run under sh -c inside the sandbox
-        cmd2, shell2 = sandbox_wrap("echo hi", True, "/tmp/ws", {})
-        self.assertEqual(cmd2[-3:], ["sh", "-c", "echo hi"])
-        self.assertFalse(shell2)
+        task = TaskSpec(task_id="t", repo_path="/repo", base_commit="c", prompt="p")
+        prof = profile_for(task, "/ws", "/ctx", "/jr")
+        cmd, _ = sandbox_wrap("run", True, "/ws", {"HEART_PROMPT": "do it",
+                                                   "EVENT_JOURNAL_DIR": "/hijack"},
+                              mode="docker-sbx", profile=prof)
+        script = cmd[2]
+        self.assertIn("HEART_PROMPT=do it", script)
+        self.assertIn(f"EVENT_JOURNAL_DIR={JOURNAL}", script)
+        self.assertNotIn("EVENT_JOURNAL_DIR=/hijack", script)
 
-    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap not installed")
-    def test_wrap_mode_override_forces_nonet(self):
-        from heart.runner import sandbox_wrap
+    def test_run_agent_passes_the_sandbox_profile_not_the_model_profile(self):
+        """`claude:opus` splits into a model profile named `profile`, which used
+        to shadow the sandbox profile parameter of the same name -- so docker
+        mode raised "no sandbox profile was supplied" for every agent carrying
+        one. The bug is invisible unless something asserts on what arrives."""
+        from heart import runner
 
-        # HEART_SANDBOX=bwrap in the env, but an explicit mode= must win —
-        # this is how run_verifiers forces the no-network variant regardless
-        # of what agents are configured to use.
-        self.assertEqual(os.environ["HEART_SANDBOX"], "bwrap")
-        cmd, shell = sandbox_wrap(["true"], False, "/tmp/ws", {}, mode="bwrap-nonet")
-        self.assertFalse(shell)
-        self.assertIn("--unshare-net", cmd)
+        os.environ["HEART_SANDBOX"] = "docker-sbx"
+        seen = {}
+        real = runner.sandbox_wrap
 
-    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
-    def test_sandbox_blocks_stray_writes(self):
-        from heart.runner import run_agent
+        def spy(cmd, shell, cwd, extra_env, *, mode=None, profile=None):
+            seen["profile"] = profile
+            seen["env"] = extra_env
+            return ["true"], False
 
-        with tempfile.TemporaryDirectory() as ws:
-            marker = Path.home() / f"heart-sbx-{os.getpid()}"
-            log = Path(ws) / "agent.log"
-            run_agent("shell", f"touch {marker}; touch {ws}/inside", ws, {}, 30, log)
-            self.assertFalse(marker.exists())  # $HOME is read-only
-            self.assertTrue((Path(ws) / "inside").exists())
+        from heart.sandbox import profile_for
+        from heart.taskspec import TaskSpec
 
-    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
-    def test_bwrap_nonet_blocks_network(self):
-        from heart.runner import sandbox_wrap
+        sentinel = profile_for(
+            TaskSpec(task_id="t", repo_path="/repo", base_commit="c", prompt="p",
+                     network="api"), "/ws", "/ctx", "/jr")
+        runner.sandbox_wrap = spy
+        try:
+            with tempfile.TemporaryDirectory() as ws:
+                runner.run_agent("claude:opus", "p", ws, {}, 5, Path(ws) / "a.log",
+                                 agent_cmd="true", profile=sentinel)
+        finally:
+            runner.sandbox_wrap = real
+        self.assertIs(seen["profile"], sentinel)
+        self.assertEqual(seen["env"]["HEART_MODEL_PROFILE"], "opus")
 
-        with tempfile.TemporaryDirectory() as ws:
-            cmd, shell = sandbox_wrap(
-                ["python3", "-c",
-                 "import socket; socket.create_connection(('1.1.1.1', 53), timeout=3)"],
-                False, ws, {}, mode="bwrap-nonet",
-            )
-            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
-            self.assertNotEqual(proc.returncode, 0)
 
-    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
-    def test_bwrap_hides_ssh(self):
-        from heart.runner import sandbox_wrap
+@unittest.skipUnless(_docker_usable(), "no docker daemon, or the sandbox image is not built (docker build -t heart-agent:latest .)")
+class TestSandboxLive(unittest.TestCase):
+    """The container, for real. These are the negative-space tests: what the
+    sandbox must refuse. A green unit test on the mount table proves the flags
+    were rendered, not that the kernel enforced them."""
 
-        ssh_dir = Path.home() / ".ssh"
-        if not ssh_dir.exists():
-            self.skipTest("no ~/.ssh on this host")
-        with tempfile.TemporaryDirectory() as ws:
-            cmd, shell = sandbox_wrap(
-                ["sh", "-c", f"ls -A {ssh_dir} | grep -q ."], False, ws, {}, mode="bwrap",
-            )
-            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
-            self.assertNotEqual(proc.returncode, 0)  # tmpfs-hidden: empty or unreadable
+    def setUp(self):
+        from heart.taskspec import TaskSpec
 
-    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
-    def test_bwrap_cwd_stays_writable(self):
-        from heart.runner import sandbox_wrap
+        self.tmp = tempfile.TemporaryDirectory(dir=Path.home() / ".cache")
+        root = Path(self.tmp.name)
+        self.ws, self.ctx, self.jr = root / "ws", root / "ctx", root / "jr"
+        for d in (self.ws / "src", self.ws / "secrets", self.ctx, self.jr):
+            d.mkdir(parents=True)
+        (self.ws / "src" / "a.py").write_text("x = 1\n")
+        (self.ws / "secrets" / "k.txt").write_text("hunter2\n")
+        self.task = TaskSpec(task_id="t", repo_path=str(root / "norepo"),
+                             base_commit="c", prompt="p", allowed_paths=["src"],
+                             denied_paths=["secrets"], timeout_seconds=60)
 
-        with tempfile.TemporaryDirectory() as ws:
-            cmd, shell = sandbox_wrap(["touch", f"{ws}/probe"], False, ws, {}, mode="bwrap")
-            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
-            self.assertEqual(proc.returncode, 0)
-            self.assertTrue((Path(ws) / "probe").exists())
+    def tearDown(self):
+        self.tmp.cleanup()
 
-    @unittest.skipUnless(_bwrap_usable(), "bwrap cannot create user namespaces here")
-    def test_bwrap_git_commit_works(self):
-        from heart.runner import sandbox_wrap
+    def _agent(self, **kw):
+        from heart.sandbox import profile_for
 
-        with tempfile.TemporaryDirectory() as ws:
-            git = ["git", "-C", ws, "-c", "user.name=t", "-c", "user.email=t@t"]
-            subprocess.run([*git[:3], "init", "-q"], check=True)
-            (Path(ws) / "file.txt").write_text("hello\n")
-            subprocess.run([*git, "add", "-A"], check=True)
-            cmd, shell = sandbox_wrap(
-                [*git, "commit", "-qm", "wip"], False, ws, {}, mode="bwrap",
-            )
-            proc = subprocess.run(cmd, shell=shell, capture_output=True, timeout=15)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+        return profile_for(self.task, self.ws, self.ctx, self.jr, **kw)
+
+    def test_allowed_paths_are_writable_and_everything_else_is_not(self):
+        r = _run_in(self._agent(), "touch /work/src/new.py; touch /work/top; "
+                                   "touch /work/secrets/x; true")
+        self.assertTrue((self.ws / "src" / "new.py").exists(), r.stderr)
+        self.assertFalse((self.ws / "top").exists())
+        self.assertFalse((self.ws / "secrets" / "x").exists())
+        self.assertIn("read-only file system", r.stderr.lower())
+
+    def test_a_denied_path_stays_readable(self):
+        # denied means "may not change", not "may not see" -- a task that
+        # cannot read a config it must not edit is a sandbox drawn too tight
+        r = _run_in(self._agent(), "cat /work/secrets/k.txt")
+        self.assertIn("hunter2", r.stdout)
+
+    def test_the_default_network_is_none(self):
+        """The plugin has no --network, and its sandboxes come up on bridge.
+        heart detaches and re-attaches between creating the sandbox and running
+        anything in it, so `none` means none again."""
+        self.assertEqual(self._agent().network, "none")
+        r = _run_in(self._agent(), "getent hosts example.com >/dev/null && echo REACHED")
+        self.assertNotIn("REACHED", r.stdout)
+
+    def test_resource_limits_are_applied_after_creation_too(self):
+        # --memory/--cpus/--pids-limit are not flags the plugin takes either;
+        # `docker update` accepts them on the running sandbox
+        r = _run_in(self._agent(), "cat /sys/fs/cgroup/memory.max 2>/dev/null | head -1")
+        self.assertEqual(r.stdout.strip(), str(4 * 1024 ** 3), r.stderr)
+
+    def test_a_task_that_asks_for_egress_gets_the_network_the_operator_named(self):
+        """"api" no longer means the open internet. It means whichever network
+        HEART_API_NETWORK points at -- by default the --internal one where the
+        egress proxy's allowlist decides what leaves. Pointed at bridge, the
+        old unrestricted behaviour is still there for anyone who wants it."""
+        import dataclasses
+        import importlib
+
+        from heart import sandbox
+
+        self.task = dataclasses.replace(self.task, network="api")
+        with unittest.mock.patch.dict(os.environ, {"HEART_API_NETWORK": "bridge"}):
+            importlib.reload(sandbox)
+            try:
+                prof = sandbox.profile_for(self.task, self.ws, self.ctx, self.jr)
+                self.assertEqual(prof.network, "bridge")
+                r = _run_in(prof, "getent hosts example.com >/dev/null && echo REACHED")
+                self.assertIn("REACHED", r.stdout, r.stderr)
+            finally:
+                importlib.reload(sandbox)
+
+    def test_the_host_home_is_not_visible(self):
+        r = _run_in(self._agent(), f"ls {Path.home()}/.ssh 2>&1 | head -3; "
+                                   f"ls {Path.home()} 2>&1 | head -3")
+        self.assertNotIn("id_", r.stdout)
+        self.assertIn("No such file", r.stdout)
+
+    def test_the_agent_cli_has_a_writable_home(self):
+        # under --read-only the image's own /home/agent is not writable, and a
+        # claude CLI that cannot write its config never gets as far as a turn
+        r = _run_in(self._agent(),
+                    'echo probe > "$HOME/x" && cat "$HOME/x" && claude --version')
+        self.assertIn("probe", r.stdout)
+        self.assertIn("Claude Code", r.stdout, r.stderr)
+
+    def test_tool_caches_land_somewhere_writable_under_a_tight_scope(self):
+        """A tight scope makes the whole tree read-only, so every incidental
+        write a toolchain makes -- pytest's cache, ruff's, npm's -- is refused
+        for reasons that have nothing to do with the task. Those refusals match
+        _DENIAL_SIGNS, so without this they are recorded as paths the task
+        needed and accumulate in plexus's ledger, which never retracts."""
+        from heart.sandbox import CACHE_ENV
+
+        dirs = [v for k, v in CACHE_ENV.items() if v.startswith("/tmp/")]
+        script = "; ".join(f'mkdir -p {d} && touch {d}/probe' for d in dirs)
+        r = _run_in(self._agent(), script + "; echo ALL_WRITABLE")
+        self.assertIn("ALL_WRITABLE", r.stdout, r.stderr)
+        self.assertEqual(r.stderr.strip(), "")
+
+    def test_the_journal_is_the_only_way_out(self):
+        r = _run_in(self._agent(), 'echo "{}" > /journal/e.jsonl; touch /context/x; true')
+        self.assertTrue((self.jr / "e.jsonl").exists(), r.stderr)
+        self.assertFalse((self.ctx / "x").exists())
+
+    def test_a_verifier_cannot_write_the_tree_it_judges_or_reach_the_network(self):
+        import dataclasses
+
+        from heart.sandbox import verifier_profile_for
+
+        task = dataclasses.replace(self.task, network="api")  # even then
+        prof = verifier_profile_for(task, self.ws, self.jr)
+        r = _run_in(prof, "touch /work/src/cheat.py; ls /context; "
+                          "getent hosts example.com && echo REACHED; true")
+        self.assertFalse((self.ws / "src" / "cheat.py").exists())
+        self.assertNotIn("REACHED", r.stdout)
+        self.assertIn("No such file", r.stderr + r.stdout)  # /context not mounted
+
+    def test_a_verifier_can_still_run_a_test_suite_on_a_read_only_tree(self):
+        """A test runner writes: caches, .pyc, temp dirs. On a tree it may not
+        write, every one of those has to land somewhere else or the verifier
+        fails for reasons that have nothing to do with the code under test.
+
+        stdlib unittest, not pytest: the default image is Docker's agent
+        template, which carries the agent CLIs and not a repo's test
+        dependencies. A real task points HEART_SANDBOX_IMAGE at an image that
+        can run its own verifiers."""
+        from heart.sandbox import verifier_profile_for
+
+        (self.ws / "test_ok.py").write_text(
+            "import unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n")
+        prof = verifier_profile_for(self.task, self.ws, self.jr)
+        r = _run_in(prof, "python3 -m unittest -q test_ok")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_git_reads_the_worktree_but_cannot_write_the_object_store(self):
+        import dataclasses
+
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git[:3], "init", "-q", "-b", "main"], check=True)
+        (repo / "src").mkdir()
+        (repo / "src" / "a.py").write_text("x = 1\n")
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "base"], check=True)
+        wt = Path(self.tmp.name) / "wt"
+        subprocess.run([*git, "worktree", "add", "-q", "--detach", str(wt)], check=True)
+        self.task = dataclasses.replace(self.task, repo_path=str(repo))
+        from heart.sandbox import profile_for
+
+        prof = profile_for(self.task, wt, self.ctx, self.jr)
+        r = _run_in(prof, 'git -C /work log --oneline | head -1; '
+                          'git -C /work status --porcelain >/dev/null && echo STATUS_OK; '
+                          'echo y >> /work/src/a.py; '
+                          'git -C /work -c user.name=t -c user.email=t@t commit -aqm x '
+                          '2>&1 | head -2')
+        self.assertIn("base", r.stdout, r.stderr)
+        self.assertIn("STATUS_OK", r.stdout)
+        self.assertIn("read-only file system", r.stdout.lower())
+        self.assertIn("failed to insert into database", r.stdout.lower())
+        # and the edit itself survived for heart to commit on the host
+        self.assertIn("y", (wt / "src" / "a.py").read_text())
+        subprocess.run([*git, "worktree", "remove", "--force", str(wt)], check=True)
+
+    def test_the_container_kills_itself_when_the_task_timeout_expires(self):
+        import dataclasses
+        import time as _t
+
+        self.task = dataclasses.replace(self.task, timeout_seconds=3)
+        t0 = _t.monotonic()
+        r = _run_in(self._agent(), "sleep 60", timeout=60)
+        self.assertLess(_t.monotonic() - t0, 45)
+        self.assertNotEqual(r.returncode, 0)
+
+
+class TestRewardBridge(unittest.TestCase):
+    def test_heart_calls_the_reward_ingest_not_the_document_ingest(self):
+        """`art ingest` is arteries' document ingester: it globs *.md and embeds
+        what it finds. heart called it for as long as the bridge existed, which
+        did nothing -- runs dirs held no markdown, so no reward was ever
+        ingested and nothing said so. The day heart wrote memory packets to
+        runs/<id>/context/*.md, the glob matched and arteries tried to embed an
+        agent's memory into the corpus as documentation."""
+        import inspect
+
+        from heart import cli
+
+        src = inspect.getsource(cli._ingest_rewards)
+        assert '"rewards"' in src, "the reward ledger lives behind `art rewards`"
+        assert '"ingest"' not in src.split('"""')[-1], \
+            "`art ingest` embeds documents; it is not the credit-assignment bridge"
+
+
+class TestReviewerRotation(unittest.TestCase):
+    """A reviewer must not be the family that wrote the code: the same lineage
+    brings the same blind spots to finding the bug it brought to writing it."""
+
+    def setUp(self):
+        # pin the pool: review_pool() reads ~/.config/heart/models.json, and a
+        # unit test that asserts on the operator's live config fails whenever
+        # they change a model -- which is exactly what it is meant to let them do
+        self._patch = unittest.mock.patch.dict(
+            os.environ, {"HEART_REVIEW_MODELS": "claude:opus,codex:sol"})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def test_the_reviewer_is_a_different_family_than_the_coder(self):
+        from heart.router import review_agent
+
+        self.assertEqual(review_agent("claude:opus"), "codex:sol")
+        self.assertEqual(review_agent("codex:sol"), "claude:opus")
+        # a different profile in the same family is still the same lineage
+        self.assertEqual(review_agent("claude:sonnet"), "codex:sol")
+        self.assertEqual(review_agent("codex:terra"), "claude:opus")
+
+    def test_a_coder_outside_the_pool_still_gets_a_reviewer(self):
+        # a local model or a subscription seat is not in the pool; failing the
+        # episode over that would be a config choice breaking a run
+        from heart.router import review_agent
+
+        self.assertEqual(review_agent("api:local"), "claude:opus")
+
+    def test_the_pool_is_data_not_code(self):
+        """Adding or changing a model must not need a code change, and the
+        rotation has to work for any number of entries."""
+        from heart.router import review_agent
+
+        pool = ["a:one", "b:two", "c:three"]
+        with unittest.mock.patch.dict(os.environ, {"HEART_REVIEW_MODELS": ",".join(pool)}):
+            self.assertEqual(review_agent("a:one"), "b:two")
+            self.assertEqual(review_agent("c:three"), "a:one")
+            self.assertEqual(review_agent("z:none"), "a:one")
+
+    def test_an_explicit_agent_on_the_role_still_wins(self):
+        # rotation fills in what nobody chose; it does not overrule a caller
+        from heart.episode import DEFAULT_ROLES
+
+        review = next(r for r in DEFAULT_ROLES if r["name"] == "review")
+        self.assertTrue(review.get("review"))
+        self.assertNotIn("agent", review, "the default must rotate, not pin")
+
+
+class TestReclaim(unittest.TestCase):
+    """One reclaimer, and liveness asked rather than guessed at.
+
+    There used to be two: `heart clean` walked the disk with an age cutoff,
+    prune_repo_worktrees walked a repo's worktree list with none. Both are
+    filters on the same walk now, and neither is what makes it safe."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws_root = root / "ws"
+        self.ws_root.mkdir()
+        self._old = os.environ.get("HEART_WS_ROOT")
+        os.environ["HEART_WS_ROOT"] = str(self.ws_root)
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git[:3], "init", "-q", "-b", "main"], check=True)
+        (self.repo / "f.txt").write_text("x\n")
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "base"], check=True)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("HEART_WS_ROOT", None)
+        else:
+            os.environ["HEART_WS_ROOT"] = self._old
+        self.tmp.cleanup()
+
+    def test_a_live_workspace_is_never_reclaimed(self):
+        from heart.env import Workspace, reclaim
+
+        ws = Workspace(str(self.repo), "HEAD")
+        try:
+            self.assertEqual(reclaim(), 0)
+            self.assertTrue(ws.path.is_dir())
+        finally:
+            ws.destroy()
+
+    def test_a_worktree_whose_owner_died_is_reclaimed_at_once(self):
+        """No age cutoff. The kernel drops the lock however the owner dies, so
+        a lock that can be taken means the tree is nobody's."""
+        from heart.env import Workspace, reclaim
+
+        ws = Workspace(str(self.repo), "HEAD")
+        path = ws.path
+        ws._lock.close()          # what a SIGKILL does, minus the process exit
+        self.assertEqual(reclaim(), 1)
+        self.assertFalse(path.exists())
+        listed = subprocess.run(["git", "-C", str(self.repo), "worktree", "list"],
+                                capture_output=True, text=True).stdout
+        self.assertNotIn(str(path), listed, "prune should have deregistered it")
+
+    def test_a_worktree_with_no_lock_at_all_is_a_leak(self):
+        # everything created before this existed, including one real 86-strong
+        # backlog, has no lock file
+        from heart.env import reclaim
+
+        stray = self.ws_root / "deadbeefcafe"
+        stray.mkdir()
+        (stray / "junk.txt").write_text("x")
+        self.assertEqual(reclaim(), 1)
+        self.assertFalse(stray.exists())
+
+    def test_an_orphan_whose_repo_is_gone_is_still_reclaimed(self):
+        """85 of 86 leaks in one real backlog belonged to task clones and temp
+        repos already deleted. Walking from a repo means someone has to name it,
+        and nobody can name a repo that no longer exists -- so the walk starts
+        from the disk and asks each worktree where it came from.
+
+        `git -C <gone> worktree list` returns nothing, which is why the old
+        repo-first version could not see these at all."""
+        from heart.env import Workspace, reclaim
+
+        ws = Workspace(str(self.repo), "HEAD")
+        path = ws.path
+        ws._lock.close()
+        shutil.rmtree(self.repo)          # the repo disappears
+        probe = subprocess.run(["git", "-C", str(self.repo), "worktree", "list"],
+                               capture_output=True, text=True)
+        self.assertNotEqual(probe.returncode, 0, "the repo really is gone")
+        self.assertEqual(reclaim(), 1)    # found without being told a repo
+        self.assertFalse(path.exists())
+
+    def test_a_tree_an_agent_left_unwritable_is_still_removed(self):
+        """rmtree cannot delete a child when the parent is mode 0500, and with
+        ignore_errors that failure is silent. A reclaimer counting attempts
+        rather than results reported 48 removed over 48 still on disk."""
+        from heart.env import reclaim
+
+        stray = self.ws_root / "aaaabbbbcccc"
+        (stray / "locked").mkdir(parents=True)
+        (stray / "locked" / "f.txt").write_text("x")
+        (stray / "locked").chmod(0o500)
+        try:
+            self.assertEqual(reclaim(), 1)
+            self.assertFalse(stray.exists())
+        finally:
+            if stray.exists():
+                (stray / "locked").chmod(0o700)
+
+    def test_a_lock_whose_worktree_is_gone_is_litter(self):
+        from heart.env import reclaim
+
+        (self.ws_root / "ffffeeeedddd.lock").write_text("")
+        reclaim()
+        self.assertFalse((self.ws_root / "ffffeeeedddd.lock").exists())
+
+    def test_the_filters_narrow_without_being_the_safety(self):
+        from heart.env import Workspace, reclaim
+
+        ws = Workspace(str(self.repo), "HEAD")
+        ws._lock.close()
+        other = Path(self.tmp.name) / "elsewhere"
+        self.assertEqual(reclaim(repo=other), 0)      # different repo: skipped
+        self.assertEqual(reclaim(older_than=0), 0)    # nothing is that old
+        self.assertEqual(reclaim(repo=self.repo), 1)
+
+    def test_making_a_workspace_sweeps_leaks_left_by_earlier_runs(self):
+        """Only plexus ever called the old reclaimer, so driving heart directly
+        leaked indefinitely and silently."""
+        import heart.env as env
+
+        stray = self.ws_root / "0123456789ab"
+        stray.mkdir()
+        env._swept = False
+        ws = env.Workspace(str(self.repo), "HEAD")
+        try:
+            self.assertFalse(stray.exists())
+        finally:
+            ws.destroy()
 
 
 class TestCost(unittest.TestCase):

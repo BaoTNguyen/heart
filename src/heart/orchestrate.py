@@ -403,7 +403,12 @@ def _route_worker(sub: Subtask, task, agent: str, manifest: dict) -> tuple[str, 
 def _worker_taskspec(task, sub: Subtask, effort: str):
     """A worker builds only its slice, structural checks only — a fragment can't
     be judged against whole-feature tests, so correctness is decided on the merge.
-    allowed_paths is an optional soft lane (path_violations enforces it)."""
+    allowed_paths is not a soft lane any more. Under HEART_SANDBOX=docker it
+    becomes the container's mount table -- everything outside it is read-only --
+    so a planner guessing paths from a prompt it has not verified against the
+    code is guessing at a wall, not a hint. Worth revisiting whether a first
+    attempt should run open and tighten only once plexus's ledger has seen the
+    task before."""
     return dataclasses.replace(
         task,
         task_id=f"{task.task_id}-{sub.name}",

@@ -209,16 +209,173 @@ Four coding-specific mechanisms, composable per run:
 
 Operational switches:
 
-- **Sandbox** (`HEART_SANDBOX=bwrap`): agent subprocesses run under bubblewrap
-  — filesystem read-only except the worktree, /tmp, and agent config/cache
-  dirs; `~/.ssh`/`~/.aws`/`~/.gnupg` hidden; network open (agents call APIs).
-  Off by default; turn it on for unattended batches. Containment for accidents,
-  not a boundary against a hostile model. `HEART_SANDBOX=bwrap-nonet` also cuts
-  the network — for verifier runs and local-model agents needing no egress.
-  Whenever sandboxing is on at all (`bwrap` or `bwrap-nonet`), verifier
-  subprocesses always run under `bwrap-nonet` regardless of the agent's mode:
-  agents get network, verifiers never do. Ubuntu 24.04+ needs a one-time
-  AppArmor profile allowing bwrap to create user namespaces.
+- **Sandbox** (`HEART_SANDBOX=docker`): every agent role and every verifier
+  runs in a container whose mount table is derived from the task spec —
+  `allowed_paths` writable, `denied_paths` read-only, the rest of the worktree
+  read-only, no host home, no rootfs writes, all capabilities dropped. The
+  refusal happens at the syscall, so `path_violations` reading the diff
+  afterwards became a second opinion rather than the only one.
+
+  Off by default; `HEART_SANDBOX=docker-sbx` turns it on. That is the only
+  mode — a stale `HEART_SANDBOX=docker` or `bwrap` raises rather than running
+  unsandboxed.
+
+  **What the runtime gives, and how.** The plugin exposes no `--network`,
+  `--cap-drop`, `--read-only` or memory/cpu/pids flag — measured at v0.6.0:
+  `NetworkMode=bridge, CapDrop=[], ReadonlyRootfs=false, Memory=0`. It does
+  leave an ordinary container behind, and with `-d` nothing has run in it yet,
+  so heart applies the flags it will not take in the gap between creating the
+  sandbox and exec'ing the agent into it:
+
+  - **Network.** `docker network disconnect bridge`, then `connect` to whatever
+    the spec asked for — nothing at all for `none`. So `none` means none, and
+    the egress allowlist is a boundary again rather than advice: an agent on an
+    `--internal` network that ignores `HTTP_PROXY` reaches nothing.
+  - **Verifiers** are detached from every network, so exfiltration-via-test is
+    closed and a verifier still cannot edit the tree it judges.
+  - **Limits.** `docker update --memory --memory-swap --cpus --pids-limit`.
+
+  Both network steps are fatal on failure. A sandbox that keeps its bridge leg
+  because the disconnect failed is the silent widening this feature exists to
+  prevent; one that reaches no network because the connect failed produces an
+  agent that did nothing. Either exits 125, which puts docker's own message in
+  the log where `sandbox_start_failure` raises on it.
+
+  Still gone, because they are fixed at container creation and no post-hoc
+  command sets them: **`--cap-drop` and `--read-only` rootfs**. And a
+  `denied_paths` entry that does not exist yet cannot be pre-denied — the plugin
+  refuses a sandbox over a missing bind source, so heart drops the mount and
+  `path_violations` on the diff is the backstop.
+
+  Two plugin behaviours heart works around: sandboxes are named by creation time
+  to the second, so heart supplies a unique `--name` (without it every
+  `--candidates` run collides); and `docker exec` starts in the image workdir,
+  so heart passes `-w /work` or the agent edits files outside the worktree and
+  the episode reads as `no_change`.
+
+  Network is `none` unless the task spec asks: `"network": "api"` for a vendor
+  model, `"model"` for a local one. Both default to `heart-egress` — the
+  `--internal` network where the egress proxy below is the only reachable
+  container. `HEART_API_NETWORK=bridge` restores plain unrestricted egress; it
+  is deliberately the thing you type rather than the thing you get.
+
+  A network name buys no containment on its own: `docker network create
+  heart-model` gives `Internal=false` and full internet egress — verified. Nor
+  does `--internal` alone, which removes the gateway and so cuts off a
+  `host.docker.internal` model server too.
+
+  **Egress allowlist.** `contrib/egress-proxy.py` is what makes the default
+  mean something. The agent sits on an `--internal` network where the proxy is
+  the only reachable container, and the proxy's `ALLOW` list decides what
+  leaves. CONNECT is tunnelled after the host check, never intercepted — no TLS
+  to terminate, no certificate to inject — and plain HTTP is forwarded by
+  absolute-URI, so one list covers a local model on `http://` and a vendor API
+  on `https://` alike.
+
+      docker network create --internal heart-egress
+      docker run -d --name egress --restart unless-stopped --network bridge \
+        -e ALLOW=api.anthropic.com,host.docker.internal \
+        -v $PWD/contrib/egress-proxy.py:/proxy.py:ro \
+        --entrypoint python3 heart-agent:latest /proxy.py
+      docker network connect heart-egress egress
+
+      HEART_SANDBOX=docker HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
+
+  `--restart unless-stopped` is not decoration: a Docker Desktop update killed
+  the proxy with 137 mid-session and the next run had no route out.
+
+  It fails closed by construction — an agent that ignores the proxy variables
+  has no gateway at all, so it reaches nothing rather than quietly going direct.
+
+  A host the agents need but the list omits is **not** scored. The proxy stamps
+  `HEART_EGRESS_DENIED` on every refusal and heart raises on it, because a list
+  missing a host is missing it for the whole batch. Without that, a denied host
+  arrived as an ordinary API error and the episode scored `no_change` at reward
+  0.0 — measured. Build the list by running a few episodes and reading the
+  proxy's deny lines; Claude Code also reaches for `mcp-proxy.anthropic.com`
+  and `http-intake.logs.us5.datadoghq.com`, and the episodes pass without them.
+
+  Verifiers get `none` no matter what the task asked for, plus a read-only
+  worktree and no `/context` — agents get network, verifiers never do, and a
+  verifier cannot edit the tree it is scoring.
+
+  Build the image once — `docker build -t heart-agent:latest .` — from the
+  Dockerfile in this repo. It carries git, node and heart itself (so `api:`
+  agents can run their `python3 -m heart.agents_api`), and no agent CLI at all.
+  504MB measured.
+
+  The CLIs are **mounted from the host, not baked in**: whichever of claude,
+  codex, opencode, gemini, pi and cursor-agent are installed get bind-mounted
+  read-only at run time (`sandbox.AGENT_TOOLS`). Adding a seventh agent costs no
+  bytes and no rebuild, and the container runs the same build you have. The
+  price is that the version floats with the host rather than being pinned by an
+  image tag, which is why every role records `agent_version`.
+
+  Three install shapes are handled: a versioned single-file binary (claude) is
+  renamed back to its command, a launcher with a bundled runtime beside it
+  (cursor-agent) gets its whole directory, and an npm-installed CLI (codex, pi)
+  gets its npm prefix so `../lib/node_modules` still resolves. heart supplies
+  `PATH` because a bundle directory is one it invented and the image cannot name.
+
+  A task's own test dependencies are the one thing the base cannot carry. Layer
+  them on and point `HEART_SANDBOX_IMAGE` at the result. Also:
+  `HEART_SANDBOX_MEMORY` (4g), `HEART_SANDBOX_CPUS` (2), `HEART_SANDBOX_USER`.
+
+  **Credentials.** Two routes, both agent-roles-only — a verifier has no model
+  to authenticate to, and one holding a key is an exfiltration path with a test
+  suite around it.
+
+  API keys: `HEART_SANDBOX_ENV=ANTHROPIC_API_KEY,OPENAI_API_KEY` forwards named
+  variables. An allowlist, never a copy of the environment.
+
+  Subscription seats (Claude Pro/Max, ChatGPT) authenticate with an OAuth file
+  under `$HOME` instead, so name the files:
+
+      HEART_SANDBOX_HOME_FILES=~/.claude/.credentials.json,~/.claude.json
+
+  Each is mounted **read-only** at the same position relative to `HOME` it holds
+  on the host. Read-only is the point: an OAuth refresh rotates the token at the
+  provider, so a container refreshing against your credentials would log you out
+  of your own machine. A run that outlives the access token fails with an auth
+  error instead, which is recoverable.
+
+  Files only, never a directory — `~/.claude` is a home full of transcripts, not
+  a credential store.
+
+  Note on Docker Desktop: it shares only paths under `$HOME`. A CLI installed
+  outside one mounts but will not execute; the container then fails to start,
+  and heart raises with docker's own message rather than scoring the episode.
+
+  Agents are told their scope. When a task sets `allowed_paths`/`denied_paths`,
+  the boundary is appended to every role's prompt — otherwise the agent meets it
+  as an unexplained `Read-only file system` and cannot tell a wrong approach
+  from a wall. If the task also sets `blocked_marker`, the note tells the agent
+  to emit it rather than work around the wall, which turns "the scope was wrong"
+  into an answer on the first attempt instead of a guess on the third.
+
+  A refusal on ground the spec permitted emits `sandbox.denied` regardless of
+  how the episode ends, and marks the record `scope_suspect` when the episode
+  still scored. The reward is never adjusted for it: the number stands, the
+  doubt is recorded next to it, and the consumer decides.
+
+  Containment for accidents and reward hacking, not a boundary against a
+  hostile model: an allowlisted host is still a host, and a determined model
+  with something to say can say it to an endpoint you permitted.
+
+  Bubblewrap used to be the mechanism. It could not express a per-task mount
+  table, which is the whole point of the feature, and two mechanisms enforcing
+  overlapping halves of one policy is how the halves drift apart.
+- **Reviewer rotation**: the `review` role runs on a different model family
+  than the one that wrote the code — a model reviewing its own output brings
+  the same blind spots to finding the bug that it brought to writing it. The
+  pool defaults to `claude:opus, codex:sol`; override with `review_models` in
+  `models.json` or `HEART_REVIEW_MODELS`. Matching is on the family (the part
+  before the colon), so `claude:sonnet` is still reviewed by `codex:sol`. A
+  coder outside the pool gets the first entry rather than no reviewer, and an
+  explicit `"agent"` on a `--roles` entry always wins — rotation only fills in
+  what nobody chose. `review2` reuses whatever the review role resolved to, so
+  a pinned reviewer is not overridden on re-review.
+
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
