@@ -46,6 +46,22 @@ TOOLS = [{
 }]
 
 
+def profile_config(profile: str) -> dict:
+    """One profile's entry from models.json, or {} if there is none.
+
+    Tolerant where resolve_config is strict, and for the same reason
+    endpoint_for is: the caller is heart deciding what to hand a container, not
+    the agent deciding whether it can run.
+    """
+    if not profile:
+        return {}
+    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+    try:
+        return json.loads(path.read_text())["profiles"].get(profile, {})
+    except (OSError, KeyError, json.JSONDecodeError):
+        return {}
+
+
 def resolve_config() -> dict:
     cfg: dict = {}
     profile = os.environ.get("HEART_MODEL_PROFILE", "")

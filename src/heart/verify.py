@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import time
 
 from .env import Workspace
-from .runner import sandbox_wrap
+from .runner import SANDBOX_MODE, sandbox_start_failure, sandbox_wrap
 from .taskspec import TaskSpec, Verifier
 
 
@@ -18,13 +19,19 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
     # HEART_TIER_* scrubbed for the same reason as in runner.run_agent
     env = {k: v for k, v in os.environ.items() if not k.startswith("HEART_TIER_")}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    # Policy: agents get network, verifiers never do — when sandboxing is on
-    # at all, verifier subprocesses are always forced into the no-network
-    # variant of whichever mode is in force. `profile` carries that for docker
-    # (verifier_profile_for pins network="none" and a read-only worktree); for
-    # bwrap it is the -nonet mode below.
+    # Policy: agents may get network, verifiers never do. `profile` carries
+    # that — verifier_profile_for pins network="none" and a read-only worktree.
+    # No profile in docker mode means the caller did not build one, and a
+    # verifier that quietly runs unsandboxed while the agent is contained is
+    # the asymmetry this whole feature exists to remove: fail instead.
     mode = os.environ.get("HEART_SANDBOX", "off")
-    sandboxed = mode in ("bwrap", "bwrap-nonet") or (mode == "docker" and profile is not None)
+    if mode == SANDBOX_MODE and profile is None:
+        raise RuntimeError(f"HEART_SANDBOX={mode} but no verifier sandbox profile was supplied")
+    # The read-only worktree survives -- the plugin enforces :ro -- so a verifier
+    # still cannot edit the tree it is judging, which is the reward-integrity
+    # half. The network half does not: docker-sbx has no network flag, so a
+    # verifier can reach the network and exfiltration-via-test is open again.
+    sandboxed = mode == SANDBOX_MODE
     # Optional suite-wide ceiling. Each verifier still gets its own `timeout`, but
     # the whole suite can't exceed HEART_VERIFY_SUITE_TIMEOUT — without it, N
     # verifiers run serially at `timeout` each, so a 4-linter repo can spend 4×
@@ -47,11 +54,8 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
             this_timeout = min(timeout, remaining)
         cmd, shell = v.command, True
         if sandboxed:
-            cmd, shell = sandbox_wrap(
-                v.command, True, cwd, {},
-                mode="docker" if profile is not None else "bwrap-nonet",
-                profile=profile,
-            )
+            cmd, shell = sandbox_wrap(v.command, True, cwd, {}, mode=SANDBOX_MODE,
+                                      profile=profile)
         try:
             proc = subprocess.run(
                 cmd, shell=shell, cwd=cwd, capture_output=True, text=True,
@@ -59,6 +63,10 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
             )
             passed, code = proc.returncode == 0, proc.returncode
             output = (proc.stdout + proc.stderr)[-4000:]
+            if failure := sandbox_start_failure(code, output):
+                # a container that never started is not a verifier that failed
+                raise RuntimeError(f"sandbox failed to start for verifier "
+                                   f"{v.name!r}: {failure}")
         except subprocess.TimeoutExpired:
             passed, code, output = False, -1, f"timeout after {this_timeout:g}s"
         results[v.name] = {
@@ -70,27 +78,55 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
     return results
 
 
+def _check_profile(task: TaskSpec, ws_path, journal: str):
+    """The verifier container for a determinism check.
+
+    check-task is not an episode: it has no episode_id and nothing to report to,
+    so the journal mount is a throwaway directory rather than an arteries inbox.
+    A profile is still required -- run_verifiers refuses to run a verifier
+    unsandboxed while HEART_SANDBOX says otherwise, and it is right to. Deciding
+    a task is deterministic under conditions the episodes will not reproduce is
+    exactly the measurement check-task exists to prevent.
+    """
+    if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
+        return None
+    from .sandbox import verifier_profile_for
+
+    return verifier_profile_for(task, ws_path, journal)
+
+
 def check_task(task: TaskSpec, n: int = 3) -> dict:
     """Run public verifiers n times at base_commit (must be bit-stable) and once
     at fix_commit if present (must pass). Flaky verifiers poison reward signal."""
     runs = []
-    for _ in range(n):
-        ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
-        try:
-            res = run_verifiers(task.public_verifiers, str(ws.path), task.timeout_seconds)
-            runs.append({name: r["passed"] for name, r in res.items()})
-        finally:
-            ws.destroy()
-    deterministic = all(r == runs[0] for r in runs)
+    # under heart's workspace root, not /tmp: Docker Desktop shares only paths
+    # it has been told about, and a bind it will not share fails the container
+    # rather than the check -- which then reads as "every verifier failed"
+    from .env import _ws_root
 
-    fix_passes = None
-    if task.fix_commit:
-        ws = Workspace(task.repo_path, task.fix_commit, overlay=task.overlay_files)
-        try:
-            res = run_verifiers(task.public_verifiers, str(ws.path), task.timeout_seconds)
-            fix_passes = all(r["passed"] for r in res.values())
-        finally:
-            ws.destroy()
+    _ws_root().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="heart-check-", dir=_ws_root()) as journal:
+        for _ in range(n):
+            ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
+            try:
+                res = run_verifiers(task.public_verifiers, str(ws.path),
+                                    task.timeout_seconds,
+                                    profile=_check_profile(task, ws.path, journal))
+                runs.append({name: r["passed"] for name, r in res.items()})
+            finally:
+                ws.destroy()
+        deterministic = all(r == runs[0] for r in runs)
+
+        fix_passes = None
+        if task.fix_commit:
+            ws = Workspace(task.repo_path, task.fix_commit, overlay=task.overlay_files)
+            try:
+                res = run_verifiers(task.public_verifiers, str(ws.path),
+                                    task.timeout_seconds,
+                                    profile=_check_profile(task, ws.path, journal))
+                fix_passes = all(r["passed"] for r in res.values())
+            finally:
+                ws.destroy()
 
     # verifiers that already pass at base make the task worthless as signal:
     # a no-op diff earns full reward
