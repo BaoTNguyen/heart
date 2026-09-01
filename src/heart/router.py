@@ -88,10 +88,17 @@ def review_agent(coding_agent: str) -> str:
     family, the first entry again -- a same-family reviewer is worth more than
     none, and refusing here would fail an episode over a config choice.
     """
+    family = coding_agent.partition(":")[0]
+    if family == "shell":
+        # `shell` runs the prompt as bash; it is the harness, not a model, and
+        # has no lineage to rotate away from. Rotating anyway pointed every
+        # role-pipeline test at whatever real CLI sat first in the pool -- the
+        # toy suite spent real tokens locally and failed on CI, where no such
+        # binary exists.
+        return coding_agent
     pool = review_pool()
     if not pool:
         return coding_agent
-    family = coding_agent.partition(":")[0]
     return next((a for a in pool if a.partition(":")[0] != family), pool[0])
 
 
