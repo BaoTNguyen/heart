@@ -50,11 +50,15 @@ training data:
   the task's inferred skills, difficulty, and context size, filters to the ones
   that can actually run it, and picks the cheapest capable match — with declared
   scores corrected by a measured-reward sidecar so they can't drift unchecked.
-- **Orchestrator-worker for tasks that split.** A decomposer breaks a task into
-  workers, each routed to its own model and effort and run as an isolated episode;
-  their diffs are 3-way merged by git, the merged tree is verified, and failures
-  recover at the cheapest rung that works before falling back to the single-worktree
-  role pipeline. Coupled work stays on the safe sequential path.
+- **Orchestrator-worker over a dependency graph.** A decomposer breaks a task
+  into subtasks with `depends_on` edges. Everything with no unmet dependency runs
+  at once — each routed to its own model and effort, in its own isolated episode —
+  their diffs are 3-way merged by git, and the merged tree becomes the base the
+  next wave builds on, so a downstream worker reads its upstream's real code
+  instead of a promise about it. Failures recover at the cheapest rung that works:
+  re-run only the colliding lanes, then one repair pass, then the single-worktree
+  role pipeline. Ordered work no longer collapses to one sequential agent; only
+  work that cannot be split at all does.
 
 ## Install
 
@@ -96,11 +100,21 @@ Set a default with `HEART_AGENT`. The `api` agent resolves config from
 
 ```json
 {"profiles": {
-  "gpt":      {"endpoint": "https://api.openai.com/v1", "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"},
-  "deepseek": {"endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY"},
-  "local7b":  {"endpoint": "http://127.0.0.1:8000/v1", "model": "default"}
+  "gpt":       {"endpoint": "https://api.openai.com/v1", "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"},
+  "deepseek":  {"endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY"},
+  "local":     {"endpoint": "http://127.0.0.1:8001/v1", "model": "default"},
+  "local-think": {"endpoint": "http://127.0.0.1:8001/v1", "model": "default", "reasoning": true}
 }}
 ```
+
+**Per-request reasoning.** A local server (llama.cpp/vLLM) is launched with
+thinking off; `"reasoning": true` on a profile flips `enable_thinking` per call,
+so `local` and `local-think` share one loaded model on one port — a fast
+executor and a thinking planner without a reload. `HEART_API_REASONING=1`
+forces it for a single run. When on, the token floor rises to 4000 so a
+reasoning trace can't consume the whole budget and return an empty answer.
+Point these at the [hot-swap model manager](../plexus/local_model_ideas/) and
+the model behind the fixed port swaps underneath without the profiles changing.
 
 CLI agents keep arteries memory/retrieval hooks alive if installed in the
 target repo (episode worktrees carry the repo's `.arteries/` and CLI hook
@@ -122,9 +136,40 @@ unchecked. A bare tier map still works and is synthesized into a manifest:
 ```
 
 Every routing call emits a `route.decided` event with its signals, so routing
-quality is auditable in the spool and can later train a learned gate.
+quality is auditable in the journal and can later train a learned gate.
 `--escalate` defaults to the strong tier when routing. `HEART_MAX_AGENTS`
 (default 8) caps concurrent agents across parallel episodes and candidates.
+
+### Fleet concurrency: one local model, many callers
+
+`HEART_MAX_AGENTS` bounds one process. When several processes run at once — a
+`heart batch`, or a few `plexus run` goals working different repos — they each
+get their own cap, and if they route cheap-tier work to the *same* local model
+server they sum to N×8 requests against one GPU. Two knobs bound the total,
+both opt-in (unset or `0` changes nothing):
+
+- **`HEART_MAX_AGENTS_GLOBAL`** — a machine-wide cap on *every* agent, for when
+  the shared limit is a paid API key or aggregate load.
+- **`HEART_LOCAL_SLOTS`** — a cap on agents hitting a *local* model server
+  (loopback or LAN address), and nothing else. Paid APIs and subscription CLIs
+  skip it and keep running, so a fleet's frontier roles aren't throttled to
+  protect the GPU. Slots are keyed by **host:port**, so every profile pointing
+  at the *same* server shares one pool, while two servers get independent pools.
+  That is the multi-GPU story without a supervisor: run one llama.cpp (or vLLM)
+  per GPU — `127.0.0.1:8000` on card 0, `:8001` on card 1 — point a profile at
+  each, and `HEART_LOCAL_SLOTS` becomes the *per-GPU* ceiling, so two GPUs give
+  you `2 × N` local agents, N per card, each queue bounded on its own. Profiles
+  sharing one endpoint (`local7b`, `local-coder`, a trained checkpoint all on
+  `:8000`) contend as one resource — which is why a single server that keeps
+  swapping models between them just thrashes; pin one model per endpoint and
+  make a swap a deliberate restart, not a routing accident. A tensor-parallel
+  server spanning both cards on one port is a single pool, correctly: it is one
+  queue.
+
+Size `HEART_LOCAL_SLOTS` to what one server batches well (2–4 is a sane start);
+excess callers wait on a flock'd slot rather than piling onto the endpoint. A
+crashed agent's slot frees immediately — the kernel drops the lock when the
+holder dies.
 
 Tiers mix pricing models freely — a tier is an agent string, so it can be a
 local server (`api:local7b`), a metered API (`api:gpt`), or a subscription CLI
@@ -168,16 +213,173 @@ Four coding-specific mechanisms, composable per run:
 
 Operational switches:
 
-- **Sandbox** (`HEART_SANDBOX=bwrap`): agent subprocesses run under bubblewrap
-  — filesystem read-only except the worktree, /tmp, and agent config/cache
-  dirs; `~/.ssh`/`~/.aws`/`~/.gnupg` hidden; network open (agents call APIs).
-  Off by default; turn it on for unattended batches. Containment for accidents,
-  not a boundary against a hostile model. `HEART_SANDBOX=bwrap-nonet` also cuts
-  the network — for verifier runs and local-model agents needing no egress.
-  Whenever sandboxing is on at all (`bwrap` or `bwrap-nonet`), verifier
-  subprocesses always run under `bwrap-nonet` regardless of the agent's mode:
-  agents get network, verifiers never do. Ubuntu 24.04+ needs a one-time
-  AppArmor profile allowing bwrap to create user namespaces.
+- **Sandbox** (`HEART_SANDBOX=docker`): every agent role and every verifier
+  runs in a container whose mount table is derived from the task spec —
+  `allowed_paths` writable, `denied_paths` read-only, the rest of the worktree
+  read-only, no host home, no rootfs writes, all capabilities dropped. The
+  refusal happens at the syscall, so `path_violations` reading the diff
+  afterwards became a second opinion rather than the only one.
+
+  Off by default; `HEART_SANDBOX=docker-sbx` turns it on. That is the only
+  mode — a stale `HEART_SANDBOX=docker` or `bwrap` raises rather than running
+  unsandboxed.
+
+  **What the runtime gives, and how.** The plugin exposes no `--network`,
+  `--cap-drop`, `--read-only` or memory/cpu/pids flag — measured at v0.6.0:
+  `NetworkMode=bridge, CapDrop=[], ReadonlyRootfs=false, Memory=0`. It does
+  leave an ordinary container behind, and with `-d` nothing has run in it yet,
+  so heart applies the flags it will not take in the gap between creating the
+  sandbox and exec'ing the agent into it:
+
+  - **Network.** `docker network disconnect bridge`, then `connect` to whatever
+    the spec asked for — nothing at all for `none`. So `none` means none, and
+    the egress allowlist is a boundary again rather than advice: an agent on an
+    `--internal` network that ignores `HTTP_PROXY` reaches nothing.
+  - **Verifiers** are detached from every network, so exfiltration-via-test is
+    closed and a verifier still cannot edit the tree it judges.
+  - **Limits.** `docker update --memory --memory-swap --cpus --pids-limit`.
+
+  Both network steps are fatal on failure. A sandbox that keeps its bridge leg
+  because the disconnect failed is the silent widening this feature exists to
+  prevent; one that reaches no network because the connect failed produces an
+  agent that did nothing. Either exits 125, which puts docker's own message in
+  the log where `sandbox_start_failure` raises on it.
+
+  Still gone, because they are fixed at container creation and no post-hoc
+  command sets them: **`--cap-drop` and `--read-only` rootfs**. And a
+  `denied_paths` entry that does not exist yet cannot be pre-denied — the plugin
+  refuses a sandbox over a missing bind source, so heart drops the mount and
+  `path_violations` on the diff is the backstop.
+
+  Two plugin behaviours heart works around: sandboxes are named by creation time
+  to the second, so heart supplies a unique `--name` (without it every
+  `--candidates` run collides); and `docker exec` starts in the image workdir,
+  so heart passes `-w /work` or the agent edits files outside the worktree and
+  the episode reads as `no_change`.
+
+  Network is `none` unless the task spec asks: `"network": "api"` for a vendor
+  model, `"model"` for a local one. Both default to `heart-egress` — the
+  `--internal` network where the egress proxy below is the only reachable
+  container. `HEART_API_NETWORK=bridge` restores plain unrestricted egress; it
+  is deliberately the thing you type rather than the thing you get.
+
+  A network name buys no containment on its own: `docker network create
+  heart-model` gives `Internal=false` and full internet egress — verified. Nor
+  does `--internal` alone, which removes the gateway and so cuts off a
+  `host.docker.internal` model server too.
+
+  **Egress allowlist.** `contrib/egress-proxy.py` is what makes the default
+  mean something. The agent sits on an `--internal` network where the proxy is
+  the only reachable container, and the proxy's `ALLOW` list decides what
+  leaves. CONNECT is tunnelled after the host check, never intercepted — no TLS
+  to terminate, no certificate to inject — and plain HTTP is forwarded by
+  absolute-URI, so one list covers a local model on `http://` and a vendor API
+  on `https://` alike.
+
+      docker network create --internal heart-egress
+      docker run -d --name egress --restart unless-stopped --network bridge \
+        -e ALLOW=api.anthropic.com,host.docker.internal \
+        -v $PWD/contrib/egress-proxy.py:/proxy.py:ro \
+        --entrypoint python3 heart-agent:latest /proxy.py
+      docker network connect heart-egress egress
+
+      HEART_SANDBOX=docker HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
+
+  `--restart unless-stopped` is not decoration: a Docker Desktop update killed
+  the proxy with 137 mid-session and the next run had no route out.
+
+  It fails closed by construction — an agent that ignores the proxy variables
+  has no gateway at all, so it reaches nothing rather than quietly going direct.
+
+  A host the agents need but the list omits is **not** scored. The proxy stamps
+  `HEART_EGRESS_DENIED` on every refusal and heart raises on it, because a list
+  missing a host is missing it for the whole batch. Without that, a denied host
+  arrived as an ordinary API error and the episode scored `no_change` at reward
+  0.0 — measured. Build the list by running a few episodes and reading the
+  proxy's deny lines; Claude Code also reaches for `mcp-proxy.anthropic.com`
+  and `http-intake.logs.us5.datadoghq.com`, and the episodes pass without them.
+
+  Verifiers get `none` no matter what the task asked for, plus a read-only
+  worktree and no `/context` — agents get network, verifiers never do, and a
+  verifier cannot edit the tree it is scoring.
+
+  Build the image once — `docker build -t heart-agent:latest .` — from the
+  Dockerfile in this repo. It carries git, node and heart itself (so `api:`
+  agents can run their `python3 -m heart.agents_api`), and no agent CLI at all.
+  504MB measured.
+
+  The CLIs are **mounted from the host, not baked in**: whichever of claude,
+  codex, opencode, gemini, pi and cursor-agent are installed get bind-mounted
+  read-only at run time (`sandbox.AGENT_TOOLS`). Adding a seventh agent costs no
+  bytes and no rebuild, and the container runs the same build you have. The
+  price is that the version floats with the host rather than being pinned by an
+  image tag, which is why every role records `agent_version`.
+
+  Three install shapes are handled: a versioned single-file binary (claude) is
+  renamed back to its command, a launcher with a bundled runtime beside it
+  (cursor-agent) gets its whole directory, and an npm-installed CLI (codex, pi)
+  gets its npm prefix so `../lib/node_modules` still resolves. heart supplies
+  `PATH` because a bundle directory is one it invented and the image cannot name.
+
+  A task's own test dependencies are the one thing the base cannot carry. Layer
+  them on and point `HEART_SANDBOX_IMAGE` at the result. Also:
+  `HEART_SANDBOX_MEMORY` (4g), `HEART_SANDBOX_CPUS` (2), `HEART_SANDBOX_USER`.
+
+  **Credentials.** Two routes, both agent-roles-only — a verifier has no model
+  to authenticate to, and one holding a key is an exfiltration path with a test
+  suite around it.
+
+  API keys: `HEART_SANDBOX_ENV=ANTHROPIC_API_KEY,OPENAI_API_KEY` forwards named
+  variables. An allowlist, never a copy of the environment.
+
+  Subscription seats (Claude Pro/Max, ChatGPT) authenticate with an OAuth file
+  under `$HOME` instead, so name the files:
+
+      HEART_SANDBOX_HOME_FILES=~/.claude/.credentials.json,~/.claude.json
+
+  Each is mounted **read-only** at the same position relative to `HOME` it holds
+  on the host. Read-only is the point: an OAuth refresh rotates the token at the
+  provider, so a container refreshing against your credentials would log you out
+  of your own machine. A run that outlives the access token fails with an auth
+  error instead, which is recoverable.
+
+  Files only, never a directory — `~/.claude` is a home full of transcripts, not
+  a credential store.
+
+  Note on Docker Desktop: it shares only paths under `$HOME`. A CLI installed
+  outside one mounts but will not execute; the container then fails to start,
+  and heart raises with docker's own message rather than scoring the episode.
+
+  Agents are told their scope. When a task sets `allowed_paths`/`denied_paths`,
+  the boundary is appended to every role's prompt — otherwise the agent meets it
+  as an unexplained `Read-only file system` and cannot tell a wrong approach
+  from a wall. If the task also sets `blocked_marker`, the note tells the agent
+  to emit it rather than work around the wall, which turns "the scope was wrong"
+  into an answer on the first attempt instead of a guess on the third.
+
+  A refusal on ground the spec permitted emits `sandbox.denied` regardless of
+  how the episode ends, and marks the record `scope_suspect` when the episode
+  still scored. The reward is never adjusted for it: the number stands, the
+  doubt is recorded next to it, and the consumer decides.
+
+  Containment for accidents and reward hacking, not a boundary against a
+  hostile model: an allowlisted host is still a host, and a determined model
+  with something to say can say it to an endpoint you permitted.
+
+  Bubblewrap used to be the mechanism. It could not express a per-task mount
+  table, which is the whole point of the feature, and two mechanisms enforcing
+  overlapping halves of one policy is how the halves drift apart.
+- **Reviewer rotation**: the `review` role runs on a different model family
+  than the one that wrote the code — a model reviewing its own output brings
+  the same blind spots to finding the bug that it brought to writing it. The
+  pool defaults to `claude:opus, codex:sol`; override with `review_models` in
+  `models.json` or `HEART_REVIEW_MODELS`. Matching is on the family (the part
+  before the colon), so `claude:sonnet` is still reviewed by `codex:sol`. A
+  coder outside the pool gets the first entry rather than no reviewer, and an
+  explicit `"agent"` on a `--roles` entry always wins — rotation only fills in
+  what nobody chose. `review2` reuses whatever the review role resolved to, so
+  a pinned reviewer is not overridden on re-review.
+
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
@@ -187,14 +389,29 @@ Operational switches:
   re-runs the sweep any time (dedup makes it safe).
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
   a cheap tier that keeps failing means the classifier thresholds need moving.
-- **Cost capture**: `runner.run_agent` extracts tokens (and, with a
-  `~/.config/heart/models.json` `"pricing"` map keyed by agent string,
-  dollars) per role and rolls them into `episode["usage"]` and the spine.
-  Subscription CLI seats (`claude`) get tokens only unless priced explicitly —
-  no fake dollars for a quota you already paid for.
+- **Cost capture**: `runner.run_agent` extracts tokens and, from a
+  `~/.config/heart/models.json` `"pricing"` map keyed by agent string, dollars
+  per role, rolled into `episode["usage"]` and the spine. Two rules make the
+  dollar figure a usable routing signal rather than a billing artifact:
+  - **A local model server is always free** — `0.0`, even if a broad `"api"`
+    pricing entry exists — because you pay nothing to run it.
+  - **Everything else prices at the map's API rates, including subscription
+    seats.** A Claude Pro/Max seat's marginal cost is zero, but pricing `claude`
+    at Anthropic's published rates records the spend it *would* cost, so routing
+    and `pulse insights` compare tiers on real dollars. Give each seat its own
+    API-equivalent entry:
+    ```json
+    "pricing": {
+      "api":    {"in_per_mtok": 0.15, "out_per_mtok": 0.60},
+      "claude": {"in_per_mtok": 3.00, "out_per_mtok": 15.00},
+      "codex":  {"in_per_mtok": 2.50, "out_per_mtok": 10.00}
+    }
+    ```
+    (rates are illustrative — set them to the current published API price of the
+    model behind each seat.)
 - **`heart pulse serve`**: the factory floor as a local web page
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
-  all from the same NDJSON spool the terminal tools read. Stdlib HTTP + SSE,
+  all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
 - **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
   outcome/reward/cost, grouped from `episode.finished` events whose payload

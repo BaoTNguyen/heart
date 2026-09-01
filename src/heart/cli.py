@@ -14,6 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from . import mine as mine_mod
+from .env import reclaim as env_reclaim
 from . import pulse as pulse_mod
 from . import reward as reward_mod
 from .detect import detect_verifiers
@@ -54,23 +55,46 @@ def _episode_kwargs(args) -> dict:
 def _ingest_rewards(runs_dir) -> None:
     """Best-effort credit-assignment bridge: hand finished episodes to arteries'
     reward ledger when its CLI is installed. A subprocess, not an import — heart
-    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips."""
+    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips.
+
+    `art rewards`, not `art ingest`. `ingest` is arteries' *document* ingester:
+    it globs `*.md` and embeds what it finds as project documents. This called
+    it for as long as it has existed, which did nothing at all -- runs
+    directories held no markdown, so no episode reward was ever ingested and
+    nothing said so. The day heart started writing retrieved-memory packets to
+    `runs/<id>/context/*.md`, the glob matched and arteries tried to embed an
+    agent's memory back into the corpus as documentation.
+
+    A wrong subcommand that silently succeeds is worse than one that fails:
+    this one looked healthy for months by doing nothing.
+    """
     art = shutil.which("art")
     if not art or os.environ.get("HEART_INGEST") == "off":
         return
     try:
         proc = subprocess.run(
-            [art, "ingest", str(runs_dir)], capture_output=True, text=True, timeout=120,
+            [art, "rewards", str(runs_dir)], capture_output=True, text=True, timeout=120,
         )
         tail = (proc.stdout + proc.stderr).strip().splitlines()
         if tail:
-            print(f"art ingest: {tail[-1]}")
+            print(f"art rewards: {tail[-1]}")
     except Exception as exc:  # rewards can always be re-ingested later
-        print(f"art ingest skipped: {exc}", file=sys.stderr)
+        print(f"art rewards skipped: {exc}", file=sys.stderr)
 
 
 def cmd_run(args) -> int:
     task = load_task(args.task)
+    if getattr(args, "orchestrate", False):
+        # A JSON spec is the only place probes, baselines and hidden verifiers
+        # can be declared, so it is also where Path B is most worth having.
+        from .orchestrate import run_orchestrated
+        ep = run_orchestrated(task, agent=args.agent, runs_dir=args.runs_dir,
+                              agent_cmd=args.agent_cmd,
+                              roles=None if getattr(args, "solo", False) else DEFAULT_ROLES)
+        print(json.dumps({k: ep[k] for k in
+                          ("episode_id", "task_id", "outcome", "reward")}, indent=2))
+        _ingest_rewards(args.runs_dir)
+        return 0 if ep["outcome"] == "pass" else 1
     eps = run_candidates(
         task, args.candidates,
         memory_mode=args.memory, retrieval=not args.no_retrieval,
@@ -228,6 +252,119 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+STALE_AFTER_DAYS = 90
+SCHEDULED_WITHIN_DAYS = 30
+
+PRICING_PAGES = {
+    "claude": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+    "codex": "https://openai.com/api/pricing/",
+}
+
+
+def _models_seen(hours: float) -> "defaultdict[str, int]":
+    """Models the fleet actually ran, from the spine. The point of driving this
+    off observed traffic is that you never track a vendor's whole catalogue —
+    only the handful of models you are actually being billed for."""
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(hours=hours)).isoformat()
+    seen: defaultdict[str, int] = defaultdict(int)
+    for event in pulse_mod.load_events():
+        if str(event.get("ts") or "") < cutoff:
+            continue
+        model = (event.get("payload") or {}).get("model")
+        if model:
+            seen[str(model)] += 1
+    return seen
+
+
+def _model_pricing_table() -> dict:
+    from .runner import _load_models_json
+    return _load_models_json().get("model_pricing") or {}
+
+
+def cmd_models(args) -> int:
+    """Rate-card coverage: which models ran, which of them have no rate, and
+    how old the rates are. See PRICING.md for what to do about each."""
+    from .runner import model_pricing, models_json_path, pricing_provenance, set_model_price
+
+    if args.what == "set-price":
+        if not (args.model and args.source):
+            print("usage: heart models set-price <model> --input N --output N --source URL",
+                  file=sys.stderr)
+            return 2
+        row = set_model_price(
+            args.model, args.input_rate, args.output_rate,
+            source=args.source, verified=args.verified,
+            effective_from=args.effective_from)
+        when = f" from {row['effective_from']}" if row.get("effective_from") else ""
+        print(f"{args.model}: ${row['in_per_mtok']}/${row['out_per_mtok']} per MTok{when} "
+              f"(verified {row['verified']})")
+        print(f"wrote {models_json_path()}")
+        return 0
+
+    today = datetime.date.today()
+    rates = model_pricing()
+    provenance = pricing_provenance()
+    seen = _models_seen(args.hours)
+
+    missing = {m: n for m, n in seen.items() if m not in rates}
+    print(f"rate card: {models_json_path()}")
+    print(f"{len(rates)} model(s) priced · {len(seen)} model(s) seen in {args.hours:g}h\n")
+
+    if missing:
+        print("UNPRICED MODELS SEEN — billing at a provider fallback, which may be wrong")
+        for model, n in sorted(missing.items(), key=lambda kv: -kv[1]):
+            provider = "claude" if "claude" in model else "codex" if "gpt" in model else "?"
+            print(f"  {model:<24} {n:>5} turn(s)   check {PRICING_PAGES.get(provider, '?')}")
+        print()
+
+    stale, undated = [], []
+    for model in sorted(set(rates) & set(seen)):
+        verified = (provenance.get(model) or {}).get("verified")
+        if not verified:
+            undated.append(model)
+            continue
+        try:
+            age = (today - datetime.date.fromisoformat(verified)).days
+        except ValueError:
+            undated.append(model)
+            continue
+        if age > STALE_AFTER_DAYS:
+            stale.append((model, verified, age))
+    if stale:
+        print(f"STALE — not re-checked in over {STALE_AFTER_DAYS} days")
+        for model, verified, age in stale:
+            print(f"  {model:<24} verified {verified} ({age}d ago)")
+        print()
+    if undated:
+        # a rate with no date cannot be aged, so it never looks stale and is
+        # trusted indefinitely — the quiet version of being wrong
+        print("NO VERIFIED DATE — re-record with `set-price` so these can age")
+        print("  " + ", ".join(undated) + "\n")
+
+    scheduled = []
+    for model, rows in _model_pricing_table().items():
+        for row in (rows if isinstance(rows, list) else [rows]):
+            if not isinstance(row, dict) or not row.get("effective_from"):
+                continue
+            try:
+                days = (datetime.date.fromisoformat(row["effective_from"]) - today).days
+            except ValueError:
+                continue
+            if 0 <= days <= SCHEDULED_WITHIN_DAYS:
+                scheduled.append((model, row["effective_from"], days, row))
+    if scheduled:
+        print("PRICE CHANGES LANDING SOON")
+        for model, starts, days, row in sorted(scheduled, key=lambda s: s[2]):
+            print(f"  {model:<24} ${row['in_per_mtok']}/${row['out_per_mtok']} "
+                  f"on {starts} (in {days}d)")
+        print()
+
+    if not (missing or stale or undated or scheduled):
+        print("card is current for every model in use")
+    return 0
+
+
 def cmd_pulse(args) -> int:
     if args.what == "serve":
         from . import serve as serve_mod
@@ -305,24 +442,6 @@ def cmd_mine(args) -> int:
     return 0
 
 
-def _worktree_source_repo(worktree: Path) -> str | None:
-    """A worktree's `.git` file reads `gitdir: <repo>/.git/worktrees/<id>`;
-    walk back up to the repo root. Best-effort — return None if unreadable."""
-    git_file = worktree / ".git"
-    if not git_file.is_file():
-        return None
-    try:
-        line = git_file.read_text().strip()
-    except OSError:
-        return None
-    if not line.startswith("gitdir:"):
-        return None
-    gitdir = Path(line.split(":", 1)[1].strip())
-    # <repo>/.git/worktrees/<id> -> <repo>
-    repo = gitdir.parent.parent.parent
-    return str(repo) if repo.is_dir() else None
-
-
 def cmd_clean(args) -> int:
     """Delete finished-episode directories and stale heart worktrees older
     than --days. summary.csv (the batch resume ledger) is never touched."""
@@ -339,23 +458,10 @@ def cmd_clean(args) -> int:
             shutil.rmtree(ep_dir, ignore_errors=True)
             n_runs += 1
 
-    # read fresh each call (not env.WS_ROOT's import-time constant) so tests
-    # can point this at a fabricated dir via HEART_WS_ROOT without touching
-    # the real worktree cache
-    ws_root = Path(os.environ.get("HEART_WS_ROOT", str(Path.home() / ".cache" / "heart-ws")))
-    n_worktrees = 0
-    source_repos: set[str] = set()
-    if ws_root.is_dir():
-        for wt in ws_root.iterdir():
-            if not wt.is_dir() or wt.stat().st_mtime >= cutoff:
-                continue
-            repo = _worktree_source_repo(wt)
-            shutil.rmtree(wt, ignore_errors=True)
-            n_worktrees += 1
-            if repo:
-                source_repos.add(repo)
-    for repo in source_repos:
-        subprocess.run(["git", "-C", repo, "worktree", "prune"], capture_output=True)
+    # one reclaimer, shared with the automatic sweep and with plexus. --days
+    # is a filter now, not the safety mechanism: a live worktree is one whose
+    # lock is held, which reclaim() checks directly.
+    n_worktrees = env_reclaim(older_than=cutoff)
 
     print(f"heart clean: {n_runs} run(s) removed, {n_worktrees} worktree(s) removed")
     return 0
@@ -401,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--memory", default="normal", choices=["normal", "readonly", "clean"])
     p.add_argument("--no-retrieval", action="store_true")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
+    p.add_argument("--orchestrate", action="store_true",
+                   help="decompose into a wave graph of workers (Path B)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("work", help="orchestrated task against the current repo")
@@ -415,9 +523,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
     p.add_argument("--orchestrate", action="store_true",
-                   help="decompose into parallel routed workers merged with git "
-                        "(Path B); auto-falls back to a single build when the task "
-                        "isn't splittable or has no integration verifier")
+                   help="decompose into a dependency graph of routed workers, run "
+                        "in waves and merged with git (Path B); auto-falls back to a "
+                        "single build when the task isn't splittable, the graph is "
+                        "invalid, or the repo has no integration verifier")
     p.set_defaults(func=cmd_work, runs_dir=str(WORK_RUNS_DIR), fix_rounds=2)
 
     p = sub.add_parser("batch", help="run tasks x variants x repeats")
@@ -446,6 +555,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", default=None, help="filter by source (heart|arteries|marrow|agent)")
     p.add_argument("--once", action="store_true", help="print and exit; don't follow")
     p.set_defaults(func=cmd_pulse)
+
+    p = sub.add_parser("models", help="rate card: check | set-price")
+    p.add_argument("what", nargs="?", default="check", choices=["check", "set-price"])
+    p.add_argument("model", nargs="?", help="model id, for set-price")
+    p.add_argument("--hours", type=float, default=24 * 30,
+                   help="window of observed traffic to check coverage against")
+    p.add_argument("--input", dest="input_rate", type=float, default=0.0,
+                   help="USD per million input tokens")
+    p.add_argument("--output", dest="output_rate", type=float, default=0.0,
+                   help="USD per million output tokens")
+    p.add_argument("--source", default=None,
+                   help="vendor pricing URL this rate was read from (required)")
+    p.add_argument("--verified", default=None, help="YYYY-MM-DD; defaults to today")
+    p.add_argument("--effective-from", dest="effective_from", default=None,
+                   help="YYYY-MM-DD a scheduled change takes effect")
+    p.set_defaults(func=cmd_models)
 
     p = sub.add_parser("ingest", help="re-run reward ingest over a runs dir (safe: dedup)")
     p.add_argument("runs_dir", nargs="?", default=str(WORK_RUNS_DIR))
