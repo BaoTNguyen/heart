@@ -1,7 +1,7 @@
 # The event spine
 
 The contract for cross-stack observability. This file is the canon; emitters in
-other repos (arteries `spool.py`, marrow via `heart.events`) conform to it.
+other repos (arteries `journal.py`, marrow via `heart.events`) conform to it.
 There is deliberately **no shared library** — the standard is this wire format,
 like syslog. Emitters are ~40 lines of stdlib each and stay that dumb.
 
@@ -36,9 +36,9 @@ in the environment, it stamps `payload.goal_id`/`payload.feature_id` onto
 every event it emits (optional, additive, skipped if the call site already
 set them) — `pulse goal <goal-id>` reads this back.
 
-## Spool location
+## Journal location
 
-`$HEART_SPOOL_DIR`, else `~/.local/share/heart/events/`. One file per UTC day:
+`$EVENT_JOURNAL_DIR`, else `~/.local/share/heart/events/`. One file per UTC day:
 `YYYYMMDD.ndjson`. Writers append single lines (atomic enough on Linux);
 readers tolerate torn or malformed lines by skipping them.
 
@@ -60,6 +60,8 @@ take down the observed.
 | `route.decided` | heart | tier, agent, reason (heuristic signals or task.difficulty) |
 | `verify.round` | heart | attempt, passed |
 | `diff.captured` | heart | diff_lines |
+| `sandbox.denied` | heart | `paths` (worktree-relative, refused), allowed_paths, denied_paths, network, `evidence` (the raw refusal lines) |
+| `guardrail.hit` | heart | `rules` (`denied_path_probe`, or the secret-scan rules), `paths` (worktree-relative) |
 | `batch.progress` | heart | done, total, outcome |
 | `turn.observed`, `memory.*`, `prompt.*`, `*.failed` | arteries/capillaries | runlog tee; `store: db\|jsonl` |
 | `decision.<type>` | arteries | chosen, available, cost, `store` |
@@ -70,6 +72,27 @@ take down the observed.
 | `feature.started/failed/landed` | plexus | goal_id, feature_id, reason, episode_ids |
 | `acceptance.round` | plexus | attempt, passed (goal-level mirror of `verify.round`) |
 | `escalation.raised/resolved` | plexus | goal_id, feature_id, reason, episode_ids |
+
+`sandbox.denied` and `guardrail.hit` are the two halves of one distinction, and
+consumers must keep them apart: the first says the sandbox refused ground the
+spec permitted (heart drew the mount table too tight, and the episode carries
+no reward — `None`, not `0.0`), the second says the agent reached for ground the
+spec forbade (its violation, scored `0.0`). Collapse them and `scope_denied`
+becomes an escape from being scored at all.
+
+`sandbox.denied` fires whenever a refusal on permitted ground appears in the
+episode's logs, whatever the outcome — a passing episode can carry one. It is a
+report that the mount table was tighter than the work needed, not a verdict on
+the episode, and it never moves the reward. Consumers that only looked at it
+alongside `scope_denied` were seeing the tail of the distribution: the scopes so
+tight the agent produced nothing, never the far more common scope that let an
+agent start and not finish. Episodes in the second group carry `scope_suspect:
+true` and `scope_refused_paths` on the episode record.
+
+Both carry `paths` already parsed and worktree-relative — the vocabulary
+`allowed_paths` speaks, not the container's `/work` mount point. Read that
+field; do not re-parse `evidence`. It exists for a human reading a trace, and a
+second parser for the same prose is how the two drifted apart the first time.
 
 `store` reports where the durable write landed: `jsonl` means the Postgres
 write failed and the record fell back to repo-local JSONL — a silent-degradation

@@ -51,7 +51,7 @@ primary.
 | plexus → heart | Python import (`heart.episode`, `heart.taskspec`, `heart.env`) | heart API drift breaks plexus silently — no pinning, same-machine source checkouts |
 | heart → arteries | env (`ARTERIES_PROJECT/REPO/MEMORY/EPHEMERAL`, `HEART_EPISODE_ID`) + `art ingest` subprocess + `.arteries/hooks/observe.sh` | env leakage between roles; ingest schema drift; hooks absent in a fresh worktree |
 | arteries → capillaries | Python import (retrieval gate) + shared Postgres | capillaries import failure takes down arteries eval (seen: `No module named 'capillaries'`) |
-| everyone → spine | NDJSON spool, SPINE.md contract, additive-only fields | a malformed emitter corrupts nothing (tolerant readers) but silently drops observability |
+| everyone → spine | NDJSON journal, SPINE.md contract, additive-only fields | a malformed emitter corrupts nothing (tolerant readers) but silently drops observability |
 | everyone → Postgres | arteries owns `episodes/decisions/rewards`; capillaries owns its retrieval + skills + optimize tables | schema ownership is clean today; keep migrations in the owning repo only |
 
 ### 1.2 Contract tests (per seam, cheap, run in each repo's suite)
@@ -106,7 +106,7 @@ detail.
 **Conflict audit (run once, then guarded by the smoke):** env prefixes are
 already disjoint (`HEART_/ARTERIES_/CAPILLARIES_/PLEXUS_`); ports must be
 declared in one place — adopt: capillaries HTTP 8100, vLLM 8000, pulse serve
-7717, document in each README; Postgres schemas per owner (§1.1); spool is
+7717, document in each README; Postgres schemas per owner (§1.1); journal is
 append-only per-source files so concurrent writers are safe; config files
 (`~/.config/heart/models.json`, capillaries config, `.arteries/`) never shared.
 
@@ -167,37 +167,39 @@ question per subprocess type is which mode.
 
 ### 3.1 Activation (user, once)
 
-AppArmor profile for bwrap userns (already prepared) — until it's loaded,
-everything below stays skip-not-fail.
+A running Docker daemon, and `docker pull docker/sandbox-templates:claude-code`
+(or your own image in `HEART_SANDBOX_IMAGE`). Nothing else: no AppArmor
+profile, no user namespaces to unblock. `HEART_SANDBOX=docker` is the switch.
 
 ### 3.2 Policy matrix (code)
 
-| Subprocess | Mode | Why |
-| --- | --- | --- |
-| agent roles (implement/test/review/fix) | `bwrap` | needs API egress; fs contained |
-| verifiers | `bwrap-nonet` | tests have no business on the network; kills exfil-via-test and flaky-network tests in one move |
-| `art ingest`, git plumbing | none | trusted local tooling touching real state on purpose |
+| Subprocess | Network | Worktree | Why |
+| --- | --- | --- | --- |
+| agent roles (implement/test/review/fix) | from the spec (`none` default; `api`/`model` reach an allowlist proxy on an `--internal` network) | `allowed_paths` rw, `denied_paths` ro, rest ro | the spec is the privilege boundary |
+| verifiers | always `none` | entirely read-only, no `/context` | tests have no business on the network, and a verifier that can edit the tree it judges is not a judge |
+| `art ingest`, git plumbing, the commit | host | — | trusted local tooling touching real state on purpose |
 
-Implementation: `HEART_SANDBOX` stays the master switch; when it's `bwrap`,
-verifier subprocesses (`verify.py` / episode verify calls) upgrade themselves
-to `bwrap-nonet` automatically. One env var, no per-role config until a real
-need appears.
+The commit is deliberately on the host: the object store goes into the
+container read-only, so an agent gets full history to debug against and cannot
+write a single object or move a ref.
 
-### 3.3 Testing it ("full sandboxing for each feature to implement and test with")
+### 3.3 Testing it
 
-- The existing containment test (stray write to `$HOME` fails) un-skips.
-- Add the negative-space tests: verifier under `bwrap-nonet` cannot `curl`;
-  agent under `bwrap` cannot read `~/.ssh`; worktree and `/tmp` remain
-  writable; a `git commit` inside the worktree still works (bwrap keeps uid).
-- Acceptance: re-run the 10-task meridian shakedown with `HEART_SANDBOX=bwrap`
-  — same pass rate as unsandboxed. Bun installing under bwrap is the likely
-  friction point (cache dir binds); the shakedown finds it.
-- **Every feature in this document is developed and tested with the sandbox
-  on** once activated — sandbox-off becomes the exception you type, not the
-  default you forget.
+`tests/test_sandbox.py` pins the mount table; `TestSandboxLive` in
+`tests/test_heart.py` runs real containers and skips when no daemon is
+reachable. The negative space is the point — allowed writable / denied refused
+/ worktree root refused / default network unreachable / host `$HOME` invisible
+/ verifier cannot write or reach the network / `git commit` refused inside
+while the edit survives for the host / the container kills itself at the task
+timeout.
 
-**Done when:** shakedown passes sandboxed at parity, and the policy matrix
-above is enforced by tests, not convention.
+Above that, the three episode outcomes are exercised end to end: a pass that
+lands a real commit, a denied-path probe that scores 0.0 as `path_violation`,
+and a spec drawn too tight that scores `None` as `scope_denied`.
+
+**Done when:** the 10-task meridian shakedown passes sandboxed at parity with
+unsandboxed. Not yet run — the likely friction point is package installs with
+`network: none`, which the shakedown finds.
 
 ---
 
@@ -214,7 +216,7 @@ provides the knobs.
 - Scoring: static failures gate at a small reward weight — they must not
   drown the test signal, but a diff that fails lint/type never scores full
   marks and `--apply` warns. Threshold, not tyranny.
-- Runs `bwrap-nonet` like all verifiers.
+- Runs with `network: none` and a read-only tree, like all verifiers.
 
 ### 4.2 Guardrails on the diff (pre-apply, pre-reward)
 

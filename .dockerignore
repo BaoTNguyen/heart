@@ -1,0 +1,5 @@
+.git
+tests
+runs
+**/__pycache__
+*.egg-info
