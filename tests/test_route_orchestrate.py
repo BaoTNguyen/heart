@@ -737,3 +737,19 @@ class TestOrchestrate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewAgentHarnessTests(unittest.TestCase):
+    """`shell` is the test harness, not a model."""
+
+    def test_shell_is_never_rotated_to_a_real_cli(self):
+        """Rotating it made every role-pipeline test spawn a billed CLI locally
+        and fail on CI, where the binary does not exist."""
+        with unittest.mock.patch.object(orchestrate.router_mod, "review_pool",
+                                        return_value=["claude", "codex"]):
+            self.assertEqual(orchestrate.router_mod.review_agent("shell"), "shell")
+
+    def test_a_real_agent_still_rotates_family(self):
+        with unittest.mock.patch.object(orchestrate.router_mod, "review_pool",
+                                        return_value=["claude:opus", "codex"]):
+            self.assertEqual(orchestrate.router_mod.review_agent("claude:sonnet"), "codex")
