@@ -256,12 +256,12 @@ class Workspace:
                     shutil.copy2(src, dst)
 
     # agents run tests inside the workspace; their cache junk must not reach diffs
-    DIFF_EXCLUDES = [
-        ":(exclude)__pycache__", ":(exclude)*.pyc",
-        ":(exclude).pytest_cache", ":(exclude)node_modules",
+    EXCLUDED_PATHS = [
+        "__pycache__", "*.pyc", ".pytest_cache", "node_modules",
         # integration files we copied in ourselves (INTEGRATION_FILES)
-        ":(exclude).arteries", ":(exclude).claude", ":(exclude).codex",
+        ".arteries", ".claude", ".codex",
     ]
+    DIFF_EXCLUDES = [f":(exclude){p}" for p in EXCLUDED_PATHS]
 
     def diff(self) -> str:
         # intent-to-add so untracked files created by the agent show up in the diff
@@ -286,8 +286,25 @@ class Workspace:
         survives `git worktree remove` and the next gc. That is the whole trick
         for keeping real commits without a thicket of branches.
         """
-        overlay_excludes = [f":(exclude){rel}" for rel in self.overlay]
-        _run(["git", "add", "-A", "--", ".", *self.DIFF_EXCLUDES, *overlay_excludes],
+        # Stage with NO pathspec, then unstage what must not travel.
+        #
+        # `git add -A -- . :(exclude)X` fails outright (exit 1) when X is also in
+        # .gitignore and present: the `.` names it, git refuses to add a named
+        # ignored path, and the exclude does not suppress that check. heart
+        # copies .claude and .arteries into every worktree and most real repos
+        # gitignore both, so heart created the collision itself -- every commit
+        # on such a repo raised, which on Path B took the whole orchestration
+        # down. Toy repos with no .gitignore never saw it.
+        #
+        # `-f` would silence it and is the wrong fix: it stages EVERY ignored
+        # file the excludes do not name, .env included, straight into the diff
+        # heart scores and applies.
+        #
+        # Bare `git add -A` respects .gitignore on its own, so the excludes are
+        # only here for paths a repo does NOT ignore. Unstaging them after is
+        # exact, and `git reset` on a path that matched nothing is a no-op.
+        _run(["git", "add", "-A"], cwd=str(self.path))
+        _run(["git", "reset", "-q", "--", *self.EXCLUDED_PATHS, *self.overlay],
              cwd=str(self.path))
         # --quiet exits 1 when there is something staged, so _run's raise-on-
         # nonzero is the wrong helper here

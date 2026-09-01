@@ -50,11 +50,15 @@ training data:
   the task's inferred skills, difficulty, and context size, filters to the ones
   that can actually run it, and picks the cheapest capable match — with declared
   scores corrected by a measured-reward sidecar so they can't drift unchecked.
-- **Orchestrator-worker for tasks that split.** A decomposer breaks a task into
-  workers, each routed to its own model and effort and run as an isolated episode;
-  their diffs are 3-way merged by git, the merged tree is verified, and failures
-  recover at the cheapest rung that works before falling back to the single-worktree
-  role pipeline. Coupled work stays on the safe sequential path.
+- **Orchestrator-worker over a dependency graph.** A decomposer breaks a task
+  into subtasks with `depends_on` edges. Everything with no unmet dependency runs
+  at once — each routed to its own model and effort, in its own isolated episode —
+  their diffs are 3-way merged by git, and the merged tree becomes the base the
+  next wave builds on, so a downstream worker reads its upstream's real code
+  instead of a promise about it. Failures recover at the cheapest rung that works:
+  re-run only the colliding lanes, then one repair pass, then the single-worktree
+  role pipeline. Ordered work no longer collapses to one sequential agent; only
+  work that cannot be split at all does.
 
 ## Install
 

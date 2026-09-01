@@ -26,7 +26,13 @@ from . import agents_api
 AGENT_COMMANDS: dict[str, list[str]] = {
     "claude": ["claude", "-p", "{prompt}", "--dangerously-skip-permissions",
                "--output-format", "json"],
-    "codex": ["codex", "exec", "--full-auto", "{prompt}"],
+    # `-s workspace-write`, not the retired `--full-auto`: codex-cli dropped that
+    # flag and errors out on it, which heart could only report as the agent
+    # failing. `exec` never prompts, so the sandbox policy is all --full-auto
+    # carried. The worktree stays writable and everything else does not — worth
+    # keeping even under HEART_SANDBOX, where heart's mount table is the real
+    # boundary and this is one more layer that costs nothing.
+    "codex": ["codex", "exec", "-s", "workspace-write", "{prompt}"],
     "gemini": ["gemini", "--yolo", "-p", "{prompt}"],
     "opencode": ["opencode", "run", "{prompt}"],
     "pi": ["pi", "--print", "{prompt}"],
