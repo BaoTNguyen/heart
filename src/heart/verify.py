@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -129,8 +130,14 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
                 ws.destroy()
 
     # verifiers that already pass at base make the task worthless as signal:
-    # a no-op diff earns full reward
-    base_all_pass = bool(runs and runs[0] and all(runs[0].values()))
+    # a no-op diff earns full reward. Baseline verifiers are exempt and must be:
+    # a measurement command is *meant* to succeed at base -- that run is the
+    # number the head run is compared against -- so judging it by the same rule
+    # would condemn every task whose criteria are performance rather than
+    # correctness.
+    gating = {v.name for v in task.public_verifiers if not v.baseline}
+    at_base = {n: r for n, r in (runs[0] if runs else {}).items() if n in gating}
+    base_all_pass = bool(at_base and all(at_base.values()))
     ok = deterministic and (fix_passes is not False) and not base_all_pass
     return {
         "task_id": task.task_id,
@@ -140,3 +147,68 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
         "fix_passes": fix_passes,
         "ok": ok,
     }
+
+
+def _last_float(text: str) -> float | None:
+    """The last number in a verifier's output.
+
+    Last, not first: a measurement command prints its working and then its
+    answer, and the answer is what the criterion is about.
+    """
+    m = re.findall(r"-?\d+(?:\.\d+)?", text)
+    return float(m[-1]) if m else None
+
+
+def compare_baseline(mode: str, base: str, head: str) -> tuple[bool, str]:
+    """Judge one verifier's output against the same command at base_commit.
+
+    Returns (passed, explanation). An unreadable comparison fails: a criterion
+    that cannot be evaluated has not been met, and defaulting it to pass is how
+    a performance gate silently stops gating.
+    """
+    if mode == "identical":
+        if base.strip() == head.strip():
+            return True, "identical to base"
+        return False, f"differs from base\n--- base\n{base[-1500:]}\n--- head\n{head[-1500:]}"
+    # Two directions, because half of the criteria worth gating on get better by
+    # going down. Without "no_more" the only way to gate latency is to print it
+    # negative, and a criterion nobody can read is a criterion nobody writes.
+    if mode in ("no_worse", "no_more"):
+        b, h = _last_float(base), _last_float(head)
+        if b is None or h is None:
+            return False, f"no number to compare (base={base[-200:]!r} head={head[-200:]!r})"
+        op, ok = (">=", h >= b) if mode == "no_worse" else ("<=", h <= b)
+        if ok:
+            return True, f"{h:g} {op} base {b:g}"
+        return False, f"regressed: {h:g} not {op} base {b:g}"
+    return False, f"unknown baseline mode {mode!r}"
+
+
+def run_probes(probes: list[Verifier], cwd: str, timeout: int,
+               profile=None) -> tuple[str | None, str]:
+    """Measure the environment before anything is planned.
+
+    Returns (blocking_failure, facts_note). The note goes into the agent's
+    prompt: the same command that asserts a fact is the one that reports it, so
+    the plan is written against what the machine actually has rather than
+    against what the prompt's author assumed in the morning.
+
+    Probes run under the *agent's* profile, not the verifier's. A probe asks
+    what the agent will be able to reach, and answering that from inside a
+    stricter box answers a different question.
+    """
+    if not probes:
+        return None, ""
+    results = run_verifiers(probes, cwd, timeout, profile=profile)
+    failed = [n for n, r in results.items() if not r["passed"]]
+    lines = ["", "", "## Measured environment (probed at base commit, before planning)"]
+    for name, r in results.items():
+        out = " ".join(r["output_tail"].split())[:300] or "(no output)"
+        lines.append(f"- {name}: {'ok' if r['passed'] else 'FAILED'} — {out}")
+    lines.append("These are measurements, not assumptions. Plan against them.")
+    if not failed:
+        return None, "\n".join(lines)
+    detail = "; ".join(
+        f"{n}: exit {results[n]['exit_code']} {' '.join(results[n]['output_tail'].split())[:200]}"
+        for n in failed)
+    return f"precondition not met — {detail}", "\n".join(lines)

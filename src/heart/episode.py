@@ -24,6 +24,7 @@ import re
 import uuid
 from pathlib import Path
 
+from . import review as review_mod
 from . import reward as reward_mod
 from . import router
 from .env import Workspace
@@ -31,7 +32,7 @@ from .events import emit
 from .guard import scan_secrets
 from .runner import run_agent
 from .taskspec import TaskSpec
-from .verify import run_verifiers
+from .verify import compare_baseline, run_probes, run_verifiers
 
 # Memory modes follow the handoff doc's subagent pattern: implementer sees
 # project memory, test-writer runs clean so tests aren't biased by the
@@ -70,12 +71,9 @@ DEFAULT_ROLES: list[dict] = [
         # rotates to a different model family than the coder -- see
         # router.review_agent. `agent` here would pin one instead.
         "review": True,
-        "prompt": (
-            "Run `git diff` and review all changes for the task below: correctness, "
-            "unintended edits, missing tests. Tests added by the pipeline's test "
-            "role are expected and in scope. Your final line must be exactly "
-            "APPROVE or REJECT followed by a one-line reason.\nTask: {prompt}"
-        ),
+        # findings, not a verdict -- see review.py. A --roles file with its own
+        # wording still works and simply falls back to the APPROVE/REJECT read.
+        "prompt": review_mod.ASSESS_PROMPT,
     },
 ]
 
@@ -538,6 +536,10 @@ def run_episode(
     escalate: str | None = None,
     isolated: bool = False,
     parent_agent_id: str | None = None,
+    # How many times a rejection may be acted on. 1 keeps the cost of the flow
+    # this replaced: one edit turn and one more judgment per rejection, nothing
+    # at all when the reviewer approves.
+    review_rounds: int = 1,
 ) -> dict:
     episode_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     out = Path(runs_dir) / episode_id
@@ -554,7 +556,7 @@ def run_episode(
         return _run_episode(
             task, agent, memory_mode, retrieval, agent_cmd, roles,
             fix_rounds, escalate, episode_id, out, routed, isolated,
-            parent_agent_id,
+            parent_agent_id, review_rounds,
         )
     except Exception as exc:
         # a crash must be a visible error signal, not a silent gap in the journal
@@ -596,12 +598,36 @@ def _memory_env(memory_mode: str, retrieval: bool, isolated: bool,
     return env
 
 
+def _normalize_roles(roles: list[dict] | None) -> list[dict] | None:
+    """`review: True` is the marker for a role that judges the diff. A role
+    named "review" implies it, so a --roles file written before the flag existed
+    keeps working.
+
+    Settled here once because it used to be asked five different ways -- twice by
+    flag, three times by name -- and the two could disagree: a role with the flag
+    and another name rotated to an independent reviewer and then never produced a
+    verdict, while a role named "review" without the flag produced one after
+    reviewing its own author's code. Neither combination errored.
+    """
+    if not roles:
+        return roles
+    out = []
+    for role in roles:
+        role = dict(role)
+        if role.get("name") == "review":
+            role.setdefault("review", True)
+        out.append(role)
+    return out
+
+
 def _run_episode(
     task: TaskSpec, agent: str, memory_mode: str, retrieval: bool,
     agent_cmd: str | None, roles: list[dict] | None,
     fix_rounds: int, escalate: str | None, episode_id: str, out: Path,
     routed: bool = False, isolated: bool = False, parent_agent_id: str | None = None,
+    review_rounds: int = 1,
 ) -> dict:
+    roles = _normalize_roles(roles)
     repo = Path(task.repo_path).resolve()
     env = {
         "ARTERIES_EPISODE_ID": episode_id, "ARTERIES_TASK_ID": task.task_id,
@@ -617,6 +643,20 @@ def _run_episode(
          pipeline=[r["name"] for r in roles] if roles else "solo")
     ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
     agent_profile, verifier_profile = _sandbox_profiles(task, ws.path, episode_id, out)
+    # Before anything is planned or written. A failed probe stops the episode
+    # here, where it costs one command instead of a full build that discovers
+    # the same fact by crashing into it.
+    probe_failure, probe_facts = run_probes(task.probes, str(ws.path),
+                                            task.timeout_seconds, profile=agent_profile)
+    if task.probes:
+        emit("heart", "probes.finished", episode_id=episode_id, task_id=task.task_id,
+             count=len(task.probes), blocked=bool(probe_failure), reason=probe_failure)
+    if probe_facts:
+        # Onto the task, so every downstream prompt -- roles, fix loop, review --
+        # sees the same measurements without threading an argument through each.
+        # The recorded prompt carries them too: what the agent was told is what
+        # the episode should be reproducible from.
+        task = dataclasses.replace(task, prompt=task.prompt + probe_facts)
     clean = None
     runs_log: list[dict] = []
     verify_rounds: list[dict] = []
@@ -627,6 +667,7 @@ def _run_episode(
     scope_refused: list[str] = []
     packets: list[dict] = []
     reviewer: str | None = None   # whatever the review role resolved to
+    review_findings: list = []    # what the reviewer found, whatever the verdict
     # Every path any role was actually permitted to write. path_violations reads
     # the finished diff and cannot see which role produced a hunk, so it has to
     # judge against the union -- otherwise the mount table lets the test role
@@ -637,8 +678,9 @@ def _run_episode(
     diff = ""
     can_fix = fix_rounds > 0 and bool(task.public_verifiers)
     try:
-        for role in roles or [{"name": "solo", "memory": memory_mode,
-                               "verify_after": can_fix, "prompt": "{prompt}"}]:
+        for role in [] if probe_failure else (roles or [
+                {"name": "solo", "memory": memory_mode,
+                 "verify_after": can_fix, "prompt": "{prompt}"}]):
             role_env = dict(env)
             mem = role.get("memory", memory_mode)
             role_env.pop("ARTERIES_MEMORY", None)
@@ -652,7 +694,14 @@ def _run_episode(
             # scope is per subtask, and the test writer needs somewhere the
             # implementer does not
             role_profile, role_task = agent_profile, task
-            if role.get("allowed_paths"):
+            # Only widen a scope that exists. An empty task.allowed_paths means
+            # "no restriction", so unioning a role's paths into it does not widen
+            # anything -- it invents a restriction out of nothing, and every path
+            # outside tests/ becomes a violation. That made `heart work` (and any
+            # plexus feature with pipeline = true) score path_violation for
+            # editing the file it was asked to edit, while the same task run solo
+            # passed.
+            if role.get("allowed_paths") and task.allowed_paths:
                 # role_task carries the widened scope so the scope note in the
                 # prompt matches the mount table. Telling an agent it may not
                 # write where it can is how you get a test role that never tries.
@@ -670,8 +719,13 @@ def _run_episode(
                 # brought to writing it. An explicit `agent` on the role still
                 # wins -- this only fills in what nobody chose.
                 role_agent = router.review_agent(role_agent)
-            if role["name"] == "review":
+            if role.get("review"):
                 reviewer = role_agent
+            if role.get("review"):
+                # the review role's turns are run by review.phase below, which
+                # owns the assess/resolve/confirm sequence and its prompts
+                reviewer = role_agent
+                continue
             prompt = role["prompt"].format(prompt=task.prompt)
             packet = {"role": role["name"],
                       **_context_packet(task, role["name"], mem, out, episode_id)}
@@ -696,38 +750,48 @@ def _run_episode(
                     task, ws, out, agent, env, fix_rounds, escalate, agent_cmd, runs_log,
                     agent_profile, verifier_profile
                 )
-        if any(r["role"] == "review" for r in runs_log):
-            review_verdict = _review_verdict(out / "review.log")
-            notes = _review_notes(out / "review.log")
-            if notes:
-                emit("heart", "review.notes", episode_id=episode_id, task_id=task.task_id,
-                     verdict=review_verdict, notes=notes)
-            if review_verdict == "reject" and can_fix:
-                # a rejection must act, not just be recorded: one fix turn on
-                # the reviewer's feedback, then a fresh verify round
-                tail = (out / "review.log").read_text(errors="replace")[-1500:]
-                prompt = (
-                    f"A code reviewer rejected the current changes:\n{tail}\n"
-                    f"Address the review feedback. Do not weaken or delete tests.\n"
-                    f"Original task: {task.prompt}"
-                )
-                _agent_turn("review-fix", agent, prompt, ws, env, task, out,
+        review_role = next((r for r in (roles or []) if r.get("review")), None)
+        if probe_failure:
+            review_role = None  # nothing was written; there is nothing to review
+        if review_role is not None:
+            # Three jobs, each named for what it reads: assess reads the diff,
+            # resolve reads the findings, confirm reads the findings plus what
+            # the fixer claims it did. The verdict is derived from severities,
+            # so a reviewer cannot reject in prose and approve on the last line.
+            review_memory = review_role.get("memory", "readonly")
+
+            def _assess(name, prompt):
+                _agent_turn(name, reviewer or agent, prompt, ws,
+                            {**env, "ARTERIES_MEMORY": review_memory}, task, out,
+                            agent_cmd, runs_log, memory=review_memory,
+                            profile=agent_profile)
+                return out / f"{name}.log"
+
+            def _resolve(name, prompt):
+                _agent_turn(name, agent, prompt, ws, env, task, out,
                             agent_cmd, runs_log, profile=agent_profile)
+                return out / f"{name}.log"
+
+            def _reverify():
+                nonlocal verify_rounds
                 verify_rounds += _fix_loop(
                     task, ws, out, agent, env, 0, None, agent_cmd, runs_log,
-                    agent_profile, verifier_profile
-                )
-                # the gate must reflect the post-fix state: without re-review,
-                # a resolved rejection still blocks --apply forever
-                review_role = next(r for r in roles if r["name"] == "review")
-                # the same reviewer that rejected, not a freshly rotated one:
-                # a custom --roles file that pinned an agent must not be
-                # overridden on the re-review
-                _agent_turn("review2", reviewer or agent,
-                            review_role["prompt"].format(prompt=task.prompt),
-                            ws, {**env, "ARTERIES_MEMORY": "readonly"}, task, out,
-                            agent_cmd, runs_log, profile=agent_profile)
-                review_verdict = _review_verdict(out / "review2.log") or review_verdict
+                    agent_profile, verifier_profile)
+
+            outcome_of_review = review_mod.phase(
+                task.prompt,
+                assess=_assess, resolve=_resolve, verify=_reverify,
+                legacy_verdict=_review_verdict,
+                assess_prompt=review_role["prompt"],
+                rounds=review_rounds if can_fix else 0)
+            review_verdict = outcome_of_review.verdict
+            review_findings = outcome_of_review.findings
+            emit("heart", "review.findings", episode_id=episode_id,
+                 task_id=task.task_id, verdict=review_verdict,
+                 rounds=outcome_of_review.rounds,
+                 fell_back=outcome_of_review.fell_back,
+                 findings=[{"severity": f.severity, "file": f.file, "line": f.line,
+                            "claim": f.claim} for f in review_findings])
 
         diff = ws.diff()
         (out / "diff.patch").write_text(diff)
@@ -743,7 +807,7 @@ def _run_episode(
 
         violations = path_violations(diff, effective_allowed, task.denied_paths)
         secret_hits = scan_secrets(diff)
-        blocked_reason = _blocked_reason(diff, task.blocked_marker)
+        blocked_reason = probe_failure or _blocked_reason(diff, task.blocked_marker)
 
         # Scanned before the ladder, not inside it. The ladder only ever asked
         # about refusals when the diff came back empty, which meant the only
@@ -809,6 +873,38 @@ def _run_episode(
                     task.public_verifiers, str(clean.path), task.timeout_seconds,
                     profile=clean_profile
                 )
+                baselined = [v for v in task.public_verifiers if v.baseline]
+                if baselined:
+                    # The same commands, at base_commit, with the diff absent.
+                    # A criterion like "recall must not drop" has no absolute
+                    # form -- only the pair of measurements says whether the
+                    # change was worth shipping, and taking them by hand is the
+                    # part of a migration that gets skipped when it is late.
+                    base_ws = Workspace(task.repo_path, task.base_commit,
+                                        overlay=task.overlay_files)
+                    try:
+                        _, base_profile = _sandbox_profiles(
+                            task, base_ws.path, episode_id, out)
+                        base_results = run_verifiers(
+                            baselined, str(base_ws.path), task.timeout_seconds,
+                            profile=base_profile)
+                    finally:
+                        base_ws.destroy()
+                    for v in baselined:
+                        head, base = verifier_results[v.name], base_results[v.name]
+                        ok, why = compare_baseline(
+                            v.baseline, base["output_tail"], head["output_tail"])
+                        head["baseline"] = {"mode": v.baseline, "passed": ok,
+                                            "detail": why,
+                                            "base_tail": base["output_tail"][-1000:]}
+                        # Both halves have to hold: the command must succeed AND
+                        # the comparison must. Overwriting `passed` is what makes
+                        # a regression score like a test failure rather than
+                        # riding along inside a green episode.
+                        head["passed"] = head["passed"] and ok
+                        emit("heart", "baseline.compared", episode_id=episode_id,
+                             task_id=task.task_id, verifier=v.name,
+                             mode=v.baseline, passed=ok, detail=why[:300])
                 if task.hidden_verifiers:
                     hidden_results = run_verifiers(
                         task.hidden_verifiers, str(clean.path), task.timeout_seconds,
@@ -917,6 +1013,11 @@ def _run_episode(
         "roles": runs_log,
         "verify_rounds": verify_rounds,
         "review_verdict": review_verdict,
+        # every finding, not only the blocking ones: an approval used to discard
+        # what the reviewer noticed on the way past
+        "review_findings": [{"severity": f.severity, "file": f.file,
+                             "line": f.line, "claim": f.claim,
+                             "evidence": f.evidence} for f in review_findings],
         "env_snapshot": {k: v for k, v in env.items() if k.startswith("ARTERIES_")},
         "verifier_results": verifier_results,
         "hidden_verifier_results": hidden_results,
