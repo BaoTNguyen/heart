@@ -228,3 +228,4 @@ tasks/mined-*/
 .arteries/
 .marrow/
 .claude/settings.local.json
+.codex/config.toml
