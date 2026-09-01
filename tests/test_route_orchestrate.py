@@ -5,14 +5,17 @@ Run: python3 -m unittest tests.test_route_orchestrate
 """
 from __future__ import annotations
 
+import dataclasses
+import graphlib
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from heart import route
+from heart import orchestrate, route
 from heart.orchestrate import Subtask, run_orchestrated
 from heart.taskspec import TaskSpec, Verifier
 
@@ -214,6 +217,44 @@ class TestDecompose(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_subtasks("no array here")
 
+    def test_a_contract_that_quotes_code_does_not_hide_the_plan(self):
+        # A good contract freezes an interface by showing it, in its own fence.
+        # That fence used to win the regex, leaving no JSON to find -- which the
+        # caller reported as "declined to split" while the plan sat in the log.
+        raw = ('''Here is the split.\n\n```json\n'''
+               '''{"contract": "`store.py`:\\n```python\\nclass Store: ...\\n```",'''
+               ''' "subtasks": ['''
+               '''{"name": "models", "prompt": "build models"},'''
+               '''{"name": "store", "prompt": "build store", "depends_on": ["models"]}]}'''
+               '''\n```\n''')
+        contract, subs = orchestrate._parse_decomposition(raw)
+        self.assertIn("class Store", contract)
+        self.assertEqual([s.name for s in subs], ["models", "store"])
+        self.assertEqual([[s.name for s in w] for w in orchestrate._waves(subs)],
+                         [["models"], ["store"]])
+
+    def test_a_transcript_full_of_braces_does_not_hide_the_plan(self):
+        # codex writes its reasoning, then a token count, then the answer. The
+        # first brace belongs to the transcript and the last to the plan, so the
+        # old first-to-last span parsed neither -- and read as "declined".
+        raw = ('thinking {"step": 1} and {"step": 2}\ntokens used\n7127\n'
+               '{"contract":"","subtasks":['
+               '{"name":"models","prompt":"build models"},'
+               '{"name":"store","prompt":"build store","depends_on":["models"]}]}')
+        contract, subs = orchestrate._parse_decomposition(raw)
+        self.assertEqual(contract, "")
+        self.assertEqual([[s.name for s in w] for w in orchestrate._waves(subs)],
+                         [["models"], ["store"]])
+
+    def test_the_subtasks_array_is_not_mistaken_for_a_bare_plan(self):
+        # the inner array parses on its own and would win as the "last" plan,
+        # dropping the contract the same-wave workers need.
+        raw = ('{"contract":"def parse(x) -> Result","subtasks":'
+               '[{"name":"a","prompt":"build"},{"name":"b","prompt":"call"}]}')
+        contract, subs = orchestrate._parse_decomposition(raw)
+        self.assertEqual(contract, "def parse(x) -> Result")
+        self.assertEqual([s.name for s in subs], ["a", "b"])
+
     def test_parse_decomposition_object_with_contract(self):
         from heart.orchestrate import _parse_decomposition, _with_contract
         raw = ('prose\n{"contract":"def parse(x)->Result","subtasks":'
@@ -326,6 +367,36 @@ class TestOrchestrate(unittest.TestCase):
         self.assertEqual(ep["orchestration"]["path"], "A")
         self.assertEqual(ep["outcome"], "pass")
 
+    def test_a_failed_probe_stops_orchestration_before_decompose(self):
+        # The planner is the expensive party to let plan on a false assumption,
+        # so the probe runs before it and nothing downstream is spent.
+        task = dataclasses.replace(
+            self._task("(orchestrated)", "true"),
+            probes=[Verifier(name="pgvector", command="exit 3")])
+        called = []
+        ep = run_orchestrated(task, agent="shell",
+                              decomposer=lambda t: called.append(t) or [],
+                              runs_dir=self.runs, manifest={})
+        self.assertEqual(called, [])
+        self.assertEqual(ep["outcome"], "blocked")
+        self.assertIsNone(ep["reward"]["total"])
+
+    def test_workers_inherit_the_measurements_and_do_not_re_probe(self):
+        task = dataclasses.replace(
+            self._task("(orchestrated)", "test -f a.txt && test -f b.txt"),
+            probes=[Verifier(name="version", command="echo 0.8.6")])
+        seen = {}
+
+        def _plan(t):
+            seen["prompt"] = t.prompt
+            return [Subtask("wa", "printf 'a\\n' > a.txt"),
+                    Subtask("wb", "printf 'b\\n' > b.txt")]
+
+        ep = run_orchestrated(task, agent="shell", decomposer=_plan,
+                              runs_dir=self.runs, manifest={})
+        self.assertIn("0.8.6", seen["prompt"])   # the planner was told
+        self.assertEqual(ep["outcome"], "pass")
+
     def test_path_b_disjoint_workers_merge_clean_and_verify(self):
         task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
         subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
@@ -340,6 +411,74 @@ class TestOrchestrate(unittest.TestCase):
         diff = (Path(self.runs) / ep["episode_id"] / "diff.patch").read_text()
         self.assertIn("a.txt", diff)
         self.assertIn("b.txt", diff)
+
+    def test_the_merged_episode_is_scored_and_the_workers_are_not(self):
+        # The merged tree is real work: a real diff that faced the real suite,
+        # so it carries a real reward. A worker built a fragment nothing could
+        # judge, so its None stays None -- unscored is not the same as failed.
+        task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={})
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertIsNotNone(ep["reward"]["total"])
+        self.assertGreater(ep["reward"]["total"], 0.0)
+        self.assertIn("public_tests", ep["reward"]["components"])
+        for wid in ep["orchestration"]["worker_episodes"]:
+            worker = json.loads((Path(self.runs) / wid / "episode.json").read_text())
+            self.assertIsNone(worker["reward"]["total"])
+
+    def test_an_unmeasured_merge_scores_none_not_zero(self):
+        # _score refuses to invent a number when nothing ran. Feeding marrow a
+        # 0.0 here would be a failure that never happened.
+        self.assertIsNone(orchestrate._score({}, "diff", 1.0, 60))
+
+    def test_the_merged_tree_is_reviewed_when_a_review_role_is_configured(self):
+        # No worker ever sees the merged tree, and it is what lands. Without
+        # this, --orchestrate silently dropped the reviewer and a caller gating
+        # on REJECT read None as "nobody objected" instead of "nobody looked".
+        task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        blocker = ('{"findings":[{"severity":"blocker","file":"a.txt","line":1,'
+                   '"claim":"lanes disagree"}]}')
+        roles = [{"name": "review", "review": True, "agent": "shell",
+                  "prompt": f"echo '{blocker}'"}]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={}, roles=roles)
+        self.assertEqual(ep["orchestration"]["path"], "B")
+        self.assertEqual(ep["review_verdict"], "reject")
+        self.assertEqual([f["claim"] for f in ep["review_findings"]],
+                         ["lanes disagree"])
+
+    def test_no_review_role_means_no_verdict_not_a_silent_approval(self):
+        task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={}, roles=None)
+        self.assertIsNone(ep["review_verdict"])
+
+    def test_a_path_b_episode_is_priced_from_its_workers(self):
+        # usage {} reads as "unknown" to plexus, so an orchestrated feature spent
+        # real money and landed in the ledger as free.
+        task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={})
+        workers = [json.loads((Path(self.runs) / w / "episode.json").read_text())
+                   for w in ep["orchestration"]["worker_episodes"]]
+        for key in ("tokens_in", "tokens_out", "cost_usd"):
+            vals = [(w.get("usage") or {}).get(key) for w in workers]
+            numeric = [v for v in vals if isinstance(v, (int, float))]
+            if numeric:
+                self.assertEqual(ep["usage"][key], sum(numeric), key)
+            else:
+                # unpriceable stays absent -- a missing key means unknown, and
+                # plexus reads a present zero as "this was free"
+                self.assertNotIn(key, ep["usage"], key)
 
     def test_no_integration_verifier_forces_path_a(self):
         # Path B is unsafe without a seam-crossing test: a clean merge would be a
@@ -487,6 +626,113 @@ class TestOrchestrate(unittest.TestCase):
         diff = (Path(self.runs) / ep["episode_id"] / "diff.patch").read_text()
         self.assertIn("a.txt", diff)
         self.assertIn("b.txt", diff)
+
+    def test_waves_group_by_dependency(self):
+        # a and c are unordered relative to each other -> same wave; b waits.
+        subs = [Subtask("a", "x"), Subtask("b", "y", depends_on=["a"]), Subtask("c", "z")]
+        self.assertEqual([[s.name for s in w] for w in orchestrate._waves(subs)],
+                         [["a", "c"], ["b"]])
+
+    def test_waves_reject_a_cycle(self):
+        subs = [Subtask("a", "x", depends_on=["b"]), Subtask("b", "y", depends_on=["a"])]
+        with self.assertRaises(graphlib.CycleError):
+            orchestrate._waves(subs)
+
+    def test_waves_reject_an_edge_to_a_name_thats_not_in_the_plan(self):
+        with self.assertRaises(ValueError):
+            orchestrate._waves([Subtask("a", "x", depends_on=["ghost"]),
+                                Subtask("b", "y")])
+
+    def test_a_wave_mixing_scoped_and_unscoped_subtasks_is_rejected(self):
+        # The unscoped one inherits the task's scope -- unrestricted for
+        # `heart work` and plexus -- so it can write over the lanes beside it
+        # while both the mount table and the diff scan call that allowed.
+        waves = [[Subtask("scoped", "x", allowed_paths=["src/a.py"]),
+                  Subtask("unscoped", "y")]]
+        with self.assertRaises(ValueError) as ctx:
+            orchestrate._check_lanes(waves)
+        self.assertIn("unscoped", str(ctx.exception))
+
+    def test_a_wave_where_nobody_declares_a_lane_stays_legal(self):
+        # Not deceptive: no lane claims a boundary, and the merge still has to
+        # come out clean. Refusing this would break every lane-free decomposer.
+        orchestrate._check_lanes([[Subtask("a", "x"), Subtask("b", "y")]])
+
+    def test_lanes_in_different_waves_may_differ_in_scoping(self):
+        # Waves are sequential, so a later subtask cannot race an earlier one.
+        orchestrate._check_lanes([[Subtask("a", "x", allowed_paths=["src/a.py"])],
+                                  [Subtask("b", "y")]])
+
+    def test_mixed_lanes_fall_back_to_path_a(self):
+        task = self._task("printf 'a\\n' > a.txt", "test -f a.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt", allowed_paths=["a.txt"]),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={})
+        self.assertEqual(ep["orchestration"]["path"], "A")
+        self.assertIn("declare no lane", ep["orchestration"]["reason"])
+
+    def test_off_vocabulary_skills_are_named_not_silently_dropped(self):
+        # route.classify() drops them and falls back to ["coding"], which is the
+        # right runtime behaviour and the wrong thing to stay quiet about.
+        from heart import route
+        subs = orchestrate._subtasks_from_list([
+            {"name": "a", "prompt": "p", "skills": ["coding"]},
+            {"name": "b", "prompt": "p", "skills": ["testing", "documentation"]}])
+        unknown = sorted({k for s in subs for k in s.skills if k not in route.SKILLS})
+        self.assertEqual(unknown, ["documentation", "testing"])
+        self.assertIn("docs", route.SKILLS)   # the word the prompt now tells it to use
+
+    def test_a_worker_that_raises_falls_back_instead_of_killing_the_run(self):
+        # A crashing worker is heart failing, not the agent failing. It used to
+        # escape run_orchestrated through pool.map and take the command with it.
+        task = self._task("printf 'a\\n' > a.txt", "test -f a.txt")
+        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
+                Subtask("wb", "printf 'b\\n' > b.txt")]
+        boom = unittest.mock.patch.object(
+            orchestrate, "_run_workers", side_effect=RuntimeError("git add failed"))
+        with boom:
+            ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                                  runs_dir=self.runs, manifest={})
+        self.assertEqual(ep["orchestration"]["path"], "B->A")
+        self.assertIn("worker_failed", ep["orchestration"]["reason"])
+        self.assertEqual(ep["outcome"], "pass")
+
+    def test_invalid_graph_falls_back_to_path_a(self):
+        # a bad plan is not a bad task: build it sequentially rather than failing.
+        task = self._task("printf 'a\\n' > a.txt", "test -f a.txt")
+        subs = [Subtask("wa", "x", depends_on=["wb"]),
+                Subtask("wb", "y", depends_on=["wa"])]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={})
+        self.assertEqual(ep["orchestration"]["path"], "A")
+        self.assertIn("invalid subtask graph", ep["orchestration"]["reason"])
+
+    def test_second_wave_builds_on_the_first_ones_committed_work(self):
+        # wb can only produce b.txt by reading a.txt, which exists solely because
+        # wave 1 was committed and became wave 2's base. If the base never
+        # advanced, cat finds nothing, b.txt is empty, and integration fails.
+        task = self._task("(orchestrated)", "test -f a.txt && grep -q hello b.txt")
+        subs = [Subtask("wa", "printf 'hello\\n' > a.txt"),
+                Subtask("wb", "cat a.txt > b.txt", depends_on=["wa"])]
+        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
+                              runs_dir=self.runs, manifest={})
+        self.assertEqual(ep["orchestration"]["path"], "B")
+        self.assertEqual(ep["orchestration"]["merge"], "waves:2")
+        self.assertEqual(ep["outcome"], "pass")
+        diff = (Path(self.runs) / ep["episode_id"] / "diff.patch").read_text()
+        self.assertIn("a.txt", diff)
+        self.assertIn("b.txt", diff)
+
+    def test_only_a_dependent_worker_is_told_its_upstream_landed(self):
+        # a same-wave sibling must not be told to go read code it cannot see.
+        task = self._task("(orchestrated)", "true")
+        first = orchestrate._worker_taskspec(task, Subtask("wa", "build a"), "medium")
+        later = orchestrate._worker_taskspec(
+            task, Subtask("wb", "build b", depends_on=["wa"]), "medium")
+        self.assertEqual(first.prompt, "build a")
+        self.assertIn("wa", later.prompt)
+        self.assertIn("build b", later.prompt)
 
 
 if __name__ == "__main__":

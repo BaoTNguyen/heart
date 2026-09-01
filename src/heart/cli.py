@@ -84,6 +84,17 @@ def _ingest_rewards(runs_dir) -> None:
 
 def cmd_run(args) -> int:
     task = load_task(args.task)
+    if getattr(args, "orchestrate", False):
+        # A JSON spec is the only place probes, baselines and hidden verifiers
+        # can be declared, so it is also where Path B is most worth having.
+        from .orchestrate import run_orchestrated
+        ep = run_orchestrated(task, agent=args.agent, runs_dir=args.runs_dir,
+                              agent_cmd=args.agent_cmd,
+                              roles=None if getattr(args, "solo", False) else DEFAULT_ROLES)
+        print(json.dumps({k: ep[k] for k in
+                          ("episode_id", "task_id", "outcome", "reward")}, indent=2))
+        _ingest_rewards(args.runs_dir)
+        return 0 if ep["outcome"] == "pass" else 1
     eps = run_candidates(
         task, args.candidates,
         memory_mode=args.memory, retrieval=not args.no_retrieval,
@@ -496,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--memory", default="normal", choices=["normal", "readonly", "clean"])
     p.add_argument("--no-retrieval", action="store_true")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
+    p.add_argument("--orchestrate", action="store_true",
+                   help="decompose into a wave graph of workers (Path B)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("work", help="orchestrated task against the current repo")
@@ -510,9 +523,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
     p.add_argument("--candidates", type=int, default=1, help="best-of-N parallel attempts")
     p.add_argument("--orchestrate", action="store_true",
-                   help="decompose into parallel routed workers merged with git "
-                        "(Path B); auto-falls back to a single build when the task "
-                        "isn't splittable or has no integration verifier")
+                   help="decompose into a dependency graph of routed workers, run "
+                        "in waves and merged with git (Path B); auto-falls back to a "
+                        "single build when the task isn't splittable, the graph is "
+                        "invalid, or the repo has no integration verifier")
     p.set_defaults(func=cmd_work, runs_dir=str(WORK_RUNS_DIR), fix_rounds=2)
 
     p = sub.add_parser("batch", help="run tasks x variants x repeats")

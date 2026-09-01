@@ -23,9 +23,11 @@ from heart import reward as reward_mod  # noqa: E402
 from heart.agents_api import resolve_config  # noqa: E402
 from heart.cli import main as cli_main  # noqa: E402
 from heart.detect import detect_verifiers  # noqa: E402
-from heart.episode import best_episode, run_candidates, run_episode  # noqa: E402
+from heart.episode import (  # noqa: E402
+    DEFAULT_ROLES, best_episode, run_candidates, run_episode)
 from heart.export import export_episodes  # noqa: E402
 from heart.taskspec import TaskSpec, Verifier  # noqa: E402
+from heart.verify import compare_baseline  # noqa: E402
 from heart.training import datasets  # noqa: E402
 from heart.verify import check_task  # noqa: E402
 
@@ -202,16 +204,28 @@ class TestHeart(unittest.TestCase):
         self.assertEqual(_claude_envelope(two)["result"], "second")
 
     def test_role_pipeline(self):
+        # `agent` pins the reviewer; without it a review role rotates to another
+        # model family, which is the point but not what this test measures.
         roles = [
             {"name": "implement", "memory": "normal", "prompt": "{prompt}"},
-            {"name": "review", "memory": "readonly",
+            {"name": "review", "memory": "readonly", "agent": "shell",
              "prompt": "echo reviewing; echo APPROVE looks-correct"},
         ]
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
         self.assertEqual(ep["outcome"], "pass")
         self.assertEqual(ep["review_verdict"], "approve")
-        self.assertEqual([r["role"] for r in ep["roles"]], ["implement", "review"])
+        # the review stage is numbered: one analysis, possibly repeated
+        self.assertEqual([r["role"] for r in ep["roles"]], ["implement", "review.1"])
         self.assertEqual(ep["roles"][1]["memory"], "readonly")
+
+    def test_a_prompt_without_findings_falls_back_to_the_verdict_word(self):
+        # a --roles file written before findings existed keeps working: no JSON
+        # means the legacy APPROVE/REJECT read, not a silent approval.
+        roles = [{"name": "implement", "prompt": "{prompt}"},
+                 {"name": "review", "agent": "shell", "prompt": "echo REJECT nope"}]
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
+        self.assertEqual(ep["review_verdict"], "reject")
+        self.assertEqual(ep["review_findings"], [])
 
     def test_detect_verifiers(self):
         names = [v.name for v in detect_verifiers(self.root / "toyrepo")]
@@ -350,28 +364,45 @@ class TestHeart(unittest.TestCase):
         # reviewer rejects once, then approves on re-review after the fix;
         # the recorded verdict must be the post-fix one or --apply blocks forever
         marker = self.root / "reviewed-once"
+        blocker = ('{"findings":[{"severity":"blocker","file":"calc.py",'
+                   '"line":2,"claim":"needs work"}]}')
         roles = [
             {"name": "implement", "prompt": "{prompt}"},
-            {"name": "review",
-             "prompt": f"if [ -f {marker} ]; then echo APPROVE ok; "
-                       f"else touch {marker}; echo REJECT needs-work; fi"},
+            {"name": "review", "agent": "shell",
+             "prompt": f"if [ -f {marker} ]; then echo '{{\"findings\":[]}}'; "
+                       f"else touch {marker}; echo '{blocker}'; fi"},
         ]
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs,
                          roles=roles, fix_rounds=1)
-        self.assertIn("review-fix", [r["role"] for r in ep["roles"]])
-        self.assertIn("review2", [r["role"] for r in ep["roles"]])
-        self.assertEqual(ep["review_verdict"], "approve")
+        # a blocker sends the diff to resolve, then to a confirm stage that reads
+        # the findings and the claims rather than re-reviewing cold
+        self.assertIn("review-fix.1", [r["role"] for r in ep["roles"]])
+        self.assertIn("review-confirm.2", [r["role"] for r in ep["roles"]])
         self.assertEqual(ep["verify_rounds"][-1]["passed"], True)  # re-verified after fix
         self.assertEqual(ep["outcome"], "pass")
 
     def test_review_reject_sticks_when_rereview_rejects(self):
+        blocker = ('{"findings":[{"severity":"blocker","file":"calc.py",'
+                   '"line":2,"claim":"still broken"}]}')
         roles = [
             {"name": "implement", "prompt": "{prompt}"},
-            {"name": "review", "prompt": "echo REJECT needs-work"},
+            {"name": "review", "agent": "shell", "prompt": f"echo '{blocker}'"},
         ]
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs,
                          roles=roles, fix_rounds=1)
         self.assertEqual(ep["review_verdict"], "reject")
+
+    def test_a_concern_records_without_blocking(self):
+        # the old shape threw away everything an APPROVE noticed; severity is
+        # now the gate, so a non-blocking finding survives the approval.
+        note = ('{"findings":[{"severity":"concern","file":"calc.py","line":2,'
+                '"claim":"no docstring"}]}')
+        roles = [{"name": "implement", "prompt": "{prompt}"},
+                 {"name": "review", "agent": "shell", "prompt": f"echo '{note}'"}]
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
+        self.assertEqual(ep["review_verdict"], "approve")
+        self.assertEqual([f["severity"] for f in ep["review_findings"]], ["concern"])
+        self.assertNotIn("review-fix.1", [r["role"] for r in ep["roles"]])
 
     def test_consume_steer_helper(self):
         from heart.episode import _consume_steer
@@ -1872,6 +1903,257 @@ class TestPulseServe(unittest.TestCase):
                 os.environ.pop("EVENT_JOURNAL_DIR", None)
             else:
                 os.environ["EVENT_JOURNAL_DIR"] = old_journal
+
+
+class TestUnrestrictedTasksStayUnrestricted(unittest.TestCase):
+    """An empty allowed_paths means no restriction. A role that declares its own
+    paths must not turn that into a restriction -- doing so made every pipeline
+    run score path_violation for editing the file it was told to edit, while the
+    same task run solo passed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.head = make_repo(self.root)
+        self.repo = str(self.root / "toyrepo")
+        self.runs = str(self.root / "runs")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _task(self, **kw):
+        return TaskSpec(
+            task_id="scope", repo_path=self.repo, base_commit=self.head,
+            prompt=FIX_CMD, timeout_seconds=60,
+            public_verifiers=[Verifier(name="t", command="python3 -m pytest -q")],
+            **kw)
+
+    def test_role_paths_do_not_invent_a_lane(self):
+        ep = run_episode(self._task(), agent="shell", roles=DEFAULT_ROLES,
+                         runs_dir=self.runs)
+        self.assertNotEqual(ep["outcome"], "path_violation")
+
+    def test_a_declared_lane_is_still_enforced(self):
+        ep = run_episode(self._task(allowed_paths=["docs"]), agent="shell",
+                         roles=DEFAULT_ROLES, runs_dir=self.runs)
+        self.assertEqual(ep["outcome"], "path_violation")
+
+
+class TestGitignoredIntegrationFiles(unittest.TestCase):
+    """heart copies .claude/.arteries into every worktree, and most real repos
+    gitignore both. `git add -A -- . :(exclude).claude` then exits 1, because the
+    `.` names an ignored path and the exclude does not suppress that check --
+    so every commit failed on any repo with a .gitignore, and on Path B the
+    exception escaped and killed the whole orchestration."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.head = make_repo(self.root)
+        self.repo = self.root / "toyrepo"
+        (self.repo / ".gitignore").write_text(".claude/\n.arteries/\n.env\n")
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "add gitignore"], check=True)
+        self.head = subprocess.run(
+            [*git[:3], "rev-parse", "HEAD"], capture_output=True, text=True,
+            check=True).stdout.strip()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_commit_survives_gitignored_integration_dirs(self):
+        from heart.env import Workspace
+        ws = Workspace(str(self.repo), self.head)
+        try:
+            (ws.path / ".claude").mkdir(exist_ok=True)
+            (ws.path / ".claude" / "settings.json").write_text("{}")
+            (ws.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+            sha = ws.commit("heart test")
+            self.assertIsNotNone(sha)
+            files = subprocess.run(
+                ["git", "-C", str(ws.path), "show", "--name-only", "--format=", sha],
+                capture_output=True, text=True, check=True).stdout.split()
+            self.assertIn("calc.py", files)
+            self.assertNotIn(".claude/settings.json", files)
+        finally:
+            ws.destroy()
+
+    def test_an_ignored_secret_never_reaches_the_commit(self):
+        # the reason `git add -f` is not the fix: it would stage every ignored
+        # file the excludes do not name, .env included.
+        from heart.env import Workspace
+        ws = Workspace(str(self.repo), self.head)
+        try:
+            (ws.path / ".env").write_text("API_KEY=sk-live-not-a-real-key\n")
+            (ws.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+            sha = ws.commit("heart test")
+            files = subprocess.run(
+                ["git", "-C", str(ws.path), "show", "--name-only", "--format=", sha],
+                capture_output=True, text=True, check=True).stdout.split()
+            self.assertIn("calc.py", files)
+            self.assertNotIn(".env", files)
+        finally:
+            ws.destroy()
+
+
+class TestReviewPhase(unittest.TestCase):
+    """The loop itself, with the agent turns injected. The confirm stage has its
+    own prompt by design, so a shell `reviewer` cannot script a verdict flip --
+    which is why the round trip is tested here rather than through an episode."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _writer(self, scripted):
+        def turn(name, prompt):
+            self.calls.append((name, prompt))
+            log = self.out / f"{name}.log"
+            log.write_text(scripted.get(name, ""))
+            return log
+        return turn
+
+    def test_a_resolved_blocker_flips_the_verdict(self):
+        from heart import review
+        blocker = ('{"findings":[{"severity":"blocker","file":"a.py","line":1,'
+                   '"claim":"drops only one index"}]}')
+        turn = self._writer({
+            "review.1": blocker,
+            "review-fix.1": '[{"id":0,"status":"fixed","how":"query pg_index"}]',
+            "review-confirm.2": '{"findings":[]}',
+        })
+        r = review.phase("do the thing", assess=turn, resolve=turn,
+                         verify=lambda: None, legacy_verdict=lambda p: None)
+        self.assertEqual(r.verdict, "approve")
+        self.assertEqual(r.rounds, 2)
+        self.assertEqual([n for n, _ in self.calls],
+                         ["review.1", "review-fix.1", "review-confirm.2"])
+
+    def test_the_fixer_is_handed_every_finding_not_a_log_tail(self):
+        # the defect this replaces: review.log[-1500:] cut a 3471-char review at
+        # char 1971, and the blocker sat at char 13.
+        from heart import review
+        blocker = ('{"findings":[{"severity":"blocker","file":"a.py","line":1,'
+                   '"claim":"THE BLOCKER"},{"severity":"note","claim":"cosmetic"}]}')
+        turn = self._writer({"review.1": blocker, "review-confirm.2": '{"findings":[]}'})
+        review.phase("t", assess=turn, resolve=turn, verify=lambda: None,
+                     legacy_verdict=lambda p: None)
+        fix_prompt = next(p for n, p in self.calls if n == "review-fix.1")
+        self.assertIn("THE BLOCKER", fix_prompt)
+        self.assertIn("cosmetic", fix_prompt)
+
+    def test_confirm_is_told_what_was_claimed(self):
+        from heart import review
+        turn = self._writer({
+            "review.1": '{"findings":[{"severity":"blocker","claim":"X broken"}]}',
+            "review-fix.1": '[{"id":0,"status":"fixed","how":"rewrote X"}]',
+            "review-confirm.2": '{"findings":[]}',
+        })
+        review.phase("t", assess=turn, resolve=turn, verify=lambda: None,
+                     legacy_verdict=lambda p: None)
+        confirm = next(p for n, p in self.calls if n == "review-confirm.2")
+        self.assertIn("X broken", confirm)
+        self.assertIn("rewrote X", confirm)
+
+    def test_an_unfixed_blocker_stops_at_the_round_budget(self):
+        from heart import review
+        blocker = '{"findings":[{"severity":"blocker","claim":"still broken"}]}'
+        turn = self._writer({"review.1": blocker, "review-confirm.2": blocker})
+        r = review.phase("t", assess=turn, resolve=turn, verify=lambda: None,
+                         legacy_verdict=lambda p: None, rounds=1)
+        self.assertEqual(r.verdict, "reject")
+        self.assertEqual([n for n, _ in self.calls],
+                         ["review.1", "review-fix.1", "review-confirm.2"])
+
+    def test_rounds_zero_assesses_without_ever_resolving(self):
+        from heart import review
+        turn = self._writer(
+            {"review.1": '{"findings":[{"severity":"blocker","claim":"x"}]}'})
+        r = review.phase("t", assess=turn, resolve=turn, verify=lambda: None,
+                         legacy_verdict=lambda p: None, rounds=0)
+        self.assertEqual(r.verdict, "reject")
+        self.assertEqual([n for n, _ in self.calls], ["review.1"])
+
+    def test_no_json_falls_back_and_says_so(self):
+        from heart import review
+        turn = self._writer({"review.1": "looks fine to me, APPROVE"})
+        r = review.phase("t", assess=turn, resolve=turn, verify=lambda: None,
+                         legacy_verdict=lambda p: "approve")
+        self.assertTrue(r.fell_back)
+        self.assertEqual(r.verdict, "approve")
+        self.assertEqual(r.findings, [])
+
+
+class TestProbesAndBaselines(unittest.TestCase):
+    """Preconditions measured before planning, and criteria judged against base."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.commit = make_repo(self.root)
+        self.runs = self.root / "runs"
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
+        os.environ["HEART_INGEST"] = "off"
+        self.task = TaskSpec(
+            task_id="probe-toy",
+            repo_path=str(self.root / "toyrepo"),
+            base_commit=self.commit,
+            prompt=FIX_CMD,
+            public_verifiers=[Verifier(name="unit",
+                                       command="python3 -m unittest -q test_calc")],
+            timeout_seconds=60,
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, **over):
+        return run_episode(TaskSpec(**{**self.task.__dict__, **over}),
+                           agent="shell", runs_dir=self.runs)
+
+    def test_failing_probe_blocks_before_the_agent_runs(self):
+        ep = self._run(probes=[Verifier(name="pgvector", command="exit 3")])
+        self.assertEqual(ep["outcome"], "blocked")
+        self.assertIsNone(ep["reward"]["total"])
+        self.assertIn("precondition not met", ep["blocked_reason"])
+        # the whole point: nothing was spent
+        self.assertEqual(ep["roles"], [])
+        self.assertEqual(ep["diff_lines"], 0)
+
+    def test_passing_probe_hands_its_measurement_to_the_agent(self):
+        ep = self._run(probes=[Verifier(name="version", command="echo 0.8.6")])
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertIn("Measured environment", ep["prompt"])
+        self.assertIn("0.8.6", ep["prompt"])
+
+    def test_baseline_identical_fails_when_the_output_moved(self):
+        ep = self._run(public_verifiers=[
+            Verifier(name="unit", command="python3 -m unittest -q test_calc"),
+            Verifier(name="answers", command="cat calc.py", baseline="identical")])
+        self.assertEqual(ep["outcome"], "fail")   # unit passed; the criterion did not
+        answers = ep["verifier_results"]["answers"]
+        self.assertTrue(answers["exit_code"] == 0)
+        self.assertFalse(answers["passed"])       # the comparison overrides the exit
+        self.assertFalse(answers["baseline"]["passed"])
+
+    def test_baseline_no_worse_accepts_an_unchanged_measurement(self):
+        ep = self._run(public_verifiers=[
+            Verifier(name="recall", command="echo recall 0.955", baseline="no_worse")])
+        self.assertEqual(ep["outcome"], "pass")
+        self.assertIn(">= base", ep["verifier_results"]["recall"]["baseline"]["detail"])
+
+    def test_compare_baseline_refuses_what_it_cannot_read(self):
+        self.assertFalse(compare_baseline("no_worse", "nothing", "numeric")[0])
+        self.assertFalse(compare_baseline("bogus", "1", "1")[0])
+        # the last number is the answer, and latency gates the other way
+        self.assertTrue(compare_baseline("no_worse", "ran 5 recall 0.94", "ran 5 recall 0.96")[0])
+        self.assertTrue(compare_baseline("no_more", "p50 1402", "p50 1397")[0])
+        self.assertFalse(compare_baseline("no_more", "p50 1402", "p50 1900")[0])
 
 
 if __name__ == "__main__":
