@@ -125,8 +125,106 @@ def test_reasoning_body():
             os.environ["HEART_API_REASONING"] = old
 
 
+def test_default_is_the_servers_parallelism_not_unbounded():
+    """The default was 0, meaning no cap, against a server that answers two
+    requests at a time and queues the rest invisibly -- a queued request looks
+    exactly like a slow one. heart admitted up to _GATE's eight, so six waited
+    inside llama.cpp where nothing here could see them.
+    """
+    from heart.runner import DEFAULT_LOCAL_SLOTS, _default_local_slots, _slots_cache
+
+    _slots_cache.clear()
+    assert DEFAULT_LOCAL_SLOTS >= 1
+    assert _default_local_slots(None) == DEFAULT_LOCAL_SLOTS
+
+
+def test_an_unreachable_server_falls_back_rather_than_uncapping():
+    """A server that will not answer has unknown parallelism. Guessing the
+    default beats guessing "unlimited", which is what 0 meant."""
+    from heart.runner import DEFAULT_LOCAL_SLOTS, _default_local_slots, _slots_cache
+
+    _slots_cache.clear()
+    assert _default_local_slots("http://127.0.0.1:9/v1") == DEFAULT_LOCAL_SLOTS
+
+
+def test_the_server_is_asked_once_per_endpoint():
+    """One probe per endpoint per process, not one per agent spawn."""
+    from heart.runner import _default_local_slots, _slots_cache
+
+    _slots_cache.clear()
+    _default_local_slots("http://127.0.0.1:9/v1")
+    before = dict(_slots_cache)
+    _default_local_slots("http://127.0.0.1:9/v1")
+    assert _slots_cache == before and len(before) == 1
+
+
+def test_an_explicit_setting_still_wins():
+    from heart.runner import _local_slot
+
+    old = os.environ.get("HEART_LOCAL_SLOTS")
+    os.environ["HEART_LOCAL_SLOTS"] = "0"
+    try:
+        # 0 means "no cap" when asked for explicitly; the change is only to what
+        # *unset* means, so anyone who deliberately turned this off stays off.
+        with _local_slot("http://127.0.0.1:8001/v1"):
+            pass
+    finally:
+        if old is None:
+            os.environ.pop("HEART_LOCAL_SLOTS", None)
+        else:
+            os.environ["HEART_LOCAL_SLOTS"] = old
+
+
+def test_a_live_server_is_reachable():
+    from heart.runner import _endpoint_reachable
+
+    # Skipped rather than failed when nothing is running: a test that needs a
+    # GPU box up is not a test anyone can run on a laptop.
+    if not _endpoint_reachable("http://127.0.0.1:8001/v1"):
+        return
+    assert _endpoint_reachable("http://127.0.0.1:8001/v1")
+
+
+def test_a_dead_port_is_not_reachable():
+    from heart.runner import _endpoint_reachable
+
+    assert not _endpoint_reachable("http://127.0.0.1:9/v1")
+
+
+def test_a_broken_probe_does_not_block_work():
+    """A liveness check that blocks when the check itself is broken is worse
+    than no check: the failure it prevents is one slow episode, the failure it
+    would introduce is every episode."""
+    from unittest.mock import patch
+
+    from heart.runner import _endpoint_reachable
+
+    with patch("urllib.request.urlopen", side_effect=ValueError("something odd")):
+        assert _endpoint_reachable("http://127.0.0.1:8001/v1")
+
+
+def test_a_non_200_answer_still_counts_as_listening():
+    """Something is answering, which is the question being asked."""
+    import urllib.error
+    from unittest.mock import patch
+
+    from heart.runner import _endpoint_reachable
+
+    err = urllib.error.HTTPError("u", 503, "busy", {}, None)
+    with patch("urllib.request.urlopen", side_effect=err):
+        assert _endpoint_reachable("http://127.0.0.1:8001/v1")
+
+
 if __name__ == "__main__":
     test_locality()
+    test_a_live_server_is_reachable()
+    test_a_dead_port_is_not_reachable()
+    test_a_broken_probe_does_not_block_work()
+    test_a_non_200_answer_still_counts_as_listening()
+    test_default_is_the_servers_parallelism_not_unbounded()
+    test_an_unreachable_server_falls_back_rather_than_uncapping()
+    test_the_server_is_asked_once_per_endpoint()
+    test_an_explicit_setting_still_wins()
     test_pool_serializes()
     test_pool_two_slots_overlap()
     test_pricing_local_free()
