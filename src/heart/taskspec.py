@@ -11,6 +11,14 @@ from pathlib import Path
 class Verifier:
     name: str
     command: str
+    # How to judge this verifier's stdout against the same command run at
+    # base_commit. "" (default) judges the exit code alone, as verifiers always
+    # have. "identical" demands byte-identical stdout; "no_worse" reads the
+    # last float in each and demands head >= base, "no_more" head <= base. Both exist because the criteria
+    # that actually gate a change -- recall, latency, index size -- have no
+    # meaning as a single number: they are only ever better or worse than what
+    # was there before, and a pass/fail verifier cannot say which.
+    baseline: str = ""
 
 
 @dataclass
@@ -22,6 +30,14 @@ class TaskSpec:
     # allowed_paths: empty list means no restriction. denied_paths always wins.
     allowed_paths: list[str] = field(default_factory=list)
     denied_paths: list[str] = field(default_factory=list)
+    # Environment facts measured at base_commit BEFORE any agent runs. Each
+    # probe does two jobs from one command: a non-zero exit blocks the episode
+    # (reward None -- nothing was attempted, so there is nothing to score), and
+    # its stdout is handed to the agent as measured fact. The second job is the
+    # point. A plan written against an assumed extension version, an absent
+    # binary or a group membership nobody has is wrong before the first token,
+    # and the assumption used to be tested only by the agent failing.
+    probes: list[Verifier] = field(default_factory=list)
     public_verifiers: list[Verifier] = field(default_factory=list)
     hidden_verifiers: list[Verifier] = field(default_factory=list)
     # files pinned into every workspace regardless of base_commit (path -> content):
@@ -44,6 +60,12 @@ class TaskSpec:
     # "PLEXUS_BLOCKED:". Seeing it makes the episode `blocked` — the agent chose
     # not to guess. Heart supplies the mechanism; the vocabulary is the caller's.
     blocked_marker: str | None = None
+    # Which network the sandbox gets: "none" (default), "model" for the local
+    # model servers, "build" when the task genuinely has to reach a package
+    # registry. Default-deny because a task that cannot reach the network cannot
+    # exfiltrate, and enforcing that costs nothing. Everything else about the
+    # sandbox is derived from fields above -- see sandbox.profile_for.
+    network: str = "none"
 
 
 def load_task(path: str | Path) -> TaskSpec:
@@ -52,7 +74,7 @@ def load_task(path: str | Path) -> TaskSpec:
     missing = [k for k in ("task_id", "repo_path", "base_commit", "prompt") if not data.get(k)]
     if missing:
         raise ValueError(f"{path}: missing required fields {missing}")
-    for key in ("public_verifiers", "hidden_verifiers"):
+    for key in ("probes", "public_verifiers", "hidden_verifiers"):
         data[key] = [Verifier(**v) for v in data.get(key, [])]
     known = {f.name for f in dataclasses.fields(TaskSpec)}
     return TaskSpec(**{k: v for k, v in data.items() if k in known})

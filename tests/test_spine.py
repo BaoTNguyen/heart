@@ -103,16 +103,16 @@ class TestEnvPropagation(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.commit = self._make_repo(self.root)
         self.runs = self.root / "runs"
-        self._old_spool = os.environ.get("HEART_SPOOL_DIR")
-        os.environ["HEART_SPOOL_DIR"] = str(self.root / "spool")
+        self._old_journal = os.environ.get("EVENT_JOURNAL_DIR")
+        os.environ["EVENT_JOURNAL_DIR"] = str(self.root / "journal")
         self._old_ingest = os.environ.get("HEART_INGEST")
         os.environ["HEART_INGEST"] = "off"
 
     def tearDown(self):
-        if self._old_spool is None:
-            os.environ.pop("HEART_SPOOL_DIR", None)
+        if self._old_journal is None:
+            os.environ.pop("EVENT_JOURNAL_DIR", None)
         else:
-            os.environ["HEART_SPOOL_DIR"] = self._old_spool
+            os.environ["EVENT_JOURNAL_DIR"] = self._old_journal
         if self._old_ingest is None:
             os.environ.pop("HEART_INGEST", None)
         else:
