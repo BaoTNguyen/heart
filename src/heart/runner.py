@@ -15,6 +15,7 @@ import threading
 import time
 from functools import lru_cache
 from pathlib import Path
+import urllib.error
 from urllib.parse import urlsplit
 
 from . import agents_api
@@ -102,6 +103,82 @@ def _global_slot():
         yield
 
 
+# A local model server answers `--parallel N` requests at once and queues the
+# rest, invisibly: a queued request looks exactly like a slow one, with no error
+# and no way to shed it. Defaulting this to 0 meant heart admitted as many agents
+# as _GATE allowed -- 8 -- against a server with 2 slots, so six of them waited
+# inside llama.cpp where nothing here could see them. arteries measured the
+# result as a 44% generation failure rate.
+#
+# 2 because that is what llama-server is started with. Not a tuning knob to
+# raise when things feel slow: raising it does not create a third slot, it only
+# moves the queue somewhere less visible.
+DEFAULT_LOCAL_SLOTS = 2
+
+
+_slots_cache: dict[str, int] = {}
+
+
+def _default_local_slots(endpoint: str | None = None) -> int:
+    """The server's real parallelism, asked once per endpoint.
+
+    Asking beats hardcoding the same number in two repos. llama.cpp's /slots
+    returns one object per slot, so a server started with a different --parallel
+    is matched rather than guessed at. /health only says "ok", which is why this
+    reads /slots instead.
+
+    Any failure means DEFAULT_LOCAL_SLOTS. A server that will not answer is one
+    whose parallelism is unknown, and guessing 2 is better than guessing none --
+    the default this replaces was "unbounded", which is how six agents ended up
+    queued inside llama.cpp where nothing could see them.
+    """
+    if not endpoint:
+        return DEFAULT_LOCAL_SLOTS
+    key = urlsplit(endpoint).netloc or endpoint
+    if key in _slots_cache:
+        return _slots_cache[key]
+
+    slots = DEFAULT_LOCAL_SLOTS
+    try:
+        import json as _json
+        import urllib.request
+
+        base = f"{urlsplit(endpoint).scheme or 'http'}://{key}"
+        with urllib.request.urlopen(f"{base}/slots", timeout=1.0) as resp:
+            reported = _json.load(resp)
+        if isinstance(reported, list) and reported:
+            slots = len(reported)
+    except Exception:
+        pass
+    _slots_cache[key] = slots
+    return slots
+
+
+def _endpoint_reachable(endpoint: str, timeout: float = 1.0) -> bool:
+    """Whether a local model server is answering at all.
+
+    Never raises, and treats anything unexpected as reachable. A liveness check
+    that blocks work when the check itself is broken is worse than no check --
+    the failure it exists to prevent is one slow episode, and the failure it
+    would introduce is every episode.
+    """
+    try:
+        import urllib.request
+
+        parts = urlsplit(endpoint)
+        base = f"{parts.scheme or 'http'}://{parts.netloc}"
+        with urllib.request.urlopen(f"{base}/health", timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError:
+        # Answering, just not with 200. Something is listening, which is the
+        # question being asked.
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
+    except Exception:
+        return True
+
+
 @contextlib.contextmanager
 def _local_slot(endpoint: str | None):
     """Cross-process cap on concurrent agents hitting one local model server,
@@ -113,9 +190,10 @@ def _local_slot(endpoint: str | None):
     independent pools — each GPU is bounded on its own, and HEART_LOCAL_SLOTS is
     the per-server ceiling. One server spanning both GPUs (tensor-parallel vLLM
     on a single port) is a single pool, which is also correct: it's one queue.
-    Non-local or unset -> no-op.
+    Non-local -> no-op. Unset now means DEFAULT_LOCAL_SLOTS rather than off:
+    "no limit" is the wrong default for a resource that has a hard one.
     """
-    n = int(os.environ.get("HEART_LOCAL_SLOTS", "0") or 0)
+    n = int(os.environ.get("HEART_LOCAL_SLOTS", "") or _default_local_slots(endpoint))
     if not endpoint or n <= 0:
         yield
         return
@@ -730,6 +808,17 @@ def run_agent(
                 local_endpoint = ep
         except Exception:
             local_endpoint = None
+    # A local server that is down does not fail fast: the agent starts, works,
+    # reaches for a model, and dies on connection after however long its own
+    # timeout is -- producing an empty diff and an episode that reads as "the
+    # agent did nothing", which is the misattribution the scope work exists to
+    # stop. One probe answers it before anything is spawned. arteries makes the
+    # same check before claiming rows, for the same reason.
+    if local_endpoint and not _endpoint_reachable(local_endpoint):
+        raise RuntimeError(
+            f"local model server at {urlsplit(local_endpoint).netloc} is not "
+            "answering; not spawning an agent that has nothing to talk to")
+
     t0 = time.monotonic()
     timed_out = False
     with _GATE, _global_slot(), _local_slot(local_endpoint), open(log_path, "w") as log:
