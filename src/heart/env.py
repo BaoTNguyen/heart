@@ -42,6 +42,25 @@ def _force_rmtree(path: Path) -> bool:
     return not path.exists()
 
 
+def _lock_is_held(lock: Path) -> bool:
+    """Whether some process holds this lock file.
+
+    Split out of `_is_live` because the two callers ask about different things:
+    that one is handed a worktree directory, this one a bare lock whose directory
+    does not exist yet. Same test, and a lock that cannot be opened is not held
+    by anyone this process needs to respect.
+    """
+    try:
+        with open(lock, "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    except Exception:
+        return False
+
+
 def _lock_path(worktree: Path) -> Path:
     """The liveness lock for a worktree, beside it rather than inside it.
 
@@ -143,16 +162,40 @@ def reclaim(repo: str | Path | None = None, older_than: float | None = None) -> 
         removed += 1
         if source:
             repos.add(source)
-    # a lock whose worktree is gone is litter: the tree was removed by
-    # something that did not know about the lock (an older heart, a manual rm)
+    # A lock whose worktree is gone is usually litter -- the tree was removed by
+    # something that did not know about the lock (an older heart, a manual rm).
+    #
+    # But it is also exactly what a workspace being born looks like. Workspace
+    # creates its lock *before* `git worktree add` creates the directory, on
+    # purpose, so a reclaim running alongside can tell live from leaked. Deleting
+    # the lock in that window takes away the newborn's only liveness signal, and
+    # the next sweep then finds a directory with no lock, calls it reclaimable,
+    # and removes it out from under git:
+    #
+    #     error: unable to create file src/heart/serve.py: No such file
+    #     fatal: cannot create directory at 'src/heart/training'
+    #
+    # Measured on three concurrent sessions: one of the three died that way.
+    #
+    # So litter is a lock nobody holds, not a lock without a directory. That is
+    # the same question _is_live asks, and it closes the window completely,
+    # because the flock is taken before the directory exists.
     for lock in ws_root.glob("*.lock"):
-        if not (ws_root / lock.name[:-len(".lock")]).exists():
-            lock.unlink(missing_ok=True)
+        if (ws_root / lock.name[:-len(".lock")]).exists():
+            continue
+        if _lock_is_held(lock):
+            continue                    # a workspace mid-creation, not litter
+        lock.unlink(missing_ok=True)
     # one prune per repo, not one `git worktree remove` per leak: prune is what
     # deregisters a worktree whose directory is gone, and the per-leak removal
     # it replaces cost a subprocess each (measured ~11x on 20 worktrees).
     for source in repos:
-        subprocess.run(["git", "-C", source, "worktree", "prune"], capture_output=True)
+        # Under the same lock Workspace takes for `worktree add`. Both mutate
+        # .git/worktrees, and a prune landing inside another session's add is the
+        # second way three concurrent sessions can break one of them.
+        with _worktree_lock(source):
+            subprocess.run(["git", "-C", source, "worktree", "prune"],
+                           capture_output=True)
     return removed
 
 
