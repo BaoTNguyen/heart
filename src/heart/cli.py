@@ -142,6 +142,7 @@ def cmd_work(args) -> int:
         # legitimate dep tasks touch lockfiles.
         denied_paths=[".github/workflows/"],
         public_verifiers=verifiers, timeout_seconds=args.timeout,
+        network=args.network,
     )
     if getattr(args, "orchestrate", False):
         # Path B: decompose into parallel routed workers, git-merge, verify. Falls
@@ -518,6 +519,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--solo", action="store_true", help="single agent, no role pipeline")
     p.add_argument("--verify", default=None, help="verifier command (else auto-detected)")
     p.add_argument("--timeout", type=int, default=600, help="per-role timeout seconds")
+    # A task spec read from a file has always been able to say this; `work`
+    # builds its spec here and had no way to. Under HEART_SANDBOX that made
+    # `work --agent api` refuse every time -- the runner says to set network
+    # "api" or "model", and nothing could. Default stays "none", because
+    # default-deny is the point of the field.
+    p.add_argument("--network", default="none", choices=("none", "model", "api"),
+                   help="sandbox network: none (default), model (local server), "
+                        "api (vendor endpoints)")
     p.add_argument("--apply", action="store_true", help="apply diff to the repo if pass+approve")
     p.add_argument("--allow-large", action="store_true",
                     help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
