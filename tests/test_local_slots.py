@@ -263,6 +263,9 @@ if __name__ == "__main__":
     test_the_model_pool_is_not_named_after_this_repo()
     test_agent_slots_stay_heart_specific()
     test_the_pool_path_matches_what_arteries_computes()
+    test_a_stale_sandbox_image_is_reported_with_the_fix()
+    test_a_missing_sandbox_image_says_to_build_it()
+    test_a_current_image_is_not_flagged()
     test_a_live_server_is_reachable()
     test_a_dead_port_is_not_reachable()
     test_a_broken_probe_does_not_block_work()
@@ -276,3 +279,46 @@ if __name__ == "__main__":
     test_pricing_local_free()
     test_reasoning_body()
     print("ok")
+
+
+def test_a_stale_sandbox_image_is_reported_with_the_fix():
+    """The Dockerfile gained the plugin's lock directory and the image was never
+    rebuilt. Every sandboxed run then failed on
+
+        touch: cannot touch '/home/agent/.docker/sandbox/locks/detached.lock'
+
+    which names a path inside a container rather than "your image is older than
+    the file describing it". Ten tests failed for two weeks and read as a plugin
+    incompatibility.
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from heart.sandbox import image_is_stale
+
+    # A Dockerfile touched into the future stands in for one edited after the
+    # build, without rebuilding anything to test it.
+    with tempfile.TemporaryDirectory() as tmp:
+        dockerfile = Path(tmp) / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        os.utime(dockerfile, (2 ** 31 - 1, 2 ** 31 - 1))
+        reason = image_is_stale(dockerfile=dockerfile)
+        assert reason is not None, "a future-dated Dockerfile should read as stale"
+        assert "docker build" in reason, reason
+
+
+def test_a_missing_sandbox_image_says_to_build_it():
+    from heart.sandbox import image_is_stale
+
+    reason = image_is_stale("heart-agent:definitely-not-built")
+    assert reason and "does not exist" in reason, reason
+
+
+def test_a_current_image_is_not_flagged():
+    """Guards against the check crying wolf, which would be worse than silence:
+    a sandbox that refuses to start is a harder failure than one that starts
+    stale."""
+    from heart.sandbox import image_is_stale
+
+    assert image_is_stale() is None, image_is_stale()

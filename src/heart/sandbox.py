@@ -221,6 +221,65 @@ class SandboxProfile:
         return args
 
 
+def image_is_stale(image: str | None = None,
+                   dockerfile: Path | None = None) -> str | None:
+    """A reason the sandbox image predates its Dockerfile, or None.
+
+    This exists because of how the sandbox broke and how long it took to work
+    out. The Dockerfile gained `/home/agent/.docker/sandbox/locks` -- which the
+    docker-sbx plugin requires of a template -- and the image was never rebuilt.
+    Every sandboxed run then failed with
+
+        create lock file: touch: cannot touch
+        '/home/agent/.docker/sandbox/locks/detached.lock': No such file
+
+    which points at a path inside a container rather than at "your image is two
+    weeks older than the file that describes it". Ten tests failed for two weeks
+    and read as a plugin incompatibility; the diagnosis that finally landed was
+    `docker images --format {{.CreatedSince}}` against `git log -1 Dockerfile`.
+
+    Timestamps, not a content hash of the build context. A hash would be exact
+    and would also mean rebuilding on any change to any copied file, which is
+    not what is being asked: the question is whether the recipe changed after the
+    cake was baked.
+    """
+    import json
+    import subprocess
+
+    image = image or os.getenv("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
+    dockerfile = dockerfile or (Path(__file__).resolve().parent.parent.parent
+                                / "Dockerfile")
+    if not dockerfile.is_file():
+        return None
+
+    try:
+        out = subprocess.run(["docker", "image", "inspect", image,
+                              "--format", "{{json .Created}}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return (f"sandbox image {image!r} does not exist. Build it:\n"
+                f"    docker build -t {image} {dockerfile.parent}")
+
+    try:
+        import datetime as _dt
+
+        created = _dt.datetime.fromisoformat(
+            json.loads(out.stdout.strip()).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    built = created.timestamp()
+    changed = dockerfile.stat().st_mtime
+    if changed <= built:
+        return None
+    age_days = (changed - built) / 86400
+    return (f"sandbox image {image!r} was built before its Dockerfile changed "
+            f"({age_days:.1f} days behind). Rebuild it:\n"
+            f"    docker build -t {image} {dockerfile.parent}")
+
+
 def profile_for(
     task: TaskSpec,
     workspace: str | Path,
