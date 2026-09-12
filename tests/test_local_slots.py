@@ -266,6 +266,10 @@ if __name__ == "__main__":
     test_a_stale_sandbox_image_is_reported_with_the_fix()
     test_a_missing_sandbox_image_says_to_build_it()
     test_a_current_image_is_not_flagged()
+    test_work_can_say_which_network_the_sandbox_gets()
+    test_the_network_default_is_still_deny()
+    test_a_newborn_workspace_lock_is_not_litter()
+    test_prune_runs_under_the_same_lock_as_worktree_add()
     test_a_live_server_is_reachable()
     test_a_dead_port_is_not_reachable()
     test_a_broken_probe_does_not_block_work()
@@ -322,3 +326,102 @@ def test_a_current_image_is_not_flagged():
     from heart.sandbox import image_is_stale
 
     assert image_is_stale() is None, image_is_stale()
+
+
+def _work_help() -> str:
+    """`heart work --help`, captured.
+
+    The parser is built inside main() and there is nothing to import, so this
+    goes through the same door a user does rather than refactoring the CLI for a
+    test's convenience.
+    """
+    import contextlib
+    import io
+
+    from heart.cli import main
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):
+        main(["work", "--help"])
+    return out.getvalue()
+
+
+def test_work_can_say_which_network_the_sandbox_gets():
+    """A spec read from a file could always set this; `heart work` builds its
+    spec in code and could not. Under HEART_SANDBOX that made `work --agent api`
+    refuse every time -- the runner's error says to set network "api" or "model"
+    and there was no way to do it.
+    """
+    help_text = _work_help()
+    assert "--network" in help_text, help_text
+    for choice in ("none", "model", "api"):
+        assert choice in help_text, choice
+
+
+def test_the_network_default_is_still_deny():
+    """Default-deny is the point of the field: a task that cannot reach the
+    network cannot exfiltrate through it."""
+    import inspect
+
+    from heart import cli
+
+    source = inspect.getsource(cli.main)
+    assert '"--network", default="none"' in source, "the default stopped being none"
+
+
+def test_a_newborn_workspace_lock_is_not_litter():
+    """A lock with no directory is what a workspace being born looks like.
+
+    Workspace creates its lock *before* `git worktree add` creates the directory,
+    so a reclaim running alongside can tell live from leaked. The litter sweep
+    deleted any lock without a directory, which took the newborn's only liveness
+    signal away -- and the next sweep then found a directory with no lock, called
+    it reclaimable, and removed it out from under git:
+
+        error: unable to create file src/heart/serve.py: No such file
+        fatal: cannot create directory at 'src/heart/training'
+
+    Measured on three concurrent sessions: one of the three died that way.
+    """
+    import fcntl
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from heart import env
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.environ.get("HEART_WS_ROOT")
+        os.environ["HEART_WS_ROOT"] = tmp
+        try:
+            root = Path(tmp)
+            # A workspace mid-creation: lock taken, directory not there yet.
+            newborn = root / "abc123def456.lock"
+            held = open(newborn, "w")
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            # And a genuine leak: a lock nobody holds, no directory.
+            (root / "deadbeef0000.lock").write_text("")
+
+            env.reclaim()
+
+            assert newborn.exists(), "a held lock was swept as litter"
+            assert not (root / "deadbeef0000.lock").exists(), "real litter survived"
+            held.close()
+        finally:
+            if old is None:
+                os.environ.pop("HEART_WS_ROOT", None)
+            else:
+                os.environ["HEART_WS_ROOT"] = old
+
+
+def test_prune_runs_under_the_same_lock_as_worktree_add():
+    """Both mutate .git/worktrees. A prune landing inside another session's add
+    is the second way three concurrent sessions break one of them."""
+    import inspect
+
+    from heart import env
+
+    source = inspect.getsource(env.reclaim)
+    prune = source[source.index("for source in repos:"):]
+    assert "_worktree_lock(source)" in prune, prune
