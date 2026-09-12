@@ -7,6 +7,7 @@ endpoints count as "the local box") and the cross-process counting semaphore
 (N agents at a time, no more, even across separate processes). Stdlib only,
 no network.
 """
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -215,8 +216,53 @@ def test_a_non_200_answer_still_counts_as_listening():
         assert _endpoint_reachable("http://127.0.0.1:8001/v1")
 
 
+def test_the_model_pool_is_not_named_after_this_repo():
+    """The pool is shared with every process on the box that talks to the same
+    server. arteries flocks the same directory and used an advisory lock of its
+    own until this was named something it could join -- two caps of two against a
+    two-slot server is the same overload with more bookkeeping.
+
+    A rename here silently splits the pool again, and nothing would fail, so this
+    test is the only thing holding the convention in place.
+    """
+    from heart.runner import _local_slot
+
+    source = inspect.getsource(_local_slot)
+    # The path, not the word: the comment beside it names the old directory on
+    # purpose, so anyone reading the rename knows what it replaced.
+    assert '"model-slots"' in source, source
+    assert '"heart-local-slots"' not in source
+
+
+def test_agent_slots_stay_heart_specific():
+    """How many agents run at once is heart's business. Only the model server is
+    a shared resource."""
+    from heart.runner import _global_slot
+
+    assert "heart-agent-slots" in inspect.getsource(_global_slot)
+
+
+def test_the_pool_path_matches_what_arteries_computes():
+    """Skipped when arteries is not on the path -- it is a sibling checkout, not
+    a pinned dependency, which is the same reason the frame contract test skips."""
+    try:
+        from arteries import slots as arteries_slots
+    except ImportError:
+        return
+
+    from heart.runner import _slots_base
+
+    endpoint = "http://127.0.0.1:8001/v1"
+    heart_pool = _slots_base() / "model-slots" / "127.0.0.1_8001"
+    assert str(heart_pool) == str(arteries_slots.pool_for(endpoint)), (
+        f"pools have diverged: {heart_pool} vs {arteries_slots.pool_for(endpoint)}")
+
+
 if __name__ == "__main__":
     test_locality()
+    test_the_model_pool_is_not_named_after_this_repo()
+    test_agent_slots_stay_heart_specific()
+    test_the_pool_path_matches_what_arteries_computes()
     test_a_live_server_is_reachable()
     test_a_dead_port_is_not_reachable()
     test_a_broken_probe_does_not_block_work()
