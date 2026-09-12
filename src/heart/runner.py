@@ -99,6 +99,9 @@ def _global_slot():
     if n <= 0:
         yield
         return
+    # Agent slots stay heart's own: this caps how many agents run at once, which
+    # is heart's business and nobody else's. The model-server pool below is the
+    # shared one, because that resource is shared.
     with _flock_pool(_slots_base() / "heart-agent-slots", n):
         yield
 
@@ -198,7 +201,17 @@ def _local_slot(endpoint: str | None):
         yield
         return
     key = (urlsplit(endpoint).netloc or "local").replace(":", "_")
-    with _flock_pool(_slots_base() / "heart-local-slots" / key, n):
+    # `model-slots`, not `heart-local-slots`. The pool is shared with every
+    # other process on the box that talks to the same server -- arteries' compile
+    # passes flock the same directory, and used a Postgres advisory lock of their
+    # own until this was named something they could join. Two caps of two against
+    # a two-slot server is the same overload with more bookkeeping.
+    #
+    # The convention is documented in arteries/src/arteries/slots.py and
+    # deliberately duplicated rather than shared: a common module would make two
+    # repos depend on each other to avoid twenty lines, and heart stays
+    # stdlib-only.
+    with _flock_pool(_slots_base() / "model-slots" / key, n):
         yield
 
 def sandbox_wrap(
