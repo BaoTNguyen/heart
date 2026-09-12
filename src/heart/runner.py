@@ -252,6 +252,15 @@ def sandbox_wrap(
         raise RuntimeError("HEART_SANDBOX=docker but no sandbox profile was supplied")
     if not shutil.which("docker"):
         raise RuntimeError("HEART_SANDBOX=docker but docker is not installed")
+    # Ahead of the run, because the alternative is what actually happened: the
+    # image was two weeks behind its Dockerfile, every sandboxed run failed on a
+    # lock file inside the container, and it read as a plugin incompatibility for
+    # two weeks. Refusing here says which command to run.
+    from .sandbox import image_is_stale
+
+    stale = image_is_stale(profile.image)
+    if stale:
+        raise RuntimeError(stale)
     inner = str(cmd) if shell else " ".join(shlex.quote(c) for c in cmd)
     # The timeout goes inside the container, not just on the docker client.
     # subprocess's timeout kills the client; the container it started keeps
