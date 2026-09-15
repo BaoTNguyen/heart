@@ -463,12 +463,17 @@ def test_a_failed_network_step_is_fatal_not_a_quiet_widening():
     for line in script.splitlines():
         if line.startswith("docker network "):
             assert "exit 125" in line, line
-            assert "docker sandbox rm" in line, f"a fatal step must still clean up: {line}"
+    # cleanup is a trap now, not a line per handler: an early exit from any step
+    # -- or the client being killed by the outer timeout -- still removes it
+    assert any(l.startswith("trap ") and "docker sandbox rm" in l
+               for l in script.splitlines()), script
 
 
 def test_the_sandbox_is_removed_even_when_the_turn_fails():
-    # the plugin does not take --rm; without the explicit rm every episode
-    # leaves a running sandbox behind
+    # the plugin does not take --rm; without the removal every episode leaves a
+    # sandbox behind. It used to be the second-to-last line, which covered the
+    # turn failing and nothing else: 103 containers from one killed batch were
+    # still on the box two days later, each holding its worktree mount.
     from heart.runner import sandbox_wrap
     from heart.sandbox import WORK
 
@@ -476,12 +481,15 @@ def test_the_sandbox_is_removed_even_when_the_turn_fails():
                           profile=_profile(_task(network="api")))
     script = cmd[2]
     assert f"docker exec -w {WORK}" in script, "else the agent runs in / and writes nothing"
-    # the removal that matters is the one after the turn, not the ones inside
-    # the fatal-step handlers -- so check the tail, not the first match
-    tail = script.rstrip().splitlines()[-3:]
-    assert "rc=$?" in tail[0]
-    assert tail[1].startswith("docker sandbox rm")
-    assert tail[2] == "exit $rc"
+    lines = script.rstrip().splitlines()
+    trap = next(i for i, l in enumerate(lines) if l.startswith("trap "))
+    assert "docker sandbox rm" in lines[trap]
+    # every path out is covered, including SIGTERM and the timeout kill
+    assert "EXIT" in lines[trap] and "INT" in lines[trap] and "TERM" in lines[trap]
+    # armed before anything can fail, and after the name exists to remove
+    assert lines[trap - 1].startswith("sbx=$(")
+    assert "rc=$?" in lines[-2]
+    assert lines[-1] == "exit $rc"
 
 
 def test_every_caller_gates_on_the_same_mode_name():
@@ -609,12 +617,24 @@ def test_the_allowlist_matches_on_boundaries_not_substrings(monkeypatch):
     an allowlist that can be suffixed is not an allowlist."""
     monkeypatch.setenv("ALLOW", "api.anthropic.com,anthropic.com")
     permitted = _proxy_module().permitted
-    assert permitted("api.anthropic.com")
-    assert permitted("API.Anthropic.COM")       # the client chooses the case
-    assert permitted("statsig.anthropic.com")   # a bare name covers subdomains
-    assert not permitted("anthropic.com.evil.net")
-    assert not permitted("notanthropic.com")
-    assert not permitted("evil.com")
+    assert permitted("api.anthropic.com", 443)
+    assert permitted("API.Anthropic.COM", 443)      # the client chooses the case
+    assert permitted("statsig.anthropic.com", 443)  # a bare name covers subdomains
+    assert permitted("api.anthropic.com", 8443)     # and a bare name, any port
+    assert not permitted("anthropic.com.evil.net", 443)
+    assert not permitted("notanthropic.com", 443)
+    assert not permitted("evil.com", 443)
+
+
+def test_a_port_in_an_entry_is_the_whole_point_of_listing_the_host_alias(monkeypatch):
+    """host.docker.internal is on the list so an agent can call the model server
+    on :8001. Without a port it also hands the agent the host's Postgres on 5432
+    and heart's own server on 8000 -- a proxy defeating its own purpose."""
+    monkeypatch.setenv("ALLOW", "host.docker.internal:8001")
+    permitted = _proxy_module().permitted
+    assert permitted("host.docker.internal", 8001)
+    assert not permitted("host.docker.internal", 5432)
+    assert not permitted("host.docker.internal", 8000)
 
 
 def test_an_allowlist_refusal_is_not_an_agent_that_did_nothing():
@@ -806,3 +826,32 @@ def test_a_prefix_collision_does_not_count_as_forbidden():
     from heart.episode import _probed_forbidden
 
     assert _probed_forbidden(["EACCES: 'src_gen/x.py'"], ["src"]) is False
+
+
+def test_codex_does_not_build_a_sandbox_inside_heart_s(monkeypatch):
+    """codex enforces `-s workspace-write` with bubblewrap, and bwrap cannot
+    create a user namespace inside an unprivileged container: every command the
+    agent tried came back `bwrap: No permissions to create a new namespace`, it
+    exited 0 having changed nothing, and the episode scored `no_change` at 0.0.
+    A nesting problem recorded as a model failure. Measured on
+    20260915-111156-ddcc4b7d."""
+    from heart.runner import _agent_command
+
+    monkeypatch.setenv("HEART_SANDBOX", "docker-sbx")
+    cmd, _ = _agent_command("codex:luna", "fix it")
+    assert "danger-full-access" in cmd
+    assert "workspace-write" not in cmd
+
+    # outside heart's sandbox the inner one is the only one there is
+    monkeypatch.setenv("HEART_SANDBOX", "off")
+    cmd, _ = _agent_command("codex:luna", "fix it")
+    assert "workspace-write" in cmd
+
+
+def test_unnesting_leaves_other_agents_alone(monkeypatch):
+    from heart.runner import _agent_command
+
+    monkeypatch.setenv("HEART_SANDBOX", "docker-sbx")
+    cmd, _ = _agent_command("claude:haiku", "fix it")
+    assert cmd[:2] == ["claude", "-p"]
+    assert "danger-full-access" not in cmd

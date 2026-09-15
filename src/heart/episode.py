@@ -264,6 +264,28 @@ def _probed_forbidden(denials: list[str], denied_paths: list[str]) -> bool:
     )
 
 
+#: A line from a test report rather than from the sandbox. The agents in a
+#: sandboxed run were pointed at heart's own source, so they ran heart's test
+#: suite -- whose fixtures construct denial strings on purpose -- and pytest
+#: echoed them back. The detector scraped its own test data: `test_calc.py`,
+#: `src/secrets/key.pem`, `src/app.py` and the literal `], [` all arrived as
+#: refused paths, and all three episodes carried `scope_suspect: true` on that
+#: basis. A reward signal reading a test fixture is worse than no signal.
+_TEST_REPORT_RE = re.compile(
+    r"""^(?:E\s|>\s|\s*(?:assert|self\.assert)\b        # pytest failure frames
+        |(?:FAILED|PASSED|ERROR)\b                        # its result lines
+        |\s*tests?/\S*::                                  # its node ids
+        |\s*[-=]{3,})                                     # its banners
+    """,
+    re.VERBOSE)
+
+#: A cache the sandbox mounts read-only on purpose. `could not create cache
+#: path ...: [Errno 30] Read-only file system` is the design working, not the
+#: agent being refused a path the spec allowed -- and it was reported in all
+#: three episodes as if it were one.
+_CACHE_HINT_RE = re.compile(r"cache|/tmp/", re.IGNORECASE)
+
+
 def _scope_denials(out: Path, limit: int = 12) -> list[str]:
     """Lines from this episode's agent logs that look like the sandbox refusing.
 
@@ -286,10 +308,16 @@ def _scope_denials(out: Path, limit: int = 12) -> list[str]:
             continue
         for line in text.splitlines():
             low = line.lower()
-            if any(sign in low for sign in _DENIAL_SIGNS):
-                hits.append(f"{log.stem}: {line.strip()[:200]}")
-                if len(hits) >= limit:
-                    return hits
+            if not any(sign in low for sign in _DENIAL_SIGNS):
+                continue
+            # ponytail: two cheap discriminators, not a parser. A pytest frame
+            # and a read-only cache are the two things that produced every false
+            # positive measured; anything subtler can wait for a case.
+            if _TEST_REPORT_RE.match(line) or _CACHE_HINT_RE.search(line):
+                continue
+            hits.append(f"{log.stem}: {line.strip()[:200]}")
+            if len(hits) >= limit:
+                return hits
     return hits
 
 
@@ -320,6 +348,12 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
         sandbox.profile_for(task, ws_path, context, inbox, env=env),
         sandbox.verifier_profile_for(task, ws_path, inbox, env=env),
     )
+
+
+# The corpus half must fit inside the packet call, with room for the rest of the
+# build. One place, so the two cannot drift back into being equal.
+PACKET_TIMEOUT = 60
+CORPUS_TIMEOUT = 20
 
 
 def _context_packet(task: TaskSpec, role: str, memory: str, out: Path,
@@ -353,12 +387,34 @@ def _context_packet(task: TaskSpec, role: str, memory: str, out: Path,
 
     situation = _situation(task)
     env = {**os.environ, "ARTERIES_EPISODE_ID": episode_id,
-           "ARTERIES_TASK_ID": task.task_id}
+           "ARTERIES_TASK_ID": task.task_id,
+           # Chaining is keyed on the session. Heart stamped episode and task and
+           # never this, so every packet recorded a NULL session and arteries'
+           # recent_packet_members returned nothing -- role 3 re-sent what role 1
+           # had already shown. The task id is the right grain: plexus names it
+           # <goal>-<feature>-a<attempt>, so the roles of one attempt chain and
+           # the next attempt starts clean, which is what an attempt is for.
+           "ARTERIES_SESSION_ID": os.environ.get("ARTERIES_SESSION_ID")
+                                  or task.task_id,
+           # The corpus suggestion is read from a cache only the CLI hook path
+           # warms, keyed on the message. This situation string never passes
+           # through a hook, so the key was never warm and every episode packet
+           # came back "not_cached" -- no episode has ever carried one. Inline
+           # exists to keep a 60s call off a 9s hook; heart is a background
+           # orchestrator with nobody typing.
+           "ARTERIES_CORPUS_INLINE": os.environ.get("ARTERIES_CORPUS_INLINE", "on"),
+           # ...and inline only works if the corpus call finishes inside the
+           # subprocess timeout. Both defaulted to 60, so a slow corpus did not
+           # cost the suggestion, it timed out the whole packet and the episode
+           # ran with no memory at all.
+           "ARTERIES_CORPUS_TIMEOUT": os.environ.get("ARTERIES_CORPUS_TIMEOUT",
+                                                     str(CORPUS_TIMEOUT))}
     try:
         proc = subprocess.run(
             ["art", "packet", "--message", situation, "--budget", "6000",
              "--format", "provenance-json"],
-            capture_output=True, text=True, timeout=60, env=env, check=True)
+            capture_output=True, text=True, timeout=PACKET_TIMEOUT, env=env,
+            check=True)
         payload = json.loads(proc.stdout)
     except Exception as exc:
         return {"status": "failed", "reason": str(exc)[:200], "memories": []}
@@ -839,9 +895,15 @@ def _run_episode(
             # no_change because a block is usually an (almost) empty diff, and
             # "wrote nothing" and "asked instead of writing" are not the same event.
             outcome = "blocked"
-        elif not diff.strip() and denials:
+        elif not diff.strip() and denials and (probed_forbidden or scope_refused):
             # An empty diff plus the kernel refusing writes is a sandbox that
             # was drawn too tight, not an agent that had nothing to say -- unless
+            # nothing was refused that the spec had allowed. A refusal naming no
+            # worktree path is not a scope problem: codex failing to write its
+            # own config directory recorded `scope_denied` with
+            # `scope_refused_paths: []`, and scope_denied is unscoreable, so the
+            # episode escaped being scored for an ordinary crash. Measured on
+            # 20260915-105917-3e7002ab. Unless
             # the refusal names ground the spec forbade, in which case the agent
             # went where it was told not to and that is a violation like any
             # other. Without this branch, scope_denied is an escape hatch from

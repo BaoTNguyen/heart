@@ -11,7 +11,7 @@ gateway at all and reaches nothing, rather than quietly going direct.
 
     docker network create --internal heart-egress
     docker run -d --name egress --restart unless-stopped --network bridge \
-      -e ALLOW=api.anthropic.com,host.docker.internal \
+      -e ALLOW=api.anthropic.com,host.docker.internal:8001 \
       -v $PWD/contrib/egress-proxy.py:/proxy.py:ro \
       --entrypoint python3 heart-agent:latest /proxy.py
     docker network connect heart-egress egress
@@ -25,7 +25,9 @@ traffic. Plain HTTP is forwarded by absolute-URI so the same allowlist covers a
 local model server on http://.
 
 A name in ALLOW covers that host and its subdomains: `anthropic.com` allows
-`api.anthropic.com`. Matching is on the name the client asked for, which is the
+`api.anthropic.com`. Append a port -- `host.docker.internal:8001` -- to allow
+only that one; a bare name allows every port on that host, which for the host
+alias means the host's Postgres and heart's own server too. Matching is on the name the client asked for, which is the
 point -- an agent that resolves a name itself and connects by IP has no route to
 do it.
 
@@ -50,9 +52,28 @@ ALLOW = tuple(h.strip().lower() for h in os.environ.get("ALLOW", "").split(",") 
 PORT = int(os.environ.get("PORT", "8888"))
 
 
-def permitted(host: str) -> bool:
+def permitted(host: str, port: int) -> bool:
+    """Is this host:port on the list?
+
+    An entry may name a port -- `host.docker.internal:8001` -- and then only
+    that port is reachable. This matters more than it looks: the host alias is
+    on the list so an agent can call a model server on :8001, and a bare name
+    also hands it every other port the host has open. Postgres on 5432 and
+    heart's own server on 8000 were both reachable by CONNECT through a proxy
+    whose job was to stop exactly that.
+
+    A bare name still allows any port, because that is what the existing
+    deployments are configured with and a silent narrowing would read as the
+    network being broken. Name the port; the log line says which one was used.
+    """
     host = host.lower().rstrip(".")
-    return any(host == a or host.endswith("." + a) for a in ALLOW)
+    for entry in ALLOW:
+        name, _, want = entry.partition(":")
+        if want and want != str(port):
+            continue
+        if host == name or host.endswith("." + name):
+            return True
+    return False
 
 
 async def _pipe(reader, writer):
@@ -102,20 +123,21 @@ async def _handle(reader, writer):
 
     if method.upper() == "CONNECT":
         host, _, port = target.partition(":")
-        if not permitted(host):
-            print(f"deny CONNECT {host}", flush=True)
+        port = int(port or 443)
+        if not permitted(host, port):
+            print(f"deny CONNECT {host}:{port}", flush=True)
             return await _deny(writer, f"{host} is not in the sandbox allowlist\n")
         # drain the rest of the request head before tunnelling
         try:
             while (await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=30)) != b"\r\n":
                 pass
-            up_r, up_w = await asyncio.open_connection(host, int(port or 443))
+            up_r, up_w = await asyncio.open_connection(host, port)
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
             writer.close()
             return
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        print(f"allow CONNECT {host}", flush=True)
+        print(f"allow CONNECT {host}:{port}", flush=True)
         return await _splice(reader, writer, up_r, up_w)
 
     # plain HTTP arrives as an absolute URI: GET http://host:port/path HTTP/1.1
@@ -124,17 +146,18 @@ async def _handle(reader, writer):
     rest = target[len("http://"):]
     authority, slash, path = rest.partition("/")
     host, _, port = authority.partition(":")
-    if not permitted(host):
-        print(f"deny {method} {host}", flush=True)
+    port = int(port or 80)
+    if not permitted(host, port):
+        print(f"deny {method} {host}:{port}", flush=True)
         return await _deny(writer, f"{host} is not in the sandbox allowlist\n")
     try:
-        up_r, up_w = await asyncio.open_connection(host, int(port or 80))
+        up_r, up_w = await asyncio.open_connection(host, port)
     except OSError:
         writer.close()
         return
     up_w.write(f"{method} /{path} HTTP/1.1\r\n".encode("latin-1"))
     await up_w.drain()
-    print(f"allow {method} {host}", flush=True)
+    print(f"allow {method} {host}:{port}", flush=True)
     await _splice(reader, writer, up_r, up_w)
 
 

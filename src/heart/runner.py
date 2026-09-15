@@ -31,9 +31,22 @@ AGENT_COMMANDS: dict[str, list[str]] = {
     # flag and errors out on it, which heart could only report as the agent
     # failing. `exec` never prompts, so the sandbox policy is all --full-auto
     # carried. The worktree stays writable and everything else does not — worth
-    # keeping even under HEART_SANDBOX, where heart's mount table is the real
-    # boundary and this is one more layer that costs nothing.
-    "codex": ["codex", "exec", "-s", "workspace-write", "{prompt}"],
+    # keeping outside HEART_SANDBOX. Inside it, it costs everything: codex
+    # enforces that policy with bubblewrap, and bwrap cannot create a user
+    # namespace inside an unprivileged container. The agent came back with
+    #     bwrap: No permissions to create a new namespace
+    # on every command it tried, exited 0 having changed nothing, and scored
+    # `no_change` at 0.0 -- a model failure recorded for a nesting problem.
+    # _agent_command swaps the policy when heart's own sandbox is the boundary;
+    # see _NESTED_SANDBOX_ARGS.
+    # --json for the same reason claude carries --output-format json: it is the
+    # only way the CLI reports what a turn cost. Without it every codex episode
+    # logged `usage: {}` and `cost_usd: null`, so a codex run was free to the
+    # ledger, to PRICING, and to every budget that reads them -- while the same
+    # task on claude:haiku reported $1.45. Reward is unaffected: `efficiency` is
+    # wall-clock against the timeout and never read tokens.
+    # _extract_usage renders the JSONL back to a readable transcript.
+    "codex": ["codex", "exec", "--json", "-s", "workspace-write", "{prompt}"],
     "gemini": ["gemini", "--yolo", "-p", "{prompt}"],
     "opencode": ["opencode", "run", "{prompt}"],
     "pi": ["pi", "--print", "{prompt}"],
@@ -286,8 +299,13 @@ def sandbox_wrap(
     # exists to prevent, and one that reaches no network because the connect
     # failed produces an agent that did nothing -- exit 125 puts docker's own
     # message in the log, where sandbox_start_failure raises on it.
-    fail = 'docker sandbox rm "$sbx" >/dev/null 2>&1; exit 125'
+    # The removal is a trap, not a line at the end. A client killed by the outer
+    # timeout, a SIGTERM, or any step exiting early used to leave the container
+    # behind: 100+ `heart-*` containers, all Exited(1), were still on this box
+    # from a failed batch two days earlier, each holding its worktree mount.
+    fail = 'exit 125'
     steps = [f"sbx=$({create}) || exit 125",
+             'trap \'docker sandbox rm "$sbx" >/dev/null 2>&1\' EXIT INT TERM',
              f'docker network disconnect bridge "$sbx" || {{ {fail}; }}']
     if profile.network != "none":
         steps.append(f'docker network connect {shlex.quote(profile.network)} '
@@ -300,7 +318,6 @@ def sandbox_wrap(
     # without this the agent edits files in / and the episode comes back as
     # `no_change`.
     steps += [f'docker exec -w {WORK} "$sbx" sh -c {shlex.quote(inner)}; rc=$?',
-              'docker sandbox rm "$sbx" >/dev/null 2>&1',
               "exit $rc"]
     return ["sh", "-c", "\n".join(steps) + "\n"], False
 
@@ -411,6 +428,55 @@ def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
             pass
         log_path.write_text(result, encoding="utf-8")
         return {"tokens_in": tokens_in, "tokens_out": tokens_out, **cache}
+    if base_agent == "codex":
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return none
+        totals = {"tokens_in": 0, "tokens_out": 0, "cache_read": 0,
+                  "cache_write_5m": 0, "cache_write_1h": 0}
+        rendered: list[str] = []
+        seen = False
+        for line in text.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # the CLI writes advisories around the stream ("Reading
+                # additional input from stdin...") -- they belong in the
+                # transcript, they are just not events
+                rendered.append(line)
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "turn.completed":
+                usage = event.get("usage") or {}
+                seen = True
+                cached = usage.get("cached_input_tokens") or 0
+                # heart's tokens_in is *uncached* input, the way the vendors
+                # bill it; codex reports the total and the cached part
+                totals["tokens_in"] += max(0, (usage.get("input_tokens") or 0) - cached)
+                totals["tokens_out"] += usage.get("output_tokens") or 0
+                totals["cache_read"] += cached
+                # no TTL split in this stream, so the whole write is the 5m
+                # bucket -- the same fallback the claude branch makes
+                totals["cache_write_5m"] += usage.get("cache_write_input_tokens") or 0
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                rendered.append(item.get("text") or "")
+            elif item.get("type") == "command_execution" and item.get("status") != "in_progress":
+                # the shell output has to survive the rendering: it is where a
+                # refusal surfaces, and _scope_denials reads this file
+                rendered.append(f"$ {item.get('command', '')}")
+                if out := item.get("aggregated_output"):
+                    rendered.append(out)
+        if not seen:
+            return none
+        try:
+            log_path.with_name(log_path.stem + ".raw.log").write_text(text, encoding="utf-8")
+            log_path.write_text("\n".join(rendered), encoding="utf-8")
+        except OSError:
+            pass
+        return totals
     if base_agent == "api":
         try:
             lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -647,6 +713,22 @@ def _resolve_model(profile: str) -> str:
     return prof.get("model") or profile
 
 
+#: How each CLI is told not to build its own sandbox inside heart's. Two
+#: sandboxes are not twice the containment: the inner one needs privileges the
+#: outer one exists to withhold, so it fails rather than nests. The container is
+#: the boundary -- mount table, network, user -- and it is the one heart can
+#: actually describe.
+_NESTED_SANDBOX_ARGS = {"codex": {"workspace-write": "danger-full-access"}}
+
+
+def _unnest(base: str, cmd: list[str]) -> list[str]:
+    """Replace an inner sandbox policy when heart's own sandbox is already on."""
+    swaps = _NESTED_SANDBOX_ARGS.get(base)
+    if not swaps or os.environ.get("HEART_SANDBOX", "off") in ("off", ""):
+        return cmd
+    return [swaps.get(part, part) for part in cmd]
+
+
 def _agent_command(agent: str, prompt: str, agent_cmd: str | None = None) -> tuple[list[str] | str, bool]:
     """Build the (command, shell) for an agent string, before sandbox wrapping.
     Pins `--model` for CLI agents carrying a profile (claude:<x>, codex:<x>) —
@@ -667,7 +749,7 @@ def _agent_command(agent: str, prompt: str, agent_cmd: str | None = None) -> tup
             cmd.append(prompt)
         else:
             cmd.append(part)
-    return cmd, False
+    return _unnest(base, cmd), False
 
 
 #: contrib/egress-proxy.py stamps this on every refusal. Kept in sync by being

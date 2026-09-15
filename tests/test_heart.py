@@ -127,6 +127,19 @@ class TestHeart(unittest.TestCase):
         self.assertFalse(ep["scope_suspect"])
         self.assertEqual(ep["scope_refused_paths"], ["locked/out.txt"])
 
+    def test_a_refusal_naming_no_path_is_not_a_scope_problem(self):
+        """scope_denied is unscoreable: it withholds the reward on the grounds
+        that the sandbox refused writes the spec allowed. A refusal that names
+        no path is not that. Codex, unable to write its own config directory
+        because a mounted credential made the parent root-owned, produced
+        `Permission denied (os error 13)` with no path in it -- and the episode
+        recorded scope_denied with scope_refused_paths [], escaping the score
+        for an ordinary crash. Measured on 20260915-105917-3e7002ab."""
+        ep = self.run_ep("echo 'failed to initialize app-server: Permission denied (os error 13)'")
+        self.assertEqual(ep["outcome"], "no_change")
+        self.assertEqual(ep["scope_refused_paths"], [])
+        self.assertEqual(ep["reward"]["total"], 0.0)   # scored, not excused
+
     def test_a_forbidden_probe_is_never_reported_as_our_misconfiguration(self):
         # denied_paths is test_calc.py here; a refusal naming it is the agent's
         # doing, and must not reach the ledger as ground the task needed
@@ -2158,3 +2171,261 @@ class TestProbesAndBaselines(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContextPacketEnv(unittest.TestCase):
+    """The three variables heart hands arteries when it builds a role packet.
+
+    All three were missing and each failed silently: no session id meant every
+    packet recorded a NULL session and chaining never fired; no inline flag meant
+    the corpus suggestion was read from a cache only the CLI hook path warms, so
+    it was always "not_cached"; and a corpus timeout equal to the subprocess
+    timeout meant a slow corpus cost the whole packet rather than the suggestion.
+    """
+
+    def _run(self, env_overrides=None):
+        from heart import episode as ep
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env") or {}
+            captured["timeout"] = kwargs.get("timeout")
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
+                {"packet": "body", "memories": [], "corpus": {}}), stderr="")
+
+        task = TaskSpec(task_id="g1-f2-a3", repo_path=".", base_commit="0" * 40,
+                        prompt="fix the thing")
+        # conftest turns retrieval off suite-wide; this is the override it
+        # describes. `art packet` is mocked, so nothing live runs either way.
+        env = {"ARTERIES_RETRIEVAL": "on", **(env_overrides or {})}
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(ep.subprocess, "run", fake_run), \
+                 unittest.mock.patch.dict(os.environ, env, clear=False):
+                result = ep._context_packet(task, "implement", "normal",
+                                            Path(tmp), "ep-1")
+        return captured, result
+
+    def test_session_id_is_the_task_id(self):
+        captured, _ = self._run()
+        # plexus names task ids <goal>-<feature>-a<attempt>, so roles of one
+        # attempt chain together and the next attempt starts clean.
+        self.assertEqual(captured["env"]["ARTERIES_SESSION_ID"], "g1-f2-a3")
+
+    def test_corpus_is_fetched_inline_and_fits_the_subprocess_timeout(self):
+        captured, _ = self._run()
+        self.assertEqual(captured["env"]["ARTERIES_CORPUS_INLINE"], "on")
+        self.assertLess(int(captured["env"]["ARTERIES_CORPUS_TIMEOUT"]),
+                        captured["timeout"])
+
+    def test_caller_env_still_wins(self):
+        captured, _ = self._run({"ARTERIES_SESSION_ID": "outer-session",
+                                 "ARTERIES_CORPUS_INLINE": "off"})
+        self.assertEqual(captured["env"]["ARTERIES_SESSION_ID"], "outer-session")
+        self.assertEqual(captured["env"]["ARTERIES_CORPUS_INLINE"], "off")
+
+
+class TestEgressProxyDiscovery(unittest.TestCase):
+    """An --internal network without a proxy is unsatisfiable, not merely
+    unconfigured. Round one of the sandboxed e2e run spent 250s per role proving
+    that, then recorded it as `no_change` at reward 0.0."""
+
+    def setUp(self):
+        from heart import sandbox
+        self.sandbox = sandbox
+        sandbox.network_facts.cache_clear()
+        self.addCleanup(sandbox.network_facts.cache_clear)
+
+    @contextlib.contextmanager
+    def _net(self, internal, names):
+        with unittest.mock.patch.object(self.sandbox, "network_facts",
+                                        lambda _n: (internal, names)), \
+             unittest.mock.patch.dict(os.environ, {"HEART_SANDBOX_PROXY": ""}):
+            yield
+
+    def test_the_proxy_on_an_internal_network_needs_no_env_var(self):
+        with self._net(True, ("egress", "heart-abc123")):
+            env = self.sandbox.proxy_env("heart-egress")
+        self.assertEqual(env["HTTP_PROXY"], "http://egress:8888")
+        # both spellings, or the half of the image that reads the other one has
+        # no route and no explanation
+        self.assertEqual(env["http_proxy"], "http://egress:8888")
+
+    def test_a_sole_container_is_the_proxy_whatever_it_is_called(self):
+        with self._net(True, ("my-proxy",)):
+            self.assertEqual(self.sandbox.proxy_env("net")["HTTP_PROXY"],
+                             "http://my-proxy:8888")
+
+    def test_an_internal_network_with_no_proxy_refuses_before_the_container_starts(self):
+        with self._net(True, ()):
+            with self.assertRaises(RuntimeError) as cm:
+                self.sandbox.proxy_env("heart-egress")
+        # names the fix, and names it as the control plane's job: provisioning
+        # the box is plexus's, one container per episode is heart's
+        self.assertIn("plexus doctor --fix", str(cm.exception))
+
+    def test_an_ambiguous_internal_network_refuses_rather_than_guessing(self):
+        # concurrent runs put agent containers on the same network; picking the
+        # first one would proxy the agent through another agent
+        with self._net(True, ("heart-a", "heart-b")):
+            with self.assertRaises(RuntimeError):
+                self.sandbox.proxy_env("heart-egress")
+
+    def test_a_routable_network_gets_no_proxy(self):
+        with self._net(False, ("egress",)):
+            self.assertEqual(self.sandbox.proxy_env("bridge"), {})
+
+    def test_network_none_never_looks_for_a_proxy(self):
+        with self._net(True, ()):
+            self.assertEqual(self.sandbox.proxy_env("none"), {})
+
+    def test_an_explicit_proxy_still_wins(self):
+        with unittest.mock.patch.dict(os.environ,
+                                      {"HEART_SANDBOX_PROXY": "http://other:3128"}):
+            self.assertEqual(self.sandbox.proxy_env("heart-egress")["HTTPS_PROXY"],
+                             "http://other:3128")
+
+
+class TestEgressAllowlist(unittest.TestCase):
+    """The allowlist is the whole boundary, so what a name covers is the whole
+    question."""
+
+    def _permitted(self, allow):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "contrib" / "egress-proxy.py"
+        with unittest.mock.patch.dict(os.environ, {"ALLOW": allow}):
+            spec = importlib.util.spec_from_file_location("egress_proxy", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        return mod.permitted
+
+    def test_a_port_in_the_entry_bounds_the_host_to_that_port(self):
+        p = self._permitted("host.docker.internal:8001")
+        self.assertTrue(p("host.docker.internal", 8001))
+        # the hole this closes: the host alias is listed for the model server,
+        # and a bare name also hands the agent the host's Postgres
+        self.assertFalse(p("host.docker.internal", 5432))
+        self.assertFalse(p("host.docker.internal", 8000))
+
+    def test_a_bare_name_still_covers_subdomains_on_any_port(self):
+        p = self._permitted("anthropic.com")
+        self.assertTrue(p("api.anthropic.com", 443))
+        self.assertTrue(p("api.anthropic.com", 80))
+        self.assertFalse(p("anthropic.com.evil.test", 443))
+
+    def test_nothing_unlisted_gets_through(self):
+        p = self._permitted("api.anthropic.com")
+        self.assertFalse(p("pypi.org", 443))
+
+
+class TestScopeDenialsIgnoreTestOutput(unittest.TestCase):
+    """The scope detector reads the agent's log for refusals. Point an agent at
+    a repo whose test suite constructs refusal strings and it reads its own
+    fixtures back: three sandboxed episodes came back with `test_calc.py`,
+    `src/secrets/key.pem` and the literal `], [` as refused paths, all of them
+    from tests/test_heart.py, all three flagged `scope_suspect`."""
+
+    def _denials(self, log_text):
+        import tempfile
+
+        from heart.episode import _scope_denials
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "solo.log").write_text(log_text)
+            return _scope_denials(Path(tmp))
+
+    def test_a_real_refusal_is_still_caught(self):
+        hits = self._denials(
+            "/bin/sh: 1: cannot create src/app.py: Read-only file system\n")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("src/app.py", hits[0])
+
+    def test_pytest_echoing_a_fixture_is_not_a_refusal(self):
+        hits = self._denials(
+            "E       AssertionError: ['permission denied writing src/app.py']\n"
+            ">       assert denials == ['Read-only file system', '], [']\n"
+            "FAILED tests/test_heart.py::test_scope - EACCES\n"
+            "tests/test_heart.py::test_denied_paths EACCES\n"
+            "=========== 1 failed: read-only file system ===========\n")
+        self.assertEqual(hits, [])
+
+    def test_a_read_only_cache_is_the_design_not_a_denial(self):
+        hits = self._denials(
+            "could not create cache path /tmp/cache/uv: "
+            "[Errno 30] Read-only file system\n")
+        self.assertEqual(hits, [])
+
+
+
+class TestCodexUsage(unittest.TestCase):
+    """Every codex episode logged `usage: {}` and `cost_usd: null`, so a codex
+    run was free to the ledger and to every budget that reads it -- while the
+    same task on claude:haiku reported $1.45. The CLI does report it, behind
+    --json. (Reward is untouched: `efficiency` is wall-clock against the
+    timeout and never read tokens.)"""
+
+    #: a real stream, trimmed: `codex exec --json -s read-only --model gpt-5.6-luna`
+    STREAM = "\n".join([
+        "Reading additional input from stdin...",
+        '{"type":"thread.started","thread_id":"01a0a631"}',
+        '{"type":"item.completed","item":{"id":"i0","type":"command_execution",'
+        '"command":"ls /work","aggregated_output":"calc.py\\ntouch: cannot touch'
+        ' \'locked/out.txt\': Permission denied","exit_code":0,"status":"completed"}}',
+        '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"fixed the sign"}}',
+        '{"type":"turn.completed","usage":{"input_tokens":47366,"cached_input_tokens":35072,'
+        '"cache_write_input_tokens":0,"output_tokens":311,"reasoning_output_tokens":104}}',
+    ])
+
+    def _extract(self, stream):
+        import tempfile
+
+        from heart.runner import _extract_usage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "solo.log"
+            log.write_text(stream)
+            usage = _extract_usage(log, "codex")
+            raw = log.parent / "solo.raw.log"
+            return usage, log.read_text(), raw.read_text() if raw.exists() else ""
+
+    def test_tokens_in_is_the_uncached_part(self):
+        usage, _, _ = self._extract(self.STREAM)
+        # codex reports the total and the cached share; heart's tokens_in is
+        # what the vendor actually bills as fresh input
+        self.assertEqual(usage["tokens_in"], 47366 - 35072)
+        self.assertEqual(usage["cache_read"], 35072)
+        self.assertEqual(usage["tokens_out"], 311)
+
+    def test_turns_add_up(self):
+        two = self.STREAM + "\n" + (
+            '{"type":"turn.completed","usage":{"input_tokens":100,'
+            '"cached_input_tokens":40,"cache_write_input_tokens":7,"output_tokens":9}}')
+        usage, _, _ = self._extract(two)
+        self.assertEqual(usage["tokens_out"], 320)
+        self.assertEqual(usage["cache_write_5m"], 7)
+
+    def test_the_log_is_left_readable_and_the_raw_stream_is_kept(self):
+        _, rendered, raw = self._extract(self.STREAM)
+        self.assertIn("fixed the sign", rendered)
+        self.assertIn("$ ls /work", rendered)
+        self.assertNotIn('"type":"turn.completed"', rendered)
+        self.assertIn('"type":"turn.completed"', raw)
+
+    def test_a_refusal_in_the_shell_output_survives_the_rendering(self):
+        """_scope_denials reads this file. Rendering only the agent's messages
+        would hide every refusal the sandbox produced."""
+        from heart.episode import _scope_denials
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "solo.log"
+            log.write_text(self.STREAM)
+            from heart.runner import _extract_usage
+            _extract_usage(log, "codex")
+            (log.parent / "solo.raw.log").unlink()
+            hits = _scope_denials(Path(tmp))
+        self.assertTrue(any("Permission denied" in h for h in hits))
+
+    def test_a_stream_with_no_usage_reports_none_rather_than_zero(self):
+        usage, _, _ = self._extract('{"type":"thread.started"}')
+        self.assertIsNone(usage["tokens_in"])
