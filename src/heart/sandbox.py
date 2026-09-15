@@ -125,8 +125,12 @@ NETWORKS = {
 # connect. The container is told the address that reaches the host from its
 # side; the host keeps its own.
 #
-# Pair this with binding the model server to the bridge address rather than
-# 0.0.0.0 -- the lazy fix exposes the model to the whole LAN.
+# Binding the model server to the docker0 address instead of 0.0.0.0 is the
+# obvious hardening and it is wrong under Docker Desktop: host.docker.internal
+# resolves to the Desktop VM's gateway (192.168.65.2 here), not to 172.17.0.1,
+# so a docker0-only bind is unreachable from every container. Measured on this
+# box. 0.0.0.0 stays, and the exposure it opens -- every interface, tailscale0
+# included -- belongs to the host firewall, not to a bind address.
 
 @dataclass(frozen=True)
 class Mount:
@@ -389,8 +393,10 @@ def container_endpoint(url: str) -> str:
 
     This only makes the address reachable. The server still has to be listening
     on something other than loopback: `llama-server --host 127.0.0.1` cannot be
-    reached from a container whatever the URL says. Bind it to the bridge
-    address rather than 0.0.0.0 -- the lazy fix exposes the model to the LAN.
+    reached from a container whatever the URL says. Under Docker Desktop that
+    means 0.0.0.0, because host.docker.internal is the Desktop VM's gateway and
+    a docker0-only bind never sees it -- so bound the exposure at the firewall
+    instead of the bind address.
     """
     parts = urlsplit(url)
     if parts.hostname not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
@@ -479,7 +485,31 @@ def home_file_mounts() -> tuple[tuple[Mount, ...], tuple[str, ...]]:
     return tuple(mounts)
 
 
-def proxy_env() -> dict[str, str]:
+@lru_cache(maxsize=None)
+def network_facts(network: str) -> tuple[bool, tuple[str, ...]]:
+    """(is_internal, container names) for a docker network, ((False, ()) if the
+    network cannot be inspected -- a name docker does not know is the operator's
+    problem to hear about from docker, not something to guess at here).
+
+    Cached for the process: a network's Internal flag never changes, and the
+    container list only matters at launch.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["docker", "network", "inspect", network, "--format",
+             "{{.Internal}} {{range .Containers}}{{.Name}} {{end}}"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return (False, ())
+    if out.returncode != 0:
+        return (False, ())
+    internal, _, rest = out.stdout.strip().partition(" ")
+    return (internal.lower() == "true", tuple(rest.split()))
+
+
+def proxy_env(network: str = "") -> dict[str, str]:
     """Point the agent at an egress proxy, if the operator runs one.
 
     `network: "api"` is plain bridge egress -- reaching api.anthropic.com means
@@ -495,9 +525,44 @@ def proxy_env() -> dict[str, str]:
     these has no gateway at all, so it reaches nothing rather than going direct.
     """
     url = os.getenv("HEART_SANDBOX_PROXY", "").strip()
+    if not url and network not in ("", "none"):
+        url = _proxy_on(network)
     if not url:
         return {}
     return {k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+
+
+def _proxy_on(network: str) -> str:
+    """The proxy URL for an --internal network, found rather than typed.
+
+    An --internal network has no gateway and no DNS to the host: a container on
+    it reaches exactly the other containers on it and nothing else. So a run
+    with no proxy set is not "less isolated", it is unsatisfiable -- and it used
+    to say so 250 seconds in, as a name-resolution traceback three roles deep,
+    recorded as `no_change` at reward 0.0 and indistinguishable from an agent
+    that looked and found nothing. Both halves of that are fixed here: the
+    common case needs no env var, and the impossible case refuses before the
+    container starts.
+
+    Non-internal network (bridge, or anything the operator points the mode at):
+    no proxy, because there is a gateway and a direct route already.
+    """
+    internal, names = network_facts(network)
+    if not internal:
+        return ""
+    want = os.getenv("HEART_EGRESS_CONTAINER", "egress")
+    if want in names:
+        pick = want
+    elif len(names) == 1:
+        pick = names[0]
+    else:
+        raise RuntimeError(
+            f"network {network!r} is --internal and has no reachable egress proxy"
+            f" ({'no containers on it' if not names else 'candidates: ' + ', '.join(names)})."
+            " An agent there can reach nothing at all. Provisioning the box is"
+            " the control plane's job, not this one's: run `plexus doctor --fix`"
+            " (or name a proxy with HEART_EGRESS_CONTAINER / HEART_SANDBOX_PROXY).")
+    return f"http://{pick}:{os.getenv('HEART_SANDBOX_PROXY_PORT', '8888')}"
 
 
 def passthrough_env() -> dict[str, str]:
@@ -527,7 +592,8 @@ def _agent_env(task: TaskSpec) -> dict[str, str]:
     # which server its profile named. Two code paths setting one fact, and the
     # stale one winning: the same shape as the duplicated refusal parser.
     return {"EVENT_JOURNAL_DIR": JOURNAL, "HOME": HOME,
-            "PATH": agent_tool_path(), **CACHE_ENV, **proxy_env(),
+            "PATH": agent_tool_path(), **CACHE_ENV,
+            **proxy_env(NETWORKS.get(_network(task), "none")),
             **passthrough_env()}
 
 

@@ -58,6 +58,14 @@ RUN pip install --no-cache-dir /opt/heart
 # land in a directory that is already there rather than one docker has to
 # create inside a read-only rootfs.
 #
+# .claude and .codex exist here for a reason that is invisible until it bites:
+# a credential mounted at /home/agent/.codex/auth.json makes Docker create the
+# missing parent, and it creates it owned by root. The agent user then cannot
+# write its own home, and the codex CLI dies with
+# `failed to initialize in-process app-server client: Permission denied (os
+# error 13)` -- which heart then read as the sandbox refusing a scope. Created
+# here and chowned below, the bind lands in a directory the agent owns.
+#
 # The agent user and the .docker/sandbox scaffolding are what the docker-sbx
 # plugin requires of a template (HEART_SANDBOX=docker-sbx). Without them it
 # refuses to start with "create lock file: ... No such file or directory".
@@ -65,6 +73,7 @@ RUN pip install --no-cache-dir /opt/heart
 RUN useradd -u 1000 -m -s /bin/bash agent \
  && mkdir -p /opt/agent-bin /opt/npm-global/bin \
              /home/agent/.docker/sandbox/locks /home/agent/workspace \
+             /home/agent/.claude /home/agent/.codex \
  && chown -R 1000:1000 /home/agent
 ENV PATH=/opt/agent-bin:/opt/npm-global/bin:$PATH
 
