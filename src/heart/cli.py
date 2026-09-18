@@ -22,7 +22,7 @@ from .events import emit
 from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
 from .export import export_episodes
 from .orchestrate import run_orchestrated
-from .runner import (_load_models_json, model_pricing, models_json_path,
+from .runner import (load_models_json, model_pricing, models_json_path,
                      pricing_provenance, set_model_price)
 from .taskspec import TaskSpec, Verifier, load_task, load_tasks
 from .training import datasets
@@ -280,7 +280,7 @@ def _models_seen(hours: float) -> "defaultdict[str, int]":
 
 
 def _model_pricing_table() -> dict:
-    return _load_models_json().get("model_pricing") or {}
+    return load_models_json().get("model_pricing") or {}
 
 
 def cmd_models(args) -> int:

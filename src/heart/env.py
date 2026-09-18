@@ -103,15 +103,7 @@ def _is_live(worktree: Path) -> bool:
     (Advisory locks are unreliable on NFS. WS_ROOT is a local cache dir.)
     """
     lock = _lock_path(worktree)
-    if not lock.exists():
-        return False
-    try:
-        with open(lock, "a") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(fh, fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
+    return lock.exists() and _lock_is_held(lock)
 
 
 def reclaim(repo: str | Path | None = None, older_than: float | None = None) -> int:

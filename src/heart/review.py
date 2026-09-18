@@ -105,7 +105,8 @@ def _fill(template: str, **values: str) -> str:
 def _json_objects(raw: str):
     """Every JSON value in `raw` that actually decodes, outermost first.
 
-    Same lesson as the decomposer's parser: a reviewer quotes code in fenced
+    Shared with the decomposer's plan parser, which learned the same lesson:
+    a reviewer quotes code in fenced
     blocks and writes prose full of braces, so a single span guess (first brace
     to last, or the first ``` fence) finds nothing. Skipping past each successful
     decode keeps a nested array from being mistaken for the whole reply.
