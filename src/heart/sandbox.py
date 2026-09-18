@@ -18,14 +18,18 @@ renderer on this same profile, not a rewrite.
 from __future__ import annotations
 
 import base64
+import datetime
+import json
 import os
 import shutil
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from . import agents_api
 from .taskspec import TaskSpec
 
 WORK = "/work"
@@ -247,9 +251,6 @@ def image_is_stale(image: str | None = None,
     not what is being asked: the question is whether the recipe changed after the
     cake was baked.
     """
-    import json
-    import subprocess
-
     image = image or os.getenv("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
     dockerfile = dockerfile or (Path(__file__).resolve().parent.parent.parent
                                 / "Dockerfile")
@@ -267,9 +268,7 @@ def image_is_stale(image: str | None = None,
                 f"    docker build -t {image} {dockerfile.parent}")
 
     try:
-        import datetime as _dt
-
-        created = _dt.datetime.fromisoformat(
+        created = datetime.datetime.fromisoformat(
             json.loads(out.stdout.strip()).replace("Z", "+00:00"))
     except Exception:
         return None
@@ -421,8 +420,6 @@ def api_agent_env(model_profile: str) -> dict[str, str]:
     also the same rule the context packet already follows -- built on the host,
     so the container never needs a credential to fetch what it was given.
     """
-    from . import agents_api
-
     try:
         cfg = agents_api.profile_config(model_profile)
     except Exception:
@@ -494,8 +491,6 @@ def network_facts(network: str) -> tuple[bool, tuple[str, ...]]:
     Cached for the process: a network's Internal flag never changes, and the
     container list only matters at launch.
     """
-    import subprocess
-
     try:
         out = subprocess.run(
             ["docker", "network", "inspect", network, "--format",
@@ -780,7 +775,6 @@ def inbox_for(key: str) -> Path:
     memory. Raising here follows the same rule as a missing docker binary -- a
     requested sandbox must fail loudly rather than quietly degrade.
     """
-    import subprocess
     try:
         out = subprocess.run(["python3", "-m", "arteries.cli", "journal", "inbox", key],
                              capture_output=True, text=True, timeout=30, check=True)

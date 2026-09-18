@@ -21,6 +21,9 @@ from .detect import detect_verifiers
 from .events import emit
 from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
 from .export import export_episodes
+from .orchestrate import run_orchestrated
+from .runner import (_load_models_json, model_pricing, models_json_path,
+                     pricing_provenance, set_model_price)
 from .taskspec import TaskSpec, Verifier, load_task, load_tasks
 from .training import datasets
 from .verify import check_task
@@ -87,7 +90,6 @@ def cmd_run(args) -> int:
     if getattr(args, "orchestrate", False):
         # A JSON spec is the only place probes, baselines and hidden verifiers
         # can be declared, so it is also where Path B is most worth having.
-        from .orchestrate import run_orchestrated
         ep = run_orchestrated(task, agent=args.agent, runs_dir=args.runs_dir,
                               agent_cmd=args.agent_cmd,
                               roles=None if getattr(args, "solo", False) else DEFAULT_ROLES)
@@ -147,7 +149,6 @@ def cmd_work(args) -> int:
     if getattr(args, "orchestrate", False):
         # Path B: decompose into parallel routed workers, git-merge, verify. Falls
         # back to a single build when not splittable or no integration verifier.
-        from .orchestrate import run_orchestrated
         ep = run_orchestrated(
             task, agent=args.agent, runs_dir=args.runs_dir, agent_cmd=args.agent_cmd,
             roles=None if args.solo else DEFAULT_ROLES)
@@ -279,15 +280,12 @@ def _models_seen(hours: float) -> "defaultdict[str, int]":
 
 
 def _model_pricing_table() -> dict:
-    from .runner import _load_models_json
     return _load_models_json().get("model_pricing") or {}
 
 
 def cmd_models(args) -> int:
     """Rate-card coverage: which models ran, which of them have no rate, and
     how old the rates are. See PRICING.md for what to do about each."""
-    from .runner import model_pricing, models_json_path, pricing_provenance, set_model_price
-
     if args.what == "set-price":
         if not (args.model and args.source):
             print("usage: heart models set-price <model> --input N --output N --source URL",
@@ -368,6 +366,7 @@ def cmd_models(args) -> int:
 
 def cmd_pulse(args) -> int:
     if args.what == "serve":
+        # serve imports cli at module scope; lazy here breaks the cycle.
         from . import serve as serve_mod
         serve_mod.serve(port=args.port, runs_dir=args.serve_runs_dir)
         return 0

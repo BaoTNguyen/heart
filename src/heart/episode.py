@@ -30,7 +30,8 @@ from . import router
 from .env import Workspace
 from .events import emit
 from .guard import scan_secrets
-from .runner import run_agent
+from . import sandbox
+from .runner import SANDBOX_MODE, run_agent
 from .taskspec import TaskSpec
 from .verify import compare_baseline, run_probes, run_verifiers
 
@@ -332,11 +333,8 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
     untouched -- sandbox_wrap returns the command unchanged when no profile
     arrives and no sandbox was asked for.
     """
-    from .runner import SANDBOX_MODE
-
     if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
         return None, None
-    from . import sandbox
 
     # Read-only, built on the host: whatever the agent is given to work from.
     # The container never fetches it, so it needs no credential to read memory.
@@ -627,6 +625,7 @@ def _subagent_env(parent_agent_id: str) -> dict[str, str]:
     heart still runs where arteries isn't installed — heart imports arteries,
     never the reverse."""
     try:
+        # arteries is not a declared dependency, so this import stays lazy.
         from arteries.subagent import subagent_env
         return subagent_env(parent_agent_id)
     except Exception:

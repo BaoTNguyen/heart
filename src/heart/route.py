@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .events import emit
+from .pulse import load_events
 
 # The shared skill vocabulary. Both a model's manifest scores and a task's
 # required skills draw from this; anything off-list is ignored. Extend by editing.
@@ -169,7 +170,6 @@ def aggregate(events: list[dict]) -> dict:
 def refresh_stats() -> dict:
     """Rebuild the sidecar from the journal. Best-effort; returns the stats."""
     try:
-        from .pulse import load_events
         stats = aggregate(load_events())
     except Exception:
         return {}
