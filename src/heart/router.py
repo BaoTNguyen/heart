@@ -16,9 +16,9 @@ valve when a subscription window runs hot.
 """
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
+
+from .agents_api import load_models_json, models_json_path
 
 TIERS = ("cheap", "standard", "strong")
 # ponytail: keyword heuristic, not a learned classifier — the decision ledger
@@ -67,11 +67,7 @@ def review_pool() -> list[str]:
     env = os.environ.get("HEART_REVIEW_MODELS")
     if env:
         return [a.strip() for a in env.split(",") if a.strip()]
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        configured = json.loads(path.read_text()).get("review_models")
-    except (OSError, json.JSONDecodeError):
-        configured = None
+    configured = load_models_json().get("review_models")
     return list(configured) if configured else list(DEFAULT_REVIEW_MODELS)
 
 
@@ -107,16 +103,12 @@ def resolve(tier: str, default: str | None = None) -> str:
     env = os.environ.get(f"HEART_TIER_{tier.upper()}")
     if env:
         return env
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        tiers = json.loads(path.read_text()).get("tiers", {})
-    except (OSError, json.JSONDecodeError):
-        tiers = {}
+    tiers = load_models_json().get("tiers", {})
     if tier in tiers:
         return tiers[tier]
     if default:
         return default
     raise ValueError(
         f"no agent configured for tier {tier!r}: set HEART_TIER_{tier.upper()} "
-        f'or add {{"tiers": {{"{tier}": "<agent>"}}}} to {path}'
+        f'or add {{"tiers": {{"{tier}": "<agent>"}}}} to {models_json_path()}'
     )

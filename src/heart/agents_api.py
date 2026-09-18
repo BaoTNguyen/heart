@@ -46,6 +46,21 @@ TOOLS = [{
 }]
 
 
+def models_json_path() -> Path:
+    """Where heart keeps model profiles, the rate card and the routing tiers."""
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+
+
+def load_models_json() -> dict:
+    """models.json as a dict, or {} when it is missing or unreadable. Every
+    tolerant reader in heart goes through here; resolve_config is the one place
+    that wants the error instead."""
+    try:
+        return json.loads(models_json_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def profile_config(profile: str) -> dict:
     """One profile's entry from models.json, or {} if there is none.
 
@@ -55,18 +70,14 @@ def profile_config(profile: str) -> dict:
     """
     if not profile:
         return {}
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        return json.loads(path.read_text())["profiles"].get(profile, {})
-    except (OSError, KeyError, json.JSONDecodeError):
-        return {}
+    return load_models_json().get("profiles", {}).get(profile, {})
 
 
 def resolve_config() -> dict:
     cfg: dict = {}
     profile = os.environ.get("HEART_MODEL_PROFILE", "")
     if profile:
-        path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+        path = models_json_path()
         try:
             profiles = json.loads(path.read_text())["profiles"]
         except (OSError, KeyError, json.JSONDecodeError) as exc:
@@ -103,13 +114,7 @@ def endpoint_for(profile: str) -> str:
     on an uncertain probe — the child process re-runs resolve_config and
     reports the real error there.
     """
-    cfg: dict = {}
-    if profile:
-        try:
-            path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-            cfg = json.loads(path.read_text())["profiles"].get(profile, {})
-        except (OSError, KeyError, json.JSONDecodeError):
-            cfg = {}
+    cfg = profile_config(profile)
     endpoint = cfg.get("endpoint") or os.environ.get("HEART_API_ENDPOINT") \
         or "http://127.0.0.1:8000/v1"
     return endpoint.rstrip("/")

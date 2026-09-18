@@ -20,6 +20,8 @@ import urllib.request
 from urllib.parse import urlsplit
 
 from . import agents_api
+# re-exported: cli reads the rate card through runner
+from .agents_api import load_models_json, models_json_path
 from . import sandbox
 from .sandbox import WORK, decode_env_snippet, image_is_stale
 
@@ -494,17 +496,6 @@ def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
     return none
 
 
-def models_json_path() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-
-
-def _load_models_json() -> dict:
-    try:
-        return json.loads(models_json_path().read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 def _effective_row(rows: object, on: str) -> dict | None:
     """The rate row in force on `on` (YYYY-MM-DD).
 
@@ -542,7 +533,7 @@ def model_pricing(on: str | None = None) -> dict[str, dict[str, float]]:
     A model absent from both is absent here rather than zero, so the caller can
     fall back to a provider-wide rate instead of billing it as free.
     """
-    config = _load_models_json()
+    config = load_models_json()
     on = on or datetime.date.today().isoformat()
     out: dict[str, dict[str, float]] = {}
 
@@ -581,7 +572,7 @@ def pricing_provenance() -> dict[str, dict]:
     than it deserves. `heart models check` reads this to age the card.
     """
     out = {}
-    for model, rows in (_load_models_json().get("model_pricing") or {}).items():
+    for model, rows in (load_models_json().get("model_pricing") or {}).items():
         candidates = rows if isinstance(rows, list) else [rows]
         for row in candidates:
             if not isinstance(row, dict):
@@ -615,7 +606,7 @@ def set_model_price(model: str, in_per_mtok: float, out_per_mtok: float, *,
         if float(value) < 0:
             raise ValueError("rates cannot be negative")
     path = models_json_path()
-    config = _load_models_json()
+    config = load_models_json()
     table = config.setdefault("model_pricing", {})
     row = {"in_per_mtok": float(in_per_mtok), "out_per_mtok": float(out_per_mtok),
            "source": source, "verified": verified or datetime.date.today().isoformat()}
@@ -655,11 +646,7 @@ def _price(agent: str, tokens_in: int | None, tokens_out: int | None,
                 return 0.0
         except Exception:
             pass
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        pricing = json.loads(path.read_text()).get("pricing", {})
-    except (OSError, json.JSONDecodeError):
-        return None
+    pricing = load_models_json().get("pricing", {})
     entry = pricing.get(agent) or pricing.get(base)
     if not entry:
         return None
@@ -699,12 +686,7 @@ def _resolve_model(profile: str) -> str:
     """A CLI agent's profile token -> a concrete model id. `claude:sonnet` looks
     up models.json profiles[sonnet].model; an unknown token is used verbatim, so
     `claude:claude-opus-4-8` also works without a profile entry."""
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        prof = json.loads(path.read_text()).get("profiles", {}).get(profile, {})
-    except (OSError, json.JSONDecodeError):
-        prof = {}
-    return prof.get("model") or profile
+    return agents_api.profile_config(profile).get("model") or profile
 
 
 #: How each CLI is told not to build its own sandbox inside heart's. Two
