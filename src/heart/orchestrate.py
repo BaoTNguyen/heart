@@ -183,19 +183,8 @@ def _parse_decomposition(raw: str) -> tuple[str, list[Subtask]]:
     # this runs once per decomposition; revisit if a log ever gets large enough
     # to notice.
     """
-    decoder = json.JSONDecoder()
     plans: list[tuple[str, list]] = []
-    i = 0
-    while i < len(raw):
-        if raw[i] not in "{[":
-            i += 1
-            continue
-        try:
-            data, end = decoder.raw_decode(raw, i)
-        except ValueError:
-            i += 1
-            continue
-        i = end
+    for data in review_mod._json_objects(raw):
         if isinstance(data, dict) and isinstance(data.get("subtasks"), list):
             plans.append((str(data.get("contract") or ""), data["subtasks"]))
         elif isinstance(data, list) and all(isinstance(x, dict) for x in data):
@@ -596,14 +585,11 @@ def _commit_tree(repo: str, base_commit: str, diff: str) -> str | None:
             ws.apply(diff)
         except RuntimeError:
             return None
-        p = str(ws.path)
-        subprocess.run(["git", "-C", p, "add", "-A"], capture_output=True)
-        subprocess.run(["git", "-C", p, "-c", "user.name=heart", "-c",
-                        "user.email=heart@local", "commit", "-qm", "clean lanes"],
-                       capture_output=True)
-        sha = subprocess.run(["git", "-C", p, "rev-parse", "HEAD"],
-                             capture_output=True, text=True).stdout.strip()
-        return sha or None
+        # Workspace.commit rather than a bare `git add -A`: it keeps
+        # EXCLUDED_PATHS (.env and friends) out of the base the retried workers
+        # build on, which the inline copy here did not. None means the clean
+        # lanes changed nothing, so the base is already right.
+        return ws.commit("clean lanes") or base_commit
     finally:
         ws.destroy()
 

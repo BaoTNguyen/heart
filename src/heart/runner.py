@@ -16,9 +16,14 @@ import time
 from functools import lru_cache
 from pathlib import Path
 import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 from . import agents_api
+# re-exported: cli reads the rate card through runner
+from .agents_api import load_models_json, models_json_path
+from . import sandbox
+from .sandbox import WORK, decode_env_snippet, image_is_stale
 
 # Worktrees are disposable, so agent permission prompts are disabled.
 # "api" is the universal OpenAI-compatible tool-loop agent (agents_api.py) —
@@ -156,12 +161,9 @@ def _default_local_slots(endpoint: str | None = None) -> int:
 
     slots = DEFAULT_LOCAL_SLOTS
     try:
-        import json as _json
-        import urllib.request
-
         base = f"{urlsplit(endpoint).scheme or 'http'}://{key}"
         with urllib.request.urlopen(f"{base}/slots", timeout=1.0) as resp:
-            reported = _json.load(resp)
+            reported = json.load(resp)
         if isinstance(reported, list) and reported:
             slots = len(reported)
     except Exception:
@@ -179,8 +181,6 @@ def _endpoint_reachable(endpoint: str, timeout: float = 1.0) -> bool:
     would introduce is every episode.
     """
     try:
-        import urllib.request
-
         parts = urlsplit(endpoint)
         base = f"{parts.scheme or 'http'}://{parts.netloc}"
         with urllib.request.urlopen(f"{base}/health", timeout=timeout) as resp:
@@ -269,8 +269,6 @@ def sandbox_wrap(
     # image was two weeks behind its Dockerfile, every sandboxed run failed on a
     # lock file inside the container, and it read as a plugin incompatibility for
     # two weeks. Refusing here says which command to run.
-    from .sandbox import image_is_stale
-
     stale = image_is_stale(profile.image)
     if stale:
         raise RuntimeError(stale)
@@ -281,8 +279,6 @@ def sandbox_wrap(
     # self-terminating container needs nobody to remember to clean up.
     if profile.timeout_seconds:
         inner = f"timeout -s KILL {int(profile.timeout_seconds)}s sh -c {shlex.quote(inner)}"
-    from .sandbox import WORK, decode_env_snippet
-
     # restore any value base64'd past the plugin's newline truncation, before
     # the agent command can read it
     inner = decode_env_snippet() + inner
@@ -500,17 +496,6 @@ def _extract_usage(log_path: str | Path, base_agent: str) -> dict:
     return none
 
 
-def models_json_path() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-
-
-def _load_models_json() -> dict:
-    try:
-        return json.loads(models_json_path().read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 def _effective_row(rows: object, on: str) -> dict | None:
     """The rate row in force on `on` (YYYY-MM-DD).
 
@@ -548,7 +533,7 @@ def model_pricing(on: str | None = None) -> dict[str, dict[str, float]]:
     A model absent from both is absent here rather than zero, so the caller can
     fall back to a provider-wide rate instead of billing it as free.
     """
-    config = _load_models_json()
+    config = load_models_json()
     on = on or datetime.date.today().isoformat()
     out: dict[str, dict[str, float]] = {}
 
@@ -587,7 +572,7 @@ def pricing_provenance() -> dict[str, dict]:
     than it deserves. `heart models check` reads this to age the card.
     """
     out = {}
-    for model, rows in (_load_models_json().get("model_pricing") or {}).items():
+    for model, rows in (load_models_json().get("model_pricing") or {}).items():
         candidates = rows if isinstance(rows, list) else [rows]
         for row in candidates:
             if not isinstance(row, dict):
@@ -621,7 +606,7 @@ def set_model_price(model: str, in_per_mtok: float, out_per_mtok: float, *,
         if float(value) < 0:
             raise ValueError("rates cannot be negative")
     path = models_json_path()
-    config = _load_models_json()
+    config = load_models_json()
     table = config.setdefault("model_pricing", {})
     row = {"in_per_mtok": float(in_per_mtok), "out_per_mtok": float(out_per_mtok),
            "source": source, "verified": verified or datetime.date.today().isoformat()}
@@ -661,11 +646,7 @@ def _price(agent: str, tokens_in: int | None, tokens_out: int | None,
                 return 0.0
         except Exception:
             pass
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        pricing = json.loads(path.read_text()).get("pricing", {})
-    except (OSError, json.JSONDecodeError):
-        return None
+    pricing = load_models_json().get("pricing", {})
     entry = pricing.get(agent) or pricing.get(base)
     if not entry:
         return None
@@ -705,12 +686,7 @@ def _resolve_model(profile: str) -> str:
     """A CLI agent's profile token -> a concrete model id. `claude:sonnet` looks
     up models.json profiles[sonnet].model; an unknown token is used verbatim, so
     `claude:claude-opus-4-8` also works without a profile entry."""
-    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-    try:
-        prof = json.loads(path.read_text()).get("profiles", {}).get(profile, {})
-    except (OSError, json.JSONDecodeError):
-        prof = {}
-    return prof.get("model") or profile
+    return agents_api.profile_config(profile).get("model") or profile
 
 
 #: How each CLI is told not to build its own sandbox inside heart's. Two
@@ -877,8 +853,6 @@ def run_agent(
     if base == "api" and profile is not None:
         # containerised: hand over the resolved endpoint/model/key and drop the
         # profile name, because the file it names does not exist in there
-        from . import sandbox
-
         extra_env = {k: v for k, v in extra_env.items() if k != "HEART_MODEL_PROFILE"}
         extra_env.update(sandbox.api_agent_env(model_profile))
     if agent_cmd:

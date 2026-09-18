@@ -41,7 +41,9 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .agents_api import models_json_path
 from .events import emit
+from .pulse import load_events
 
 # The shared skill vocabulary. Both a model's manifest scores and a task's
 # required skills draw from this; anything off-list is ignored. Extend by editing.
@@ -65,10 +67,6 @@ _LEVEL = {"strong": 0.85, "capable": 0.6, "weak": 0.35}
 _BLEND_K = 8
 
 
-def _config_path() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
-
-
 def _stats_path() -> Path:
     return Path(os.environ.get("HEART_ROUTE_STATS",
                                str(Path.home() / ".local" / "share" / "heart" / "route_stats.json")))
@@ -85,7 +83,7 @@ def load_manifest(path: str | Path | None = None) -> dict:
     legacy `tiers` map so a config that predates `models` still routes (uniform
     skills per tier, difficulty ceiling by tier), and returns {} if neither
     exists — callers treat an empty manifest as 'routing unavailable'."""
-    p = Path(path) if path else _config_path()
+    p = Path(path) if path else models_json_path()
     try:
         data = json.loads(p.read_text())
     except (OSError, json.JSONDecodeError):
@@ -169,7 +167,6 @@ def aggregate(events: list[dict]) -> dict:
 def refresh_stats() -> dict:
     """Rebuild the sidecar from the journal. Best-effort; returns the stats."""
     try:
-        from .pulse import load_events
         stats = aggregate(load_events())
     except Exception:
         return {}
