@@ -16,9 +16,12 @@ import time
 from functools import lru_cache
 from pathlib import Path
 import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 from . import agents_api
+from . import sandbox
+from .sandbox import WORK, decode_env_snippet, image_is_stale
 
 # Worktrees are disposable, so agent permission prompts are disabled.
 # "api" is the universal OpenAI-compatible tool-loop agent (agents_api.py) —
@@ -156,12 +159,9 @@ def _default_local_slots(endpoint: str | None = None) -> int:
 
     slots = DEFAULT_LOCAL_SLOTS
     try:
-        import json as _json
-        import urllib.request
-
         base = f"{urlsplit(endpoint).scheme or 'http'}://{key}"
         with urllib.request.urlopen(f"{base}/slots", timeout=1.0) as resp:
-            reported = _json.load(resp)
+            reported = json.load(resp)
         if isinstance(reported, list) and reported:
             slots = len(reported)
     except Exception:
@@ -179,8 +179,6 @@ def _endpoint_reachable(endpoint: str, timeout: float = 1.0) -> bool:
     would introduce is every episode.
     """
     try:
-        import urllib.request
-
         parts = urlsplit(endpoint)
         base = f"{parts.scheme or 'http'}://{parts.netloc}"
         with urllib.request.urlopen(f"{base}/health", timeout=timeout) as resp:
@@ -269,8 +267,6 @@ def sandbox_wrap(
     # image was two weeks behind its Dockerfile, every sandboxed run failed on a
     # lock file inside the container, and it read as a plugin incompatibility for
     # two weeks. Refusing here says which command to run.
-    from .sandbox import image_is_stale
-
     stale = image_is_stale(profile.image)
     if stale:
         raise RuntimeError(stale)
@@ -281,8 +277,6 @@ def sandbox_wrap(
     # self-terminating container needs nobody to remember to clean up.
     if profile.timeout_seconds:
         inner = f"timeout -s KILL {int(profile.timeout_seconds)}s sh -c {shlex.quote(inner)}"
-    from .sandbox import WORK, decode_env_snippet
-
     # restore any value base64'd past the plugin's newline truncation, before
     # the agent command can read it
     inner = decode_env_snippet() + inner
@@ -877,8 +871,6 @@ def run_agent(
     if base == "api" and profile is not None:
         # containerised: hand over the resolved endpoint/model/key and drop the
         # profile name, because the file it names does not exist in there
-        from . import sandbox
-
         extra_env = {k: v for k, v in extra_env.items() if k != "HEART_MODEL_PROFILE"}
         extra_env.update(sandbox.api_agent_env(model_profile))
     if agent_cmd:

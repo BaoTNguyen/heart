@@ -7,8 +7,9 @@ import subprocess
 import tempfile
 import time
 
-from .env import Workspace
+from .env import Workspace, _ws_root
 from .runner import SANDBOX_MODE, sandbox_start_failure, sandbox_wrap
+from .sandbox import verifier_profile_for
 from .taskspec import TaskSpec, Verifier
 
 
@@ -91,8 +92,6 @@ def _check_profile(task: TaskSpec, ws_path, journal: str):
     """
     if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
         return None
-    from .sandbox import verifier_profile_for
-
     return verifier_profile_for(task, ws_path, journal)
 
 
@@ -103,8 +102,6 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
     # under heart's workspace root, not /tmp: Docker Desktop shares only paths
     # it has been told about, and a bind it will not share fails the container
     # rather than the check -- which then reads as "every verifier failed"
-    from .env import _ws_root
-
     _ws_root().mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="heart-check-", dir=_ws_root()) as journal:
         for _ in range(n):
