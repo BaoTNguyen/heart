@@ -274,13 +274,40 @@ def image_is_stale(image: str | None = None,
         return None
 
     built = created.timestamp()
-    changed = dockerfile.stat().st_mtime
+    changed = _dockerfile_changed_at(dockerfile)
     if changed <= built:
         return None
     age_days = (changed - built) / 86400
     return (f"sandbox image {image!r} was built before its Dockerfile changed "
             f"({age_days:.1f} days behind). Rebuild it:\n"
             f"    docker build -t {image} {dockerfile.parent}")
+
+
+def _dockerfile_changed_at(dockerfile: Path) -> float:
+    """When the recipe last changed, by commit time where git knows.
+
+    st_mtime is the *checkout* time, not the change time. On a fresh clone or a
+    CI checkout every file is stamped with today's date, so a correctly built
+    image reads as older than its Dockerfile and every sandboxed episode raises
+    on a rebuild it does not need. The docstring above already named the right
+    source -- `git log -1 Dockerfile` -- and the code never used it.
+
+    An uncommitted edit is the one case where mtime is the better answer, so a
+    dirty Dockerfile falls back to it.
+    """
+    def _git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(["git", *args], cwd=dockerfile.parent,
+                                 capture_output=True, text=True, timeout=10)
+        except Exception:
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    if not _git("status", "--porcelain", "--", dockerfile.name):
+        committed = _git("log", "-1", "--format=%ct", "--", dockerfile.name)
+        if committed and committed.strip():
+            return float(committed.strip())
+    return dockerfile.stat().st_mtime
 
 
 def profile_for(
