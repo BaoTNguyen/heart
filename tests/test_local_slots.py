@@ -16,6 +16,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
+from dockerprobe import DOCKER_USABLE
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from heart.agents_api import endpoint_for, is_local_endpoint  # noqa: E402
@@ -319,6 +323,7 @@ def test_a_missing_sandbox_image_says_to_build_it():
     assert reason and "does not exist" in reason, reason
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_current_image_is_not_flagged():
     """Guards against the check crying wolf, which would be worse than silence:
     a sandbox that refuses to start is a harder failure than one that starts
