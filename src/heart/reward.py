@@ -33,6 +33,21 @@ def diff_changed_lines(diff_text: str) -> int:
     )
 
 
+def diff_quality(diff_text: str) -> float:
+    """How much credit a patch earns for its size.
+
+    ponytail: size heuristic -- <=50 changed lines is full credit, 0 at 500.
+    Upgrade to a diff-review model once scored episodes exist.
+
+    marrow.reward.score_patch had this curve written out character for
+    character. It is the number GRPO optimises against and the number the
+    runtime scores with, so a drift between the two teaches the trainer to
+    satisfy a reward heart no longer pays.
+    """
+    changed = diff_changed_lines(diff_text)
+    return 1.0 if changed <= 50 else max(0.0, 1.0 - (changed - 50) / 450)
+
+
 def compute(
     verifier_results: dict[str, dict],
     diff_text: str,
@@ -53,10 +68,7 @@ def compute(
             r["passed"] for r in hidden_results.values()
         ) / len(hidden_results)
 
-    # ponytail: diff quality = size heuristic (<=50 changed lines is full credit,
-    # 0 at 500). Upgrade to a diff-review model once scored episodes exist.
-    changed = diff_changed_lines(diff_text)
-    components["diff_quality"] = 1.0 if changed <= 50 else max(0.0, 1.0 - (changed - 50) / 450)
+    components["diff_quality"] = diff_quality(diff_text)
 
     # Efficiency (faster = better) only counts once the work is correct. Rewarding
     # speed on a failing/partial episode is a perverse incentive — it pays the
