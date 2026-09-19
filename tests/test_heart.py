@@ -631,22 +631,7 @@ class TestHeart(unittest.TestCase):
         self.assertIn("normal/ret-on", buf.getvalue())
 
 
-def _docker_usable() -> bool:
-    """A daemon AND the sandbox image, present locally.
-
-    The image is checked, never pulled: a test suite that silently downloads
-    gigabytes is a test suite people stop running. Build it with
-    `docker build -t heart-agent:latest .` and these un-skip."""
-    if not shutil.which("docker"):
-        return False
-    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
-        return False
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-    from heart.sandbox import DEFAULT_IMAGE
-
-    image = os.environ.get("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
-    return subprocess.run(["docker", "image", "inspect", image],
-                          capture_output=True).returncode == 0
+from dockerprobe import DOCKER_USABLE
 
 
 def _run_in(profile, script: str, timeout: int = 120):
@@ -710,6 +695,7 @@ class TestSandboxWrap(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sandbox_wrap(["echo", "hi"], False, "/tmp/ws", {})
 
+    @unittest.skipUnless(DOCKER_USABLE, "no docker daemon, or the sandbox image is not built")
     def test_the_caller_env_reaches_the_container_but_cannot_override_the_profile(self):
         from heart.runner import sandbox_wrap
         from heart.sandbox import JOURNAL, profile_for
@@ -758,7 +744,7 @@ class TestSandboxWrap(unittest.TestCase):
         self.assertEqual(seen["env"]["HEART_MODEL_PROFILE"], "opus")
 
 
-@unittest.skipUnless(_docker_usable(), "no docker daemon, or the sandbox image is not built (docker build -t heart-agent:latest .)")
+@unittest.skipUnless(DOCKER_USABLE, "no docker daemon, or the sandbox image is not built (docker build -t heart-agent:latest .)")
 class TestSandboxLive(unittest.TestCase):
     """The container, for real. These are the negative-space tests: what the
     sandbox must refuse. A green unit test on the mount table proves the flags
