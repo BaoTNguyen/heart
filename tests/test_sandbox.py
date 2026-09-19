@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from dockerprobe import DOCKER_USABLE
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from heart.sandbox import (CONTEXT, HOME, JOURNAL, WORK, profile_for,
@@ -433,6 +435,7 @@ def test_the_container_home_is_a_real_directory_the_agent_owns(monkeypatch, tmp_
     assert f"{HOME}/.claude/.credentials.json:ro" in args
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_the_network_is_applied_after_creation_because_the_plugin_takes_no_flag():
     """Measured on the plugin at v0.6.0: NetworkMode=bridge, CapDrop=[],
     ReadonlyRootfs=false, Memory=0. It leaves an ordinary container behind
@@ -451,6 +454,7 @@ def test_the_network_is_applied_after_creation_because_the_plugin_takes_no_flag(
     assert "docker update --memory 4g" in egress
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_failed_network_step_is_fatal_not_a_quiet_widening():
     """A sandbox that keeps its bridge leg because the disconnect failed is the
     silent widening the feature exists to prevent; one that reaches no network
@@ -469,6 +473,7 @@ def test_a_failed_network_step_is_fatal_not_a_quiet_widening():
                for l in script.splitlines()), script
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_the_sandbox_is_removed_even_when_the_turn_fails():
     # the plugin does not take --rm; without the removal every episode leaves a
     # sandbox behind. It used to be the second-to-last line, which covered the
@@ -526,6 +531,7 @@ def test_a_multiline_value_survives_the_plugin(monkeypatch):
     assert "PLAIN=single" in args, "a value with no newline needs no encoding"
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_the_decoder_runs_before_the_agent_sees_the_environment():
     from heart.runner import sandbox_wrap
     from heart.sandbox import _B64_SUFFIX
