@@ -81,7 +81,7 @@ from .detect import detect_verifiers
 from .env import Workspace
 from .episode import run_episode
 from .events import emit
-from .runner import run_agent
+from .runner import run_agent, turn_profile
 from .verify import run_probes, run_verifiers
 
 
@@ -312,7 +312,8 @@ def _llm_decompose(task, agent: str, agent_cmd: str | None, runs_dir, parent: st
         res = run_agent(dagent, _DECOMPOSE_PROMPT.format(
                             task=task.prompt, skills=", ".join(route_mod.SKILLS)),
                         cwd=str(ws.path), extra_env=env, timeout=task.timeout_seconds,
-                        log_path=out / "decompose.log", agent_cmd=agent_cmd)
+                        log_path=out / "decompose.log", agent_cmd=agent_cmd,
+                        profile=turn_profile(task, ws.path, out, f"{parent}-decompose"))
     finally:
         ws.destroy()
     # Path A is the right answer whether the planner declined or the planner
@@ -721,7 +722,10 @@ def _integration_check(task, diff: str, verifiers: list) -> tuple[bool | None, d
             ws.apply(diff)
         except RuntimeError:
             return False, {}  # merged diff won't even apply cleanly
-        results = run_verifiers(verifiers, str(ws.path), task.timeout_seconds)
+        results = run_verifiers(
+            verifiers, str(ws.path), task.timeout_seconds,
+            profile=turn_profile(task, ws.path, None, f"{task.task_id}-integration",
+                                 kind="verifier"))
         return all(r["passed"] for r in results.values()), results
     finally:
         ws.destroy()
@@ -764,9 +768,12 @@ def _repair(task, merged_diff: str, verifiers: list, agent: str,
     ws = Workspace(task.repo_path, task.base_commit)
     try:
         ws.apply(merged_diff)
-        tail = _fail_tail(run_verifiers(verifiers, str(ws.path), task.timeout_seconds))
         out = Path(runs_dir) / f"{task.task_id}-repair"
         out.mkdir(parents=True, exist_ok=True)
+        key = f"{task.task_id}-repair"
+        judge = turn_profile(task, ws.path, out, key, kind="verifier")
+        tail = _fail_tail(run_verifiers(verifiers, str(ws.path), task.timeout_seconds,
+                                        profile=judge))
         prompt = (f"Independently-built changes were merged and now fail verification:\n"
                   f"{tail}\nFix the integration so the checks pass. Do not weaken or "
                   f"delete tests.\nOriginal task: {task.prompt}")
@@ -774,9 +781,11 @@ def _repair(task, merged_diff: str, verifiers: list, agent: str,
         env = {"ARTERIES_AGENT_ID": parent, "ARTERIES_AGENT_ROLE": "parent",
                "ARTERIES_PROJECT": repo.name, "ARTERIES_REPO": str(repo)}
         run_agent(agent, prompt, str(ws.path), env, task.timeout_seconds,
-                  out / "repair.log", agent_cmd=agent_cmd)
+                  out / "repair.log", agent_cmd=agent_cmd,
+                  profile=turn_profile(task, ws.path, out, key, kind="writer"))
         new_diff = ws.diff()
-        results = run_verifiers(verifiers, str(ws.path), task.timeout_seconds)
+        results = run_verifiers(verifiers, str(ws.path), task.timeout_seconds,
+                                profile=judge)
         passed = all(r["passed"] for r in results.values()) if results else True
         return new_diff, passed, results
     finally:
@@ -835,9 +844,11 @@ def _review_merged(task, diff: str, roles, agent: str, runs_dir, agent_cmd,
         env = {"ARTERIES_AGENT_ID": parent, "ARTERIES_AGENT_ROLE": "parent",
                "ARTERIES_PROJECT": repo.name, "ARTERIES_REPO": str(repo)}
 
+        reader = turn_profile(task, ws.path, out, f"{task.task_id}-review")
+
         def _assess(name, prompt):
             run_agent(reviewer, prompt, str(ws.path), env, task.timeout_seconds,
-                      out / f"{name}.log", agent_cmd=agent_cmd)
+                      out / f"{name}.log", agent_cmd=agent_cmd, profile=reader)
             return out / f"{name}.log"
 
         result = review_mod.phase(

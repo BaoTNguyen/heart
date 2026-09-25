@@ -13,8 +13,10 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -23,6 +25,7 @@ from . import agents_api
 # re-exported: cli reads the rate card through runner
 from .agents_api import load_models_json, models_json_path
 from . import sandbox
+from .env import _ws_root
 from .sandbox import WORK, decode_env_snippet, image_is_stale
 
 # Worktrees are disposable, so agent permission prompts are disabled.
@@ -242,10 +245,12 @@ def sandbox_wrap(
     Two mechanisms enforcing overlapping halves of one policy is how the halves
     drift apart, so the weaker one went.
 
-    ponytail: containment for accidents and reward hacking, not a boundary
-    against a hostile model. A role granted network="api" reaches whatever the
-    egress proxy's allowlist permits, and HEART_API_NETWORK=bridge removes even
-    that.
+    Threat model: a prompt-injected or hostile agent, not only accidents and
+    reward hacking. What that buys and what it does not: the host, the seat
+    credential (injected by the proxy, never mounted -- see inject_env) and the
+    LAN are out of reach; the repo the agent was handed is not, on a lane with
+    web egress. A role granted network="api" reaches whatever the egress proxy's
+    allowlist permits, and HEART_API_NETWORK=bridge removes even that.
     """
     if mode is None:
         mode = os.environ.get("HEART_SANDBOX", "off")
@@ -254,10 +259,9 @@ def sandbox_wrap(
     if mode == "docker":
         raise ValueError(
             "HEART_SANDBOX=docker is no longer a mode; use 'docker-sbx'. "
-            "Note what that costs: the plugin has no network, capability or "
-            "resource flags, so network 'none' is not enforced, the egress "
-            "allowlist becomes advisory rather than a boundary, and verifiers "
-            "can reach the network.")
+            "Network and resource limits are applied to the plugin's container "
+            "after creation; capability and read-only-rootfs flags are not "
+            "available there, and the image's non-root user stands in for them.")
     if mode != SANDBOX_MODE:
         raise ValueError(f"HEART_SANDBOX={mode!r}: only {SANDBOX_MODE!r} or 'off' supported")
     if profile is None:
@@ -795,6 +799,77 @@ def sandbox_start_failure(exit_code: int, output: str) -> str | None:
     return None
 
 
+def turn_profile(task, workspace, out: Path | None, key: str, kind: str = "reader"):
+    """The container for a turn outside an episode, or None when no sandbox was
+    asked for -- the same contract as the episode's own profiles, so
+    HEART_SANDBOX=off leaves these turns exactly as they were.
+
+    Outside an episode means the planner, the decomposer, the plan-vs-landed
+    reviewer and the Path-B repair agent. They used to run on the host with
+    --dangerously-skip-permissions whatever HEART_SANDBOX said: the least
+    contained turns in the loop, and the reviewer's whole input is a diff an
+    agent wrote.
+
+      reader   -- plans or judges: a model, the seat, read-only worktree
+      writer   -- repairs: the ordinary agent profile, writable per the spec
+      verifier -- scores: network none, read-only, no credential
+
+    A reader or writer asks for a model, so a task whose network is "none" --
+    the heart CLI default -- is read as "api" rather than refused at launch.
+    """
+    if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
+        return None
+    inbox = sandbox.inbox_for(key)
+    env = {k: v for k, v in os.environ.items() if k.startswith("ARTERIES_")}
+    if kind == "verifier":
+        return sandbox.verifier_profile_for(task, workspace, inbox, env=env)
+    if (getattr(task, "network", "") or "none").strip().lower() == "none":
+        task = replace(task, network="api")
+    context = out / "context"
+    context.mkdir(parents=True, exist_ok=True)
+    make = sandbox.profile_for if kind == "writer" else sandbox.reader_profile_for
+    return make(task, workspace, context, inbox, env=env)
+
+
+def run_contained(command: str, cwd: str, timeout: float | None,
+                  writable: bool = False) -> subprocess.CompletedProcess:
+    """Run a shell command that executes code an agent wrote -- an acceptance
+    check, a test suite -- in a verifier container when HEART_SANDBOX asks for
+    one, and on the host otherwise.
+
+    For the control plane's own checks. heart's verifiers were always contained;
+    plexus then applied the same diff in a fresh worktree and ran `pytest` on
+    the host, so a conftest.py the agent wrote ran with the operator's home,
+    network and docker socket one step after the sandbox let it go. This is the
+    same container a verifier gets -- network none, no credential, no context --
+    with the tree optionally writable, because an acceptance command may build
+    before it checks and its worktree is a throwaway anyway.
+
+    Same return shape and TimeoutExpired as subprocess.run, so a caller swaps
+    one call for the other. A container that never started raises instead of
+    returning a failure, for the reason sandbox_start_failure gives.
+    """
+    if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
+        return subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout)
+    # under heart's workspace root: Docker Desktop shares only paths it was told
+    # about, and a bind it will not share fails the container, not the check
+    _ws_root().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="heart-cmd-", dir=_ws_root()) as inbox:
+        profile = sandbox.verifier_profile_for(
+            SimpleNamespace(timeout_seconds=int(timeout or 0)), cwd, inbox)
+        if writable:
+            profile = replace(profile, mounts=tuple(
+                sandbox.Mount(m.source, m.target, writable=True) if m.target == WORK
+                else m for m in profile.mounts))
+        cmd, shell = sandbox_wrap(command, True, cwd, {}, profile=profile)
+        r = subprocess.run(cmd, shell=shell, cwd=cwd, capture_output=True,
+                           text=True, timeout=timeout)
+    if failure := sandbox_start_failure(r.returncode, r.stdout + r.stderr):
+        raise RuntimeError(f"sandbox failed to start for {command!r}: {failure}")
+    return r
+
+
 @lru_cache(maxsize=None)
 def _agent_version(base: str) -> str | None:
     """Which build of the agent CLI ran, for the episode record.
@@ -869,12 +944,24 @@ def run_agent(
         raise RuntimeError(
             f"agent {agent!r} needs a model but the task spec asks for "
             f'network "none"; set "network": "api" (vendor) or "model" (local)')
+    if (profile is not None and base == "codex" and not shell
+            and (codex_base := profile.env.get("HEART_CODEX_BASE"))):
+        # the injected ChatGPT seat: every Codex request goes to the proxy,
+        # which swaps the sentinel for the real token (see inject_env)
+        at = cmd.index("exec") + 1
+        cmd[at:at] = ["-c", f'chatgpt_base_url="{codex_base}/"',
+                      "-c", f'openai_base_url="{codex_base}/codex"']
     cmd, shell = sandbox_wrap(cmd, shell, cwd, extra_env, profile=profile)
     # HEART_TIER_* is this process's routing config, never the child's: a
     # nested heart invocation (agents working on heart itself) must not
     # inherit ambient tier overrides — that leak broke real episodes once
     env = {k: v for k, v in os.environ.items() if not k.startswith("HEART_TIER_")}
     env.update(extra_env)
+    # An unattended turn, whatever it read: what its memory hooks capture is
+    # marked untrusted, and what they retrieve for it may include its own
+    # project's untrusted rows but never reaches your own sessions (arteries
+    # trust.py). Only matters where the hooks run -- HEART_SANDBOX=off.
+    env["ARTERIES_TRUST"] = "untrusted"
     # Only api agents pointing at a local server take a local slot; paid APIs
     # and CLI agents pass endpoint=None and skip that gate. Probe never raises
     # (endpoint_for is tolerant) — an uncertain probe just means "not local".

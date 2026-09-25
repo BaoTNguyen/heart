@@ -24,12 +24,13 @@ import os
 import shutil
 import subprocess
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from . import agents_api
+from .env import _ws_root
 from .taskspec import TaskSpec
 
 WORK = "/work"
@@ -45,14 +46,13 @@ HOME = "/home/agent"
 # Built from this repo's Dockerfile: git, node, heart, and no agent CLI at all
 # (those are mounted from the host -- see agent_tool_mounts).
 #
-# Not `docker sandbox run`, and not its docker/sandbox-templates image. That
-# plugin runs an agent in a container it builds itself, and measured against
-# the running one it gives bridge networking with no way to change it, no
-# cap-drop, no read-only rootfs, no resource limits, passwordless sudo, and a
-# TTY it will not run without. It also accepts only `claude` and `gemini`,
-# where heart also has `api:` and shell-template agents. Every one of those is
-# something the profile below expresses, so heart drives `docker run` directly
-# and the plugin stays unused.
+# Not the plugin's docker/sandbox-templates image, which ships passwordless
+# sudo and accepts only `claude` and `gemini`. The plugin itself *is* the
+# runtime (runner.sandbox_wrap, HEART_SANDBOX=docker-sbx), started with this
+# image via -t. What it cannot take as flags -- network, memory, cpus, pids --
+# is applied to its container after creation and before anything runs in it;
+# what it cannot take at all -- --cap-drop, --read-only, --user at create -- is
+# absent, and the non-root USER in the Dockerfile is what stands in for them.
 DEFAULT_IMAGE = "heart-agent:latest"
 
 #: Marks an environment variable whose value was base64'd past the plugin's
@@ -121,20 +121,26 @@ NETWORKS = {
     "api": os.getenv("HEART_API_NETWORK", "heart-egress"),
     "model": os.getenv("HEART_MODEL_NETWORK", "heart-egress"),
     "build": os.getenv("HEART_BUILD_NETWORK", "heart-build"),
+    # The web lane: any public host on 80/443 through its own proxy
+    # (`egress-web`), which refuses private addresses and IP literals and
+    # resolves through a malware-filtering DNS. A separate network rather than a
+    # wider ALLOW on the shared one, because a container on heart-egress can
+    # reach every port of every proxy on heart-egress -- one proxy per lane is
+    # what keeps an "api" task from borrowing the web lane's reach.
+    "web": os.getenv("HEART_WEB_NETWORK", "heart-web"),
 }
 
 # Inside a container, 127.0.0.1 is the container. A model server bound to host
-# loopback is unreachable no matter which network the container joins, so an
-# agent that resolves its endpoint from the host's config would quietly fail to
-# connect. The container is told the address that reaches the host from its
-# side; the host keeps its own.
+# loopback is reached from a container as host.docker.internal, so the
+# container is told that address; the host keeps its own.
 #
-# Binding the model server to the docker0 address instead of 0.0.0.0 is the
-# obvious hardening and it is wrong under Docker Desktop: host.docker.internal
-# resolves to the Desktop VM's gateway (192.168.65.2 here), not to 172.17.0.1,
-# so a docker0-only bind is unreachable from every container. Measured on this
-# box. 0.0.0.0 stays, and the exposure it opens -- every interface, tailscale0
-# included -- belongs to the host firewall, not to a bind address.
+# Under Docker Desktop, host.docker.internal is forwarded to the *host's
+# loopback*: a server bound to 127.0.0.1 answers it. Measured on this box
+# (2026-09-24): an http.server on 127.0.0.1 and one on 0.0.0.0 both answered a
+# bridge container, and so did llama-server. So loopback is the right bind --
+# it keeps the model off the LAN and the tailnet without costing the sandbox
+# anything. (An earlier note here said the opposite; it measured a docker0-only
+# bind, which is a different address and does fail.)
 
 @dataclass(frozen=True)
 class Mount:
@@ -171,9 +177,10 @@ class SandboxProfile:
                    --cap-drop, --read-only, --memory/--cpus/--pids-limit,
                    --user.
 
-        So this mode gives the privilege boundary the task spec describes and
-        none of the blast-radius limits. sandbox_wrap refuses to run a task
-        that asked for network "none" here rather than pretend to honour it.
+        sandbox_wrap closes the network and resource half after creation: it
+        disconnects bridge, connects the network the profile names (none for
+        "none"), and `docker update`s the limits, all before the agent is
+        exec'd. Capabilities and a read-only rootfs stay uncovered.
 
         --workspace is pointed at the journal inbox, not the worktree. The
         plugin mounts whatever it is given read-write at its *host* path, and
@@ -322,7 +329,7 @@ def profile_for(
     return SandboxProfile(
         image=image or os.getenv("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE),
         mounts=_mounts(task, Path(workspace), Path(context_dir), Path(inbox_dir))
-        + home_file_mounts(),
+        + home_file_mounts() + codex_sentinel_mounts(),
         network=NETWORKS.get(_network(task), "none"),
         timeout_seconds=task.timeout_seconds,
         env=dict(env or {}) | _agent_env(task),
@@ -417,12 +424,11 @@ def container_endpoint(url: str) -> str:
     GPU on adjacent ports is the normal arrangement, and a constant would send
     every profile to the same one.
 
-    This only makes the address reachable. The server still has to be listening
-    on something other than loopback: `llama-server --host 127.0.0.1` cannot be
-    reached from a container whatever the URL says. Under Docker Desktop that
-    means 0.0.0.0, because host.docker.internal is the Desktop VM's gateway and
-    a docker0-only bind never sees it -- so bound the exposure at the firewall
-    instead of the bind address.
+    This only makes the address reachable. Under Docker Desktop a server on
+    127.0.0.1 is enough -- host.docker.internal lands on the host's loopback --
+    so `llama-server --host 127.0.0.1` serves containers and nothing else.
+    Native Docker Engine (no Desktop VM) differs: there the alias is the bridge
+    gateway, and the server has to listen on it.
     """
     parts = urlsplit(url)
     if parts.hostname not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
@@ -466,7 +472,7 @@ def api_agent_env(model_profile: str) -> dict[str, str]:
     return env
 
 
-def home_file_mounts() -> tuple[tuple[Mount, ...], tuple[str, ...]]:
+def home_file_mounts() -> tuple[Mount, ...]:
     """Host config files placed in the container's HOME.
 
     This is how a subscription seat gets into the sandbox. Claude Pro/Max and
@@ -485,28 +491,74 @@ def home_file_mounts() -> tuple[tuple[Mount, ...], tuple[str, ...]]:
     auth error, which is recoverable, rather than silently taking your session
     with it.
 
-    Files only, never a directory: mounting ~/.claude whole would hand the agent
-    every project history and transcript on the machine, and it is not a
-    credential store, it is a home.
+    Files here, and directories only through HEART_SANDBOX_HOME_DIRS (below):
+    mounting ~/.claude whole would hand the agent every project history and
+    transcript on the machine, and it is not a credential store, it is a home.
+
+    The source is the resolved file, the target the unresolved position: a
+    home-manager setup makes ~/.claude/settings.json a symlink into /nix/store,
+    and the container wants the file where the link was.
 
     Agent roles only -- a verifier has no model to authenticate to.
     """
     names = [n.strip() for n in os.getenv("HEART_SANDBOX_HOME_FILES", "").split(",")
              if n.strip()]
     mounts = []
-    host_home = Path.home()
     for name in names:
         path = Path(name).expanduser()
-        if not path.is_file():
+        rel = _home_rel(path)
+        if rel is None or not path.is_file():
             continue
-        try:
-            rel = path.relative_to(host_home)
-        except ValueError:
-            # Only paths under the host's home have a meaningful position in
-            # the container's home; anything else has nowhere obvious to land.
+        mounts.append(Mount(os.path.realpath(path), f"{HOME}/{rel}", writable=False))
+    return tuple(mounts) + home_dir_mounts()
+
+
+#: A directory holding one of these is a credential store, whatever it was
+#: named as; it is refused whole rather than mounted with the token inside.
+_CREDENTIAL_FILES = (".credentials.json", "auth.json")
+
+
+def home_dir_mounts() -> tuple[Mount, ...]:
+    """Host directories placed in the container's HOME, read-only: the dev
+    environment -- skills, plugins -- that makes a contained agent behave like
+    the one on the host.
+
+        HEART_SANDBOX_HOME_DIRS=~/.claude/skills,~/.claude/plugins
+
+    Each lands at its HOME-relative position and, when that differs, at its
+    host path too, because plugin manifests record absolute host paths
+    (installed_plugins.json names /home/<you>/.claude/plugins/cache/...), and a
+    plugin found at neither place loads nothing and says so only in a debug log.
+
+    Read-only is the security property here, not tidiness. Plugins and skills
+    carry hooks and scripts that run in every session; a writable mount would
+    let an agent plant one that next runs on the host. The home itself, and any
+    directory holding a credential file, is refused.
+    """
+    names = [n.strip() for n in os.getenv("HEART_SANDBOX_HOME_DIRS", "").split(",")
+             if n.strip()]
+    mounts = []
+    for name in names:
+        path = Path(name).expanduser()
+        rel = _home_rel(path)
+        if rel is None or rel == Path(".") or not path.is_dir():
             continue
-        mounts.append(Mount(str(path), f"{HOME}/{rel}", writable=False))
+        if any((path / f).exists() for f in _CREDENTIAL_FILES):
+            continue
+        real = os.path.realpath(path)
+        mounts.append(Mount(real, f"{HOME}/{rel}", writable=False))
+        if str(path) != f"{HOME}/{rel}":
+            mounts.append(Mount(real, str(path), writable=False))
     return tuple(mounts)
+
+
+def _home_rel(path: Path) -> Path | None:
+    """Position under the host's home, or None. Only paths there have a
+    meaningful place in the container's home."""
+    try:
+        return path.relative_to(Path.home())
+    except ValueError:
+        return None
 
 
 @lru_cache(maxsize=None)
@@ -551,7 +603,124 @@ def proxy_env(network: str = "") -> dict[str, str]:
         url = _proxy_on(network)
     if not url:
         return {}
-    return {k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+    env = {k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+    return env | inject_env(urlsplit(url).hostname or "")
+
+
+
+#: The unsigned JWT head of Codex's stand-in: Codex reads claims out of its
+#: tokens before it sends, so the stand-in has to parse. Says nothing true and
+#: expires in 2100. The seed is its third segment. Same in contrib/egress-proxy.py.
+CODEX_HEAD = ("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
+              "eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6"
+              "eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJoZWFydC1zZW50aW5lbCJ9fQ")
+
+
+def sentinel_seed() -> str:
+    """This box's random seed, or "".
+
+    What an agent holds instead of a seat is derived from it, so it is worth
+    something only to a container that was handed it: a run with seats
+    withheld (PLEXUS_SEAT=off) can reach the injector but cannot use it, where a
+    constant anyone could read in this file would have let it. plexus doctor
+    creates it; the proxy reads the same file from its mount.
+    """
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    try:
+        return (cfg / "heart" / "secrets" / "sentinel").read_text().strip()
+    except OSError:
+        return ""
+
+
+def sentinels(seed: str) -> dict[str, str]:
+    """route -> the stand-in credential for it. contrib/egress-proxy.py derives
+    the same two from the same seed; a test holds them equal."""
+    return {"anthropic": f"sk-ant-oat01-heart-{seed}", "chatgpt": f"{CODEX_HEAD}.{seed}"}
+
+
+def _seeded() -> dict[str, str]:
+    seed = sentinel_seed()
+    if not seed:
+        # Injection asked for and nothing to inject with: the container would
+        # start with no credential and fail as "not logged in", three roles in.
+        raise RuntimeError(
+            "seat injection is on (HEART_SANDBOX_INJECT) but this box has no "
+            "sentinel seed -- run `plexus doctor --fix`")
+    return sentinels(seed)
+
+
+def _injected() -> set[str]:
+    return {r.strip() for r in os.getenv("HEART_SANDBOX_INJECT", "").split(",") if r.strip()}
+
+
+def codex_sentinel_mounts() -> tuple[Mount, ...]:
+    """A Codex auth.json that holds nothing: the sentinel as its access token,
+    an id_token carrying only the plan claim Codex reads, and last_refresh set
+    to now -- rewritten on every profile, so Codex never decides it is due a
+    refresh (which the proxy would refuse anyway, and the turn would fail).
+
+    Not a secret, so it is written freely; the real one stays in ~/.codex and
+    is read only by the proxy. The plan comes from the control plane
+    (HEART_SANDBOX_CODEX_PLAN), which read it off the real token's claims.
+    """
+    if "chatgpt" not in _injected():
+        return ()
+    def seg(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    plan = os.getenv("HEART_SANDBOX_CODEX_PLAN", "plus")
+    claims = {"exp": 4102444800, "https://api.openai.com/auth": {
+        "chatgpt_plan_type": plan, "chatgpt_account_id": "heart-sentinel",
+        "chatgpt_user_id": "heart-sentinel"}}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    doc = {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+           "tokens": {"id_token": ".".join([seg({"alg": "none"}), seg(claims), "c2VudGluZWw"]),
+                      "access_token": _seeded()["chatgpt"], "refresh_token": "heart-sentinel",
+                      "account_id": "heart-sentinel"},
+           "last_refresh": now}
+    # beside the worktree root, not in it: reclaim() removes every directory
+    # there that no live Workspace owns, and Docker Desktop still shares it
+    path = _ws_root().parent / "heart-sentinel" / "codex" / "auth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(doc))
+    os.replace(tmp, path)  # a container already running keeps the copy it had
+    return (Mount(str(path), f"{HOME}/.codex/auth.json", writable=False),)
+
+
+def inject_env(proxy_host: str) -> dict[str, str]:
+    """Point a Claude CLI at the proxy's credential injector instead of handing
+    it the seat.
+
+    The container gets a sentinel token and a base URL; the proxy swaps in the
+    real credential on the way out. Nothing in the container is worth stealing,
+    and a foreign key has nowhere to go, because the proxy refuses CONNECT to
+    an injected host while the injector runs.
+
+    Only when the control plane says the seat is injected
+    (HEART_SANDBOX_INJECT=anthropic, set by plexus when a seat token is saved
+    for the proxy) -- otherwise the seat arrives the old way, as a read-only
+    file from home_file_mounts, and nothing here changes.
+
+    NO_PROXY names the proxy itself: the base URL is plain http on the internal
+    network, and sent through HTTP_PROXY it would arrive as an absolute URI for
+    a host no allowlist names.
+    """
+    routes = _injected()
+    if not routes & {"anthropic", "chatgpt"} or not proxy_host:
+        return {}
+    at = f"http://{proxy_host}:{os.getenv('HEART_SANDBOX_INJECT_PORT', '8889')}"
+    env = {"NO_PROXY": proxy_host, "no_proxy": proxy_host}
+    if "anthropic" in routes:
+        env |= {"ANTHROPIC_BASE_URL": f"{at}/anthropic",
+                "CLAUDE_CODE_OAUTH_TOKEN": _seeded()["anthropic"]}
+    if "chatgpt" in routes:
+        # Codex takes its two base URLs only as config, so run_agent turns this
+        # into `-c` flags; the refresh override points at a route the injector
+        # does not have, so a refresh is refused there and never rotates the
+        # host's token at OpenAI.
+        env |= {"HEART_CODEX_BASE": f"{at}/chatgpt/backend-api",
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": f"{at}/refresh"}
+    return env
 
 
 def _proxy_on(network: str) -> str:
@@ -573,8 +742,11 @@ def _proxy_on(network: str) -> str:
     if not internal:
         return ""
     want = os.getenv("HEART_EGRESS_CONTAINER", "egress")
-    if want in names:
-        pick = want
+    # `egress` on heart-egress, `egress-web` on heart-web: one proxy per lane,
+    # named for it, so a lane's proxy is found among the agents sharing it
+    ours = [n for n in names if n == want or n.startswith(want + "-")]
+    if len(ours) == 1:
+        pick = ours[0]
     elif len(names) == 1:
         pick = names[0]
     else:
@@ -786,6 +958,31 @@ def verifier_profile_for(
         memory=os.getenv("HEART_SANDBOX_MEMORY", "4g"),
         cpus=os.getenv("HEART_SANDBOX_CPUS", "2"),
     )
+
+
+def reader_profile_for(
+    task: TaskSpec,
+    workspace: str | Path,
+    context_dir: str | Path,
+    inbox_dir: str | Path,
+    env: dict[str, str] | None = None,
+    image: str | None = None,
+) -> SandboxProfile:
+    """The container for an agent that reads and judges but must not write:
+    the planner, the decomposer, the plan-vs-landed reviewer.
+
+    They get what an agent role gets (a model, the seat, the proxy, /context) minus the
+    one thing they have no use for: a writable tree. Every writable remount of
+    the worktree is dropped and the worktree itself goes in read-only; the
+    per-worktree git directory stays writable because `git diff` refreshes the
+    index to answer. runner.turn_profile is the entry point.
+    """
+    agent = profile_for(task, workspace, context_dir, inbox_dir, env=env, image=image)
+    mounts = tuple(
+        Mount(m.source, m.target, writable=False) if m.target == WORK else m
+        for m in agent.mounts
+        if not (m.writable and m.target.startswith(WORK + "/")))
+    return replace(agent, mounts=mounts)
 
 
 def inbox_for(key: str) -> Path:

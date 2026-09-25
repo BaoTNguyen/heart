@@ -386,6 +386,11 @@ def _context_packet(task: TaskSpec, role: str, memory: str, out: Path,
     situation = _situation(task)
     env = {**os.environ, "ARTERIES_EPISODE_ID": episode_id,
            "ARTERIES_TASK_ID": task.task_id,
+           # The packet is read by an agent: it may carry this project's
+           # untrusted memory, and on the web lane nothing from another
+           # project, since whatever lands in /context can leave with it.
+           "ARTERIES_TRUST": "untrusted",
+           "ARTERIES_LANE": (getattr(task, "network", "") or "none").strip().lower(),
            # Chaining is keyed on the session. Heart stamped episode and task and
            # never this, so every packet recorded a NULL session and arteries'
            # recent_packet_members returned nothing -- role 3 re-sent what role 1
