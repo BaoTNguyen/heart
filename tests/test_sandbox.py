@@ -357,9 +357,39 @@ def test_only_files_under_the_host_home_are_placed(tmp_path, monkeypatch):
     a_dir = tmp_path / ".claude"
     a_dir.mkdir()
     monkeypatch.setenv("HEART_SANDBOX_HOME_FILES", f"{outside},{a_dir}")
+    monkeypatch.delenv("HEART_SANDBOX_HOME_DIRS", raising=False)
     from heart.sandbox import home_file_mounts
 
     assert home_file_mounts() == ()
+
+
+def test_the_dev_environment_comes_in_read_only_and_never_a_credential_store(tmp_path, monkeypatch):
+    """Skills and plugins make a contained agent behave like the host one. They
+    arrive read-only -- a writable plugin dir is a hook the agent can plant for
+    the host to run -- and a directory holding a token is refused whole."""
+    monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: tmp_path))
+    claude = tmp_path / ".claude"
+    (claude / "skills" / "tagore").mkdir(parents=True)
+    (claude / "plugins").mkdir()
+    (claude / ".credentials.json").write_text("{}")
+    store = tmp_path / "store" / "settings.json"          # home-manager's symlink target
+    store.parent.mkdir()
+    store.write_text("{}")
+    (claude / "settings.json").symlink_to(store)
+    monkeypatch.setenv("HEART_SANDBOX_HOME_FILES", f"{claude / 'settings.json'}")
+    monkeypatch.setenv("HEART_SANDBOX_HOME_DIRS",
+                       f"{claude / 'skills'},{claude / 'plugins'},{claude},{tmp_path}")
+    from heart.sandbox import home_file_mounts
+
+    got = {(m.source, m.target) for m in home_file_mounts()}
+    assert all(not m.writable for m in home_file_mounts())
+    assert (str(store), f"{HOME}/.claude/settings.json") in got   # resolved source, link's place
+    assert (str(claude / "skills"), f"{HOME}/.claude/skills") in got
+    # plugin manifests name absolute host paths, so the host path works too
+    assert (str(claude / "plugins"), str(claude / "plugins")) in got
+    targets = {t for _, t in got}
+    assert f"{HOME}/.claude" not in targets, "a dir with a credential in it is refused"
+    assert HOME not in targets and str(tmp_path) not in targets, "the home itself is refused"
 
 
 # --- docker-sbx: the same profile, a second renderer ----------------------
@@ -643,6 +673,186 @@ def test_a_port_in_an_entry_is_the_whole_point_of_listing_the_host_alias(monkeyp
     assert not permitted("host.docker.internal", 8000)
 
 
+def test_the_web_lane_reaches_public_names_and_nothing_that_skips_the_filter(monkeypatch):
+    """`*` is any public host on a web port. An IP literal skips DNS, which is
+    where the malware filter lives, and a port other than 80/443 is how a
+    'web' lane turns into an SSH or database client."""
+    monkeypatch.setenv("ALLOW", "*,host.docker.internal:8001")
+    monkeypatch.setenv("DENY", "pastebin.com")
+    permitted = _proxy_module().permitted
+    assert permitted("docs.python.org", 443)
+    assert permitted("example.com", 80)
+    assert not permitted("example.com", 22)
+    assert not permitted("1.1.1.1", 443)
+    assert not permitted("::1", 443)
+    assert not permitted("pastebin.com", 443)
+    assert not permitted("x.pastebin.com", 443)
+    # a named entry still wins, which is how the local model stays reachable
+    assert permitted("host.docker.internal", 8001)
+
+
+def test_public_means_the_address_not_the_name():
+    """Names are resolved and every address must be public. The tailnet, the
+    LAN, loopback and the Docker Desktop VM are the places a web lane must not
+    become a route into."""
+    public = _proxy_module()._public
+    assert public("1.1.1.1")
+    for private in ("127.0.0.1", "10.10.10.1", "192.168.65.254",
+                    "100.87.230.112", "169.254.169.254", "::1", "fd7a:115c:a1e0::1"):
+        assert not public(private), private
+
+
+def test_an_injected_host_has_no_route_but_the_injector(monkeypatch, tmp_path):
+    """A foreign credential must have nowhere to go. If CONNECT still reached
+    api.anthropic.com, an agent could skip the injector and use an attacker's
+    key directly -- the exfiltration path the injector exists to close. Only a
+    seat the proxy holds loses its route: codex on a mounted file keeps
+    chatgpt.com until its seat is injected too."""
+    monkeypatch.setenv("ALLOW", "*,api.anthropic.com:443")
+    monkeypatch.setenv("INJECT_PORT", "8889")
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+    (tmp_path / "anthropic").write_text("sk-ant-oat01-real")
+    permitted = _proxy_module().permitted
+    assert not permitted("api.anthropic.com", 443)
+    assert permitted("statsig.anthropic.com", 443)
+    assert permitted("chatgpt.com", 443), "no codex secret here, so codex keeps its route"
+
+
+def test_codex_gets_a_sentinel_auth_file_and_the_proxy_as_its_server(monkeypatch, tmp_path):
+    """Codex reads claims from its tokens before sending, so the stand-in is a
+    parseable JWT; last_refresh is now, so Codex never reaches for a refresh."""
+    import base64, json
+    import heart.sandbox as sb
+    import heart.runner as runner
+
+    monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "heart" / "secrets").mkdir(parents=True)
+    (tmp_path / "heart" / "secrets" / "sentinel").write_text("s33d")
+    monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
+    monkeypatch.setenv("HEART_SANDBOX_CODEX_PLAN", "pro")
+    (mount,) = sb.codex_sentinel_mounts()
+    assert mount.target == f"{HOME}/.codex/auth.json" and not mount.writable
+    doc = json.loads(Path(mount.source).read_text())
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "heart" / "secrets"))
+    assert doc["tokens"]["access_token"] == sb.sentinels("s33d")["chatgpt"] \
+        == _proxy_module().sentinels()["chatgpt"]
+    payload = doc["tokens"]["id_token"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    assert claims["https://api.openai.com/auth"]["chatgpt_plan_type"] == "pro"
+
+    env = sb.inject_env("egress-web")
+    assert env["HEART_CODEX_BASE"] == "http://egress-web:8889/chatgpt/backend-api"
+    assert env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"].startswith("http://egress-web:8889/")
+    assert "ANTHROPIC_BASE_URL" not in env
+
+    class Wrapped(Exception):
+        pass
+
+    def stop(cmd, *a, **k):  # the command as it would enter the container
+        raise Wrapped(cmd)
+
+    monkeypatch.setattr(runner, "sandbox_wrap", stop)
+    profile = sb.replace(_profile(_task(network="api")), env={"HEART_CODEX_BASE": env["HEART_CODEX_BASE"]})
+    with pytest.raises(Wrapped) as got:
+        runner.run_agent("codex", "do it", str(tmp_path), {}, 10, tmp_path / "log", profile=profile)
+    cmd = got.value.args[0]
+    assert cmd[:2] == ["codex", "exec"]
+    assert 'openai_base_url="http://egress-web:8889/chatgpt/backend-api/codex"' in cmd
+    assert 'chatgpt_base_url="http://egress-web:8889/chatgpt/backend-api/"' in cmd
+    assert cmd[-1] == "do it"
+
+
+def test_the_chatgpt_route_swaps_token_and_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+    proxy = _proxy_module()
+    monkeypatch.setitem(proxy._SECRET_FILES, "chatgpt", str(tmp_path / "auth.json"))
+    (tmp_path / "auth.json").write_text(
+        '{"tokens": {"access_token": "real-access", "account_id": "real-acct"}}')
+    assert proxy.secret("chatgpt") == "real-access" and proxy.account("chatgpt") == "real-acct"
+    (tmp_path / "sentinel").write_text("s33d")
+    own = proxy.sentinels()
+    assert proxy.sentinel_only([("Authorization", f"Bearer {own['chatgpt']}")], own["chatgpt"])
+    assert not proxy.sentinel_only([("Authorization", f"Bearer {own['anthropic']}")],
+                                   own["chatgpt"]), "each route takes only its own"
+    out = proxy.rewrite("POST", "/backend-api/codex/responses",
+                        [("chatgpt-account-id", "heart-sentinel"),
+                         ("Authorization", f"Bearer {own['chatgpt']}")],
+                        b"{}", "chatgpt.com", "real-access", "real-acct").decode().lower()
+    assert "authorization: bearer real-access" in out
+    assert "chatgpt-account-id: real-acct" in out and "heart-sentinel" not in out
+
+
+def test_the_upload_budget_is_per_client_and_refills(monkeypatch):
+    """Browsing is small going out; a repo is not. The budget stops bulk
+    uploads to web hosts per client and comes back after the window."""
+    monkeypatch.setenv("UPLOAD_BUDGET", "1000")
+    monkeypatch.setenv("UPLOAD_WINDOW", "600")
+    proxy = _proxy_module()
+    clock = [100.0]
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: clock[0])
+    assert proxy.charge("10.0.0.2", 600)
+    assert not proxy.charge("10.0.0.2", 600), "over budget"
+    assert proxy.charge("10.0.0.3", 600), "another container has its own"
+    assert not proxy.charge("10.0.0.2", 0), "spent stays spent inside the window"
+    clock[0] += 601
+    assert proxy.charge("10.0.0.2", 600), "and refills after it"
+
+
+def _seeded_proxy(monkeypatch, tmp_path, seed="s33d"):
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+    (tmp_path / "sentinel").write_text(seed)
+    return _proxy_module()
+
+
+def test_the_injector_takes_the_sentinel_and_nothing_else(monkeypatch, tmp_path):
+    proxy = _seeded_proxy(monkeypatch, tmp_path)
+    s = proxy.sentinels()["anthropic"]
+    assert proxy.sentinel_only([("Authorization", f"Bearer {s}")], s)
+    assert proxy.sentinel_only([("x-api-key", s), ("content-type", "application/json")], s)
+    assert not proxy.sentinel_only([], s)                           # no credential at all
+    assert not proxy.sentinel_only([("x-api-key", "sk-ant-api03-attacker")], s)
+    # the old published constant is just another foreign credential now
+    assert not proxy.sentinel_only([("x-api-key", "sk-ant-oat01-heart-sentinel")], s)
+    # the sentinel does not launder a second, foreign credential
+    assert not proxy.sentinel_only([("Authorization", f"Bearer {s}"),
+                                    ("x-api-key", "sk-ant-api03-attacker")], s)
+
+
+def test_the_forwarded_request_carries_the_real_credential_once_and_closes(monkeypatch, tmp_path):
+    proxy = _seeded_proxy(monkeypatch, tmp_path)
+    s = proxy.sentinels()["anthropic"]
+    out = proxy.rewrite("POST", "/v1/messages",
+                        [("Host", "egress:8889"), ("Authorization", f"Bearer {s}"),
+                         ("anthropic-beta", "oauth-2025-04-20"), ("Connection", "keep-alive"),
+                         ("Transfer-Encoding", "chunked")],
+                        b'{"x":1}', "api.anthropic.com", "sk-ant-oat01-REAL").decode()
+    head = out.split("\r\n\r\n")[0].lower()
+    assert out.startswith("POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n")
+    assert "authorization: bearer sk-ant-oat01-real" in head
+    assert s not in out
+    assert "anthropic-beta: oauth-2025-04-20" in head
+    assert "connection: close" in head and "keep-alive" not in head
+    assert "transfer-encoding" not in head and "content-length: 7" in head
+    assert "cookie" not in proxy.rewrite(
+        "GET", "/", [("Cookie", "session=attacker")], b"", "chatgpt.com", "t").decode().lower(), \
+        "a session cookie is a credential and never rides along"
+    assert out.endswith('{"x":1}')
+    # an API key goes where the API expects one
+    assert "x-api-key: sk-ant-api03-k" in proxy.rewrite(
+        "GET", "/", [], b"", "api.anthropic.com", "sk-ant-api03-k").decode()
+
+
+def test_the_secret_is_the_bare_token_or_a_credentials_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+    proxy = _proxy_module()
+    (tmp_path / "anthropic").write_text("sk-ant-oat01-abc\n")
+    assert proxy.secret("anthropic") == "sk-ant-oat01-abc"
+    (tmp_path / "anthropic").write_text('{"claudeAiOauth": {"accessToken": "tok"}}')
+    assert proxy.secret("anthropic") == "tok"
+    assert proxy.secret("missing") == ""
+
+
 def test_an_allowlist_refusal_is_not_an_agent_that_did_nothing():
     """A denied host reaches the agent as an ordinary API error, so the run ends
     with no diff and the ladder reads `no_change` at reward 0.0. Measured
@@ -680,7 +890,12 @@ def test_a_proxy_is_offered_in_both_spellings(monkeypatch):
 
 
 def test_no_proxy_variables_when_none_is_configured(monkeypatch):
+    import heart.sandbox as sb
+
     monkeypatch.delenv("HEART_SANDBOX_PROXY", raising=False)
+    # a routable network, stated rather than read off whatever box runs this --
+    # on one with the proxy provisioned the live lookup finds it
+    monkeypatch.setattr(sb, "network_facts", lambda n: (False, ()))
     assert "HTTPS_PROXY" not in _profile(_task(network="api")).env
 
 
@@ -861,3 +1076,145 @@ def test_unnesting_leaves_other_agents_alone(monkeypatch):
     cmd, _ = _agent_command("claude:haiku", "fix it")
     assert cmd[:2] == ["claude", "-p"]
     assert "danger-full-access" not in cmd
+
+
+# --- seats by injection, readers, contained commands ----------------------
+
+
+def test_the_sentinel_is_one_value_on_both_sides(monkeypatch, tmp_path):
+    from heart.sandbox import sentinels
+
+    assert _seeded_proxy(monkeypatch, tmp_path, "abc").sentinels() == sentinels("abc")
+
+
+def test_a_run_without_the_seed_cannot_use_the_injector(monkeypatch, tmp_path):
+    """The seed is per box and handed only to runs that were given a seat, so
+    a run with seats withheld can reach the injector but has nothing it will
+    take. And a proxy with no seed accepts nothing at all."""
+    import heart.sandbox as sb
+
+    assert sb.sentinels("a") != sb.sentinels("b")
+    assert _seeded_proxy(monkeypatch, tmp_path).sentinels()["anthropic"] != \
+        "sk-ant-oat01-heart-sentinel", "not the constant this file used to publish"
+    (tmp_path / "sentinel").unlink()
+    assert _proxy_module().sentinels() == {}
+    # injection asked for with no seed fails loudly, not as "not logged in"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "none"))
+    monkeypatch.setenv("HEART_SANDBOX_INJECT", "anthropic")
+    with pytest.raises(RuntimeError, match="plexus doctor --fix"):
+        sb.inject_env("egress")
+
+
+def test_an_injected_seat_is_a_sentinel_and_a_base_url_never_a_token(monkeypatch):
+    """With the seat injected, the container holds nothing worth stealing: a
+    sentinel, and the address of the proxy that will swap it."""
+    import heart.sandbox as sb
+
+    monkeypatch.setattr(sb, "network_facts", lambda n: (True, ("egress-web", "heart-abc")))
+    monkeypatch.delenv("HEART_SANDBOX_PROXY", raising=False)
+    monkeypatch.setattr(sb, "sentinel_seed", lambda: "s33d")
+    monkeypatch.setenv("HEART_SANDBOX_INJECT", "anthropic")
+    env = sb.proxy_env("heart-web")
+    assert env["HTTPS_PROXY"] == "http://egress-web:8888"
+    assert env["ANTHROPIC_BASE_URL"] == "http://egress-web:8889/anthropic"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == sb.sentinels("s33d")["anthropic"]
+    # the base URL is plain http on the internal network; through HTTP_PROXY it
+    # would be an absolute URI for a host no allowlist names
+    assert env["NO_PROXY"] == env["no_proxy"] == "egress-web"
+
+    monkeypatch.delenv("HEART_SANDBOX_INJECT")
+    assert "ANTHROPIC_BASE_URL" not in sb.proxy_env("heart-web")
+
+
+def test_each_lane_finds_its_own_proxy_among_the_agents_on_it(monkeypatch):
+    import heart.sandbox as sb
+
+    monkeypatch.delenv("HEART_SANDBOX_PROXY", raising=False)
+    monkeypatch.setattr(sb, "network_facts",
+                        lambda n: (True, ("heart-1", "egress-web", "heart-2")))
+    assert sb.proxy_env("heart-web")["HTTPS_PROXY"] == "http://egress-web:8888"
+
+
+def test_a_reader_can_read_everything_and_write_nothing_but_git_metadata(tmp_path):
+    """Planner, decomposer, reviewer: an agent's reach minus a writable tree.
+    The per-worktree git dir stays writable because `git diff` refreshes the
+    index to answer."""
+    from heart.sandbox import reader_profile_for
+
+    repo = tmp_path / "repo"
+    (repo / ".git" / "worktrees" / "a").mkdir(parents=True)
+    task = _task(repo_path=str(repo), allowed_paths=["src"], network="api")
+    p = reader_profile_for(task, "/ws/a", "/ctx", "/jr")
+    assert _mount(p, WORK).writable is False
+    assert _mount(p, f"{WORK}/src") is None, "an allowance is a write grant; readers get none"
+    assert _mount(p, CONTEXT).writable is False
+    assert _mount(p, str(repo / ".git")).writable is False
+    assert _mount(p, str(repo / ".git" / "worktrees" / "a")).writable is True
+    assert p.network != "none"
+
+
+def test_a_turn_outside_an_episode_is_contained_only_when_asked(monkeypatch, tmp_path):
+    import heart.runner as runner
+    import heart.sandbox as sb
+
+    monkeypatch.delenv("HEART_SANDBOX", raising=False)
+    assert runner.turn_profile(_task(), "/ws/a", tmp_path, "k") is None
+
+    monkeypatch.setenv("HEART_SANDBOX", runner.SANDBOX_MODE)
+    monkeypatch.setattr(sb, "inbox_for", lambda key: tmp_path / "inbox")
+    reader = runner.turn_profile(_task(), "/ws/a", tmp_path, "k")
+    assert reader.network != "none", "a reader needs a model; 'none' means 'api' here"
+    assert _mount(reader, WORK).writable is False
+    writer = runner.turn_profile(_task(), "/ws/a", tmp_path, "k", kind="writer")
+    assert _mount(writer, WORK).writable is True
+    judge = runner.turn_profile(_task(network="web"), "/ws/a", None, "k", kind="verifier")
+    assert judge.network == "none", "a verifier never inherits the agent's reach"
+
+
+def test_a_contained_command_runs_on_the_host_when_no_sandbox_is_asked(monkeypatch, tmp_path):
+    from heart.runner import run_contained
+
+    monkeypatch.delenv("HEART_SANDBOX", raising=False)
+    r = run_contained("pwd; exit 3", str(tmp_path), timeout=10)
+    assert r.returncode == 3 and r.stdout.strip() == str(tmp_path)
+
+
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
+def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch):
+    """The acceptance check plexus runs after an episode executes whatever the
+    agent put in the tree. Contained, a conftest.py that phones home has no
+    route, and the operator's home is not there to read."""
+    from heart.env import _ws_root
+    from heart.runner import SANDBOX_MODE, run_contained
+    import tempfile
+
+    monkeypatch.setenv("HEART_SANDBOX", SANDBOX_MODE)
+    _ws_root().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=_ws_root()) as ws:
+        probe = ("python3 -c \"import socket; s=socket.socket(); s.settimeout(3); "
+                 "s.connect(('1.1.1.1', 443))\" 2>/dev/null && echo NET || echo NONET; "
+                 f"test -e {Path.home()}/.ssh && echo HOME || echo NOHOME; "
+                 "touch made 2>/dev/null && echo WROTE || echo RO")
+        r = run_contained(probe, ws, timeout=90)
+        assert "NONET" in r.stdout and "NOHOME" in r.stdout and "RO" in r.stdout, r.stdout + r.stderr
+        r = run_contained("touch made && echo WROTE", ws, timeout=90, writable=True)
+        assert "WROTE" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_packet_built_for_an_agent_says_whose_it_is_and_which_lane(monkeypatch, tmp_path):
+    """arteries filters retrieval on these two: an agent's packet may carry its
+    own project's untrusted memory, and a web-lane packet nothing from another
+    project, since whatever lands in /context can leave with the agent."""
+    import heart.episode as ep
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw["env"])
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(ep.subprocess, "run", fake_run)
+    monkeypatch.delenv("ARTERIES_RETRIEVAL", raising=False)
+    got = ep._context_packet(_task(network="web"), "implement", "normal", tmp_path, "ep1")
+    assert got["status"] == "failed"
+    assert seen["ARTERIES_TRUST"] == "untrusted" and seen["ARTERIES_LANE"] == "web"

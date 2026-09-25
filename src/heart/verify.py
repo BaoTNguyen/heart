@@ -29,10 +29,9 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
     mode = os.environ.get("HEART_SANDBOX", "off")
     if mode == SANDBOX_MODE and profile is None:
         raise RuntimeError(f"HEART_SANDBOX={mode} but no verifier sandbox profile was supplied")
-    # The read-only worktree survives -- the plugin enforces :ro -- so a verifier
-    # still cannot edit the tree it is judging, which is the reward-integrity
-    # half. The network half does not: docker-sbx has no network flag, so a
-    # verifier can reach the network and exfiltration-via-test is open again.
+    # Both halves hold under docker-sbx: the plugin enforces :ro, so a verifier
+    # cannot edit the tree it is judging, and sandbox_wrap detaches bridge
+    # before anything runs, so network "none" is no network at all.
     sandboxed = mode == SANDBOX_MODE
     # Optional suite-wide ceiling. Each verifier still gets its own `timeout`, but
     # the whole suite can't exceed HEART_VERIFY_SUITE_TIMEOUT — without it, N
