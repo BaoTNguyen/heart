@@ -523,9 +523,9 @@ def main(argv: list[str] | None = None) -> int:
     # `work --agent api` refuse every time -- the runner says to set network
     # "api" or "model", and nothing could. Default stays "none", because
     # default-deny is the point of the field.
-    p.add_argument("--network", default="none", choices=("none", "model", "api"),
+    p.add_argument("--network", default="none", choices=("none", "model", "api", "web"),
                    help="sandbox network: none (default), model (local server), "
-                        "api (vendor endpoints)")
+                        "api (vendor endpoints), web (public internet, filtered)")
     p.add_argument("--apply", action="store_true", help="apply diff to the repo if pass+approve")
     p.add_argument("--allow-large", action="store_true",
                     help="apply even if the diff exceeds HEART_MAX_DIFF_LINES (default 2000)")
