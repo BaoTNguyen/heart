@@ -41,4 +41,4 @@ jobs:
       - working-directory: heart
         run: |
           uv sync
-          uv run --with-editable ../capillaries --with-editable ../arteries pytest -q
+          uv run --with-editable ../capillaries --with-editable ../arteries python -m pytest -q
