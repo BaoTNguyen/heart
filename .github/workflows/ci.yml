@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: heart
 
@@ -19,29 +19,26 @@ jobs:
       # exactly what a heart PR can break silently. Same matrix rule as the rest
       # of the stack: PR into main is judged against the siblings' main, work on
       # dev against their dev.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: BaoTNguyen/arteries
           ref: ${{ github.base_ref == 'main' && 'main' || 'dev' }}
           path: arteries
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: BaoTNguyen/capillaries
           ref: ${{ github.base_ref == 'main' && 'main' || 'dev' }}
           path: capillaries
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v10.2.0   # no floating major tags after v7
         with:
           python-version: '3.12'
 
-      # The siblings go in editable rather than on PYTHONPATH: the contract test
-      # imports arteries.compile, which reaches httpx, so a bare source checkout
-      # collects and then dies on the first transitive dependency. Installing
-      # from their pyprojects means adding one there does not also mean editing
-      # this file. heart itself has no dependencies and stays a source checkout.
-      - run: pip install -e ./capillaries -e ./arteries pytest
-
+      # heart's lock can't name arteries (optional, and absent in a heart-only
+      # clone), so the siblings join this one run with --with-editable. Their
+      # pyprojects supply their transitive deps: the contract test imports
+      # arteries.compile, which reaches httpx.
       - working-directory: heart
-        env:
-          PYTHONPATH: ${{ github.workspace }}/heart/src
-        run: python -m pytest -q
+        run: |
+          uv sync
+          uv run --with-editable ../capillaries --with-editable ../arteries pytest -q
