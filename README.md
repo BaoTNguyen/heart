@@ -67,6 +67,10 @@ pip install -e .        # provides the `heart` command
 python3 tests/test_heart.py   # self-check, no network or GPUs needed
 ```
 
+heart stands alone. With [arteries](https://github.com/BaoTNguyen/arteries)
+installed beside it, orchestration workers also share memory; the whole stack
+comes as one clone with `git clone --recursive https://github.com/BaoTNguyen/vascular`.
+
 ## Daily use
 
 ```bash
