@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import graphlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -279,10 +280,17 @@ class TestDecompose(unittest.TestCase):
         self.assertEqual((contract, subs), ("", []))
 
 
+# arteries is optional for heart (episode.py imports it lazily), so a heart-only
+# clone skips the two tests that read arteries' side of the contract.
+_needs_arteries = unittest.skipUnless(importlib.util.find_spec("arteries"),
+                                      "arteries not installed")
+
+
 class TestSubagentMemory(unittest.TestCase):
     """heart marks orchestration workers as arteries subagents, using arteries'
     own identity contract (import direction: heart -> arteries only)."""
 
+    @_needs_arteries
     def test_identity_env_matches_arteries_contract(self):
         from heart.episode import _subagent_env
         from arteries.subagent import subagent_env  # source of truth
@@ -310,6 +318,7 @@ class TestSubagentMemory(unittest.TestCase):
         self.assertEqual(candidate["ARTERIES_EPHEMERAL"], "discard")
         self.assertNotIn("ARTERIES_PARENT_AGENT_ID", candidate)
 
+    @_needs_arteries
     def test_arteries_does_not_import_heart(self):
         # the whole point of the direction rule: nothing heart leaks into arteries
         import arteries.subagent
