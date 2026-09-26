@@ -63,12 +63,13 @@ training data:
 ## Install
 
 ```bash
-pip install -e .        # provides the `heart` command
-python3 tests/test_heart.py   # self-check, no network or GPUs needed
+uv sync && uv run pytest -q          # self-check, no network or GPUs needed
+uv tool install --editable .         # `heart` on your PATH, for use in any repo
 ```
 
 heart stands alone. With [arteries](https://github.com/BaoTNguyen/arteries)
-installed beside it, orchestration workers also share memory; the whole stack
+installed beside it (`uv tool install --editable . --with-editable ../arteries`),
+orchestration workers also share memory; the whole stack
 comes as one clone with `git clone --recursive https://github.com/BaoTNguyen/vascular`.
 
 ## Daily use

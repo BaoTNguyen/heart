@@ -13,3 +13,11 @@ heart = "heart.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# `uv sync` installs this group by default. arteries stays undeclared: heart
+# imports it lazily and runs without it, and a path source here would make the
+# lock fail in any clone that lacks ../arteries. Add it per run instead:
+#   uv run --with-editable ../arteries --with-editable ../capillaries python -m pytest
+# (`python -m`: the bare `pytest` script runs the base .venv, which can't see them)
+[dependency-groups]
+dev = ["pytest>=8.0"]
