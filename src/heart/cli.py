@@ -488,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--agent", default=os.environ.get("HEART_AGENT", "claude"),
             help="claude | codex | gemini | opencode | api[:profile] | shell | "
-                 "auto (route by task complexity; tiers in models.json) "
+                 "auto (route by task demand; models + defaults in models.json) "
                  "(default $HEART_AGENT or claude)",
         )
         p.add_argument("--agent-cmd", default=None, help="custom shell template; prompt in $HEART_PROMPT")

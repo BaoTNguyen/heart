@@ -75,8 +75,7 @@ from typing import Callable
 from . import episode as episode_mod
 from . import review as review_mod
 from . import reward as reward_mod
-from . import route as route_mod
-from . import router as router_mod
+from . import routing
 from .detect import detect_verifiers
 from .env import Workspace
 from .episode import run_episode
@@ -298,8 +297,9 @@ def _llm_decompose(task, agent: str, agent_cmd: str | None, runs_dir, parent: st
     dagent = agent
     if manifest:
         try:
-            dagent = route_mod.route(
-                dataclasses.replace(task, skills=["planning"]), manifest=manifest).agent
+            dagent = routing.pick(
+                routing.demand(dataclasses.replace(task, skills=["planning"])),
+                manifest=manifest).agent
         except Exception:
             dagent = agent
     repo = Path(task.repo_path).resolve()
@@ -310,7 +310,7 @@ def _llm_decompose(task, agent: str, agent_cmd: str | None, runs_dir, parent: st
     ws = Workspace(task.repo_path, task.base_commit)
     try:
         res = run_agent(dagent, _DECOMPOSE_PROMPT.format(
-                            task=task.prompt, skills=", ".join(route_mod.SKILLS)),
+                            task=task.prompt, skills=", ".join(routing.SKILLS)),
                         cwd=str(ws.path), extra_env=env, timeout=task.timeout_seconds,
                         log_path=out / "decompose.log", agent_cmd=agent_cmd,
                         profile=turn_profile(task, ws.path, out, f"{parent}-decompose"))
@@ -337,11 +337,11 @@ def _llm_decompose(task, agent: str, agent_cmd: str | None, runs_dir, parent: st
         # bake the frozen interface into every worker prompt — the only way
         # disjoint parallel lanes compose once merged (they never see each other)
         subs = [dataclasses.replace(s, prompt=_with_contract(contract, s.prompt)) for s in subs]
-    # route.classify() silently drops off-vocabulary skills and falls back to
+    # routing.demand() silently drops off-vocabulary skills and falls back to
     # ["coding"]. That is the right runtime behaviour -- a bad label must not
     # fail a plan -- but silence meant every docs and test lane routed as
     # generic coding and nothing said so. Name them here.
-    unknown = sorted({k for s in subs for k in s.skills if k not in route_mod.SKILLS})
+    unknown = sorted({k for s in subs for k in s.skills if k not in routing.SKILLS})
     emit("heart", "decompose.done", task_id=task.task_id, agent=dagent,
          parent=parent, subtasks=[s.name for s in subs], contract=bool(contract),
          unknown_skills=unknown,
@@ -362,7 +362,7 @@ def run_orchestrated(
     """Build `task`, choosing Path A or B. Returns an episode-shaped dict
     (episode_id, outcome, review_verdict, usage) with diff.patch written under
     runs_dir/<id>/, so callers treat A and B results uniformly."""
-    manifest = manifest if manifest is not None else route_mod.load_manifest()
+    manifest = manifest if manifest is not None else routing.load_manifest()
     started = time.monotonic()
     # Path B safety gate: it combines independently-built parts, so a clean merge
     # proves nothing unless a verifier actually exercises the seam. No integration
@@ -649,7 +649,7 @@ def _route_worker(sub: Subtask, task, agent: str, manifest: dict) -> tuple[str, 
         return agent, sub.effort
     wtask = dataclasses.replace(task, prompt=sub.prompt, skills=sub.skills,
                                 effort=sub.effort)
-    d = route_mod.route(wtask, manifest=manifest)
+    d = routing.pick(routing.demand(wtask), manifest=manifest)
     return d.agent, d.effort
 
 
@@ -834,7 +834,7 @@ def _review_merged(task, diff: str, roles, agent: str, runs_dir, agent_cmd,
     role = next((r for r in (roles or []) if r.get("review")), None)
     if role is None:
         return None, []
-    reviewer = role.get("agent") or router_mod.review_agent(agent)
+    reviewer = role.get("agent") or review_mod.review_agent(agent)
     ws = Workspace(task.repo_path, task.base_commit)
     try:
         ws.apply(diff)
@@ -875,7 +875,7 @@ def _review_merged(task, diff: str, roles, agent: str, runs_dir, agent_cmd,
 def _strong_agent(manifest: dict, default: str) -> str:
     if not manifest:
         return default
-    best = max(manifest.values(), key=lambda m: route_mod.drank(m["max_difficulty"]))
+    best = max(manifest.values(), key=lambda m: routing.drank(m["max_difficulty"]))
     return best["agent"]
 
 
