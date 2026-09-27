@@ -686,11 +686,18 @@ def _kill_group(proc: subprocess.Popen) -> None:
             continue
 
 
-def _resolve_model(profile: str) -> str:
+def resolve_model(profile: str) -> str:
     """A CLI agent's profile token -> a concrete model id. `claude:sonnet` looks
     up models.json profiles[sonnet].model; an unknown token is used verbatim, so
-    `claude:claude-opus-4-8` also works without a profile entry."""
+    `claude:claude-opus-4-8` also works without a profile entry.
+
+    Public because plexus needs it too: a conversation it opens in tmux runs the
+    CLI interactively, which needs the same `--model <id>` this resolves, and a
+    sibling repo reaching for a private name is a seam nothing can pin."""
     return agents_api.profile_config(profile).get("model") or profile
+
+
+_resolve_model = resolve_model  # the name before plexus needed it
 
 
 #: How each CLI is told not to build its own sandbox inside heart's. Two
@@ -720,7 +727,7 @@ def _agent_command(agent: str, prompt: str, agent_cmd: str | None = None) -> tup
     base, _, profile = agent.partition(":")
     if base not in AGENT_COMMANDS:
         raise ValueError(f"unknown agent {agent!r}; known: {sorted(AGENT_COMMANDS)}")
-    model_args = ([_MODEL_FLAG[base], _resolve_model(profile)]
+    model_args = ([_MODEL_FLAG[base], resolve_model(profile)]
                   if profile and base in _MODEL_FLAG else [])
     cmd: list[str] = []
     for part in AGENT_COMMANDS[base]:

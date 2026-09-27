@@ -26,7 +26,7 @@ from pathlib import Path
 
 from . import review as review_mod
 from . import reward as reward_mod
-from . import router
+from . import routing
 from .env import Workspace
 from .events import emit
 from .guard import scan_secrets
@@ -60,7 +60,7 @@ DEFAULT_ROLES: list[dict] = [
         # /tmp -- reporting success over work that dies with the container.
         # Unioned with the task's own allowed_paths, never replacing them.
         "allowed_paths": ["tests", "test"],
-        "tier": "cheap",  # routine work when routing (--agent auto) is on
+        "tier": "small",  # routine work; resolved from `defaults` in models.json
         "prompt": (
             "Run `git diff` to see changes made for the task below. Add or strengthen "
             "tests covering those changes, then run the test suite.\nTask: {prompt}"
@@ -70,7 +70,7 @@ DEFAULT_ROLES: list[dict] = [
         "name": "review",
         "memory": "readonly",
         # rotates to a different model family than the coder -- see
-        # router.review_agent. `agent` here would pin one instead.
+        # review.review_agent. `agent` here would pin one instead.
         "review": True,
         # findings, not a verdict -- see review.py. A --roles file with its own
         # wording still works and simply falls back to the APPROVE/REJECT read.
@@ -605,12 +605,12 @@ def run_episode(
     out.mkdir(parents=True, exist_ok=True)
     routed = agent == "auto"
     if routed:
-        tier, signals = router.classify(task)
-        agent = router.resolve(tier)
+        # two stages: what the task demands, then which model serves it. `pick`
+        # emits route.decided itself, with the episode this is for.
+        choice = routing.pick(routing.demand(task), episode_id=episode_id)
+        agent = choice.agent
         if escalate is None:
-            escalate = router.resolve("strong", default=agent)
-        emit("heart", "route.decided", episode_id=episode_id, task_id=task.task_id,
-             tier=tier, agent=agent, **signals)
+            escalate = routing.resolve("frontier", default=agent)
     try:
         return _run_episode(
             task, agent, memory_mode, retrieval, agent_cmd, roles,
@@ -746,9 +746,12 @@ def _run_episode(
             role_env.pop("ARTERIES_MEMORY", None)
             if mem != "normal":
                 role_env["ARTERIES_MEMORY"] = mem
+            # A role's declared tier is honoured whether or not the goal asked
+            # for routing: `"tier": "small"` on the test role was silently ignored
+            # under an explicit --agent, so the config said cheap and never was.
             role_agent = role.get("agent") or (
-                router.resolve(role["tier"], default=agent)
-                if routed and role.get("tier") else agent
+                routing.resolve(role["tier"], default=agent)
+                if role.get("tier") else agent
             )
             # a role that declares extra paths gets its own mount table: the
             # scope is per subtask, and the test writer needs somewhere the
@@ -778,7 +781,7 @@ def _run_episode(
                 # same lineage brings the same blind spots to finding the bug it
                 # brought to writing it. An explicit `agent` on the role still
                 # wins -- this only fills in what nobody chose.
-                role_agent = router.review_agent(role_agent)
+                role_agent = review_mod.review_agent(role_agent)
             if role.get("review"):
                 reviewer = role_agent
             if role.get("review"):
