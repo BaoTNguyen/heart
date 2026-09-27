@@ -269,27 +269,80 @@ class TestHeart(unittest.TestCase):
         solo = self.run_ep(FIX_CMD)
         self.assertNotIn("ARTERIES_EPHEMERAL", solo["env_snapshot"])
 
-    def test_router(self):
-        from heart import router
+    def test_routing_demand(self):
+        """Stage one: a task states or implies how hard it is, and that decides
+        the tier. Nothing about models here."""
+        from heart import routing
 
-        self.assertEqual(router.classify(self.task)[0], "cheap")
+        self.assertEqual(routing.demand(self.task).tier, "small")
         hard = TaskSpec(**{**self.task.__dict__,
                            "prompt": "Refactor the threading and concurrency model " + "x " * 60})
-        self.assertEqual(router.classify(hard)[0], "strong")
-        by_difficulty = TaskSpec(**{**self.task.__dict__, "difficulty": "hard"})
-        self.assertEqual(router.classify(by_difficulty)[0], "strong")
+        self.assertEqual(routing.demand(hard).tier, "frontier")
+        # a planner's own label wins over the keyword guess, and says it did
+        declared = TaskSpec(**{**self.task.__dict__, "difficulty": "hard"})
+        self.assertEqual(routing.demand(declared).tier, "frontier")
+        self.assertTrue(routing.demand(declared).declared)
+        self.assertFalse(routing.demand(self.task).declared)
+        # effort rides along: hard work tries harder unless told otherwise
+        self.assertEqual(routing.demand(declared).effort, "high")
+        self.assertEqual(routing.demand(self.task).effort, "medium")
+
+    def test_routing_resolve(self):
+        """A configured name -> an agent string. Four kinds of name, one of
+        which is refused rather than guessed at."""
+        from heart import routing
 
         old = dict(os.environ)
         try:
-            os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")  # no models.json
+            cfg = self.root / "cfg" / "heart"
+            cfg.mkdir(parents=True, exist_ok=True)
+            os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
             for k in list(os.environ):  # ambient tier config must not leak in
                 if k.startswith("HEART_TIER_"):
                     del os.environ[k]
-            os.environ["HEART_TIER_CHEAP"] = "shell"
-            self.assertEqual(router.resolve("cheap"), "shell")
-            self.assertEqual(router.resolve("strong", default="claude"), "claude")
+
+            # no config at all: the env valve, then the caller's default, then a
+            # refusal that names what to add
+            os.environ["HEART_TIER_SMALL"] = "shell"
+            self.assertEqual(routing.resolve("small"), "shell")
+            self.assertEqual(routing.resolve("frontier", default="claude"), "claude")
             with self.assertRaises(ValueError):
-                router.resolve("strong")
+                routing.resolve("frontier")
+            # the retired spelling still reaches the same tier, from either side
+            self.assertEqual(routing.resolve("cheap"), "shell")
+            del os.environ["HEART_TIER_SMALL"]
+            os.environ["HEART_TIER_CHEAP"] = "shell"
+            self.assertEqual(routing.resolve("small"), "shell")
+            del os.environ["HEART_TIER_CHEAP"]
+
+            # a manifest: a nickname resolves to its agent, a tier to the named
+            # default, and anything unknown is passed through as an agent string
+            (cfg / "models.json").write_text(json.dumps({
+                "models": {
+                    "big": {"agent": "claude:opus", "tier": "frontier", "cost": 5.0},
+                    "little": {"agent": "api:local", "tier": "small", "cost": 0.0},
+                    "spare": {"agent": "api:spare", "tier": "small", "cost": 9.0},
+                },
+                "defaults": {"frontier": "big"}}))
+            self.assertEqual(routing.resolve("little"), "api:local")
+            self.assertEqual(routing.resolve("frontier"), "claude:opus")
+            # no default for this tier: cheapest model declared in it
+            self.assertEqual(routing.resolve("small"), "api:local")
+            self.assertEqual(routing.resolve("claude:sonnet"), "claude:sonnet")
+            # "auto" is a decision that needs a task, so it is not made here
+            self.assertEqual(routing.resolve("auto"), "auto")
+
+            # a model named after a tier has two readings; refuse rather than pick
+            (cfg / "models.json").write_text(json.dumps({
+                "models": {"small": {"agent": "api:local", "tier": "small"}}}))
+            with self.assertRaises(ValueError):
+                routing.resolve("small")
+
+            # legacy config, no `models` block at all: still routes
+            (cfg / "models.json").write_text(json.dumps({
+                "tiers": {"cheap": "api:local", "strong": "claude:opus"}}))
+            self.assertEqual(routing.resolve("small"), "api:local")
+            self.assertEqual(routing.resolve("frontier"), "claude:opus")
         finally:
             os.environ.clear()
             os.environ.update(old)
@@ -303,7 +356,7 @@ class TestHeart(unittest.TestCase):
             for k in list(os.environ):
                 if k.startswith("HEART_TIER_"):
                     del os.environ[k]
-            os.environ["HEART_TIER_CHEAP"] = "shell"
+            os.environ["HEART_TIER_SMALL"] = "shell"
             ep = run_episode(self.task, agent="auto", runs_dir=self.runs)
         finally:
             os.environ.clear()
@@ -312,10 +365,12 @@ class TestHeart(unittest.TestCase):
         self.assertEqual(ep["agent"], "shell")  # routed, not the literal "auto"
         routed = [e for e in pulse.load_events(episode=ep["episode_id"])
                   if e["kind"] == "route.decided"]
-        self.assertEqual(routed[0]["payload"]["tier"], "cheap")
+        # recorded even with no manifest to choose from: a routed episode with no
+        # route.decided is indistinguishable from an unrouted one
+        self.assertEqual(routed[0]["payload"]["tier"], "small")
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             self.assertEqual(cli_main(["pulse", "insights"]), 0)
-        self.assertIn("routing: cheap=1/1 pass", buf.getvalue())
+        self.assertIn("routing: small=1/1 pass", buf.getvalue())
 
     def test_workspace_copies_integration_files(self):
         from heart.env import Workspace
@@ -961,7 +1016,7 @@ class TestReviewerRotation(unittest.TestCase):
         self._patch.stop()
 
     def test_the_reviewer_is_a_different_family_than_the_coder(self):
-        from heart.router import review_agent
+        from heart.review import review_agent
 
         self.assertEqual(review_agent("claude:opus"), "codex:sol")
         self.assertEqual(review_agent("codex:sol"), "claude:opus")
@@ -972,14 +1027,14 @@ class TestReviewerRotation(unittest.TestCase):
     def test_a_coder_outside_the_pool_still_gets_a_reviewer(self):
         # a local model or a subscription seat is not in the pool; failing the
         # episode over that would be a config choice breaking a run
-        from heart.router import review_agent
+        from heart.review import review_agent
 
         self.assertEqual(review_agent("api:local"), "claude:opus")
 
     def test_the_pool_is_data_not_code(self):
         """Adding or changing a model must not need a code change, and the
         rotation has to work for any number of entries."""
-        from heart.router import review_agent
+        from heart.review import review_agent
 
         pool = ["a:one", "b:two", "c:three"]
         with unittest.mock.patch.dict(os.environ, {"HEART_REVIEW_MODELS": ",".join(pool)}):

@@ -99,6 +99,8 @@ just duplication.
   the same logic.
 - **`route.classify` / `router.classify`.** Unrelated functions that collided
   on a name — one returns skills+tier+difficulty, the other tier+manifest.
+  *Resolved since: the two modules are one `routing.py`, with `demand()` and
+  `pick()` as the two stages and one tier vocabulary between them.*
 - **Per-call-site `json.loads(path.read_text())` on files that are not
   models.json** (taskspec, detect, export, cli roles). Each reads a different
   file with a different failure policy; a shared loader would need a policy

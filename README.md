@@ -96,7 +96,7 @@ verification passes and the reviewer approves.
 | `opencode` | OpenCode (`opencode run`) |
 | `api` / `api:<profile>` | Any OpenAI-compatible endpoint: OpenAI, Anthropic, OpenRouter, Together, DeepSeek, Groq, vLLM, Ollama, llama.cpp… |
 | `shell` | Runs the prompt as bash — scripted baselines and tests |
-| `auto` | Route by task complexity: cheap tier for routine tasks, strong for hard ones |
+| `auto` | Route by task complexity: the `small` tier for routine work, `frontier` for hard |
 | `--agent-cmd 'tmpl'` | Escape hatch: any shell template, prompt in `$HEART_PROMPT` |
 
 Set a default with `HEART_AGENT`. The `api` agent resolves config from
@@ -128,28 +128,47 @@ a marrow-trained model acts as the coding agent.
 
 ### Model routing (`--agent auto`)
 
-`heart` picks the model per task and per role (test-writing routes cheap). The
-richer form is a **capability manifest**: each model in `models.json` declares a
-`tier` and the few `skills` it's notably strong or weak at, plus a context window
-and difficulty ceiling; `route` filters to the models that can actually run the
-task (skills, difficulty, context) and picks the cheapest capable match, with
-declared scores corrected by a measured-reward sidecar so they can't drift
-unchecked. A bare tier map still works and is synthesized into a manifest:
+Routing happens in two stages, which is also the whole of `routing.py`'s public
+surface:
+
+```python
+demand(task) -> Demand     # what the work needs: a tier, skills, difficulty, context
+pick(demand)  -> Choice    # which model in the manifest serves that demand best
+```
+
+A tier is `small`, `mid` or `frontier`. A task demands one — from the difficulty a
+planner declared, or from a keyword heuristic when it declared none — and a model
+declares one in `models.json` along with the few `skills` it is notably strong or
+weak at, a context window and a difficulty ceiling. `pick` filters to the models
+that can actually run the task, then takes the cheapest capable match, with
+declared scores corrected by a measured-reward sidecar so they cannot drift
+unchecked.
+
+`defaults` names the model to use when something asks for a tier by name rather
+than by task: a role declaring `"tier": "small"` (the test-writing role does), or
+an escalation asking for `frontier`. A default is a preference, not a
+classification, and a role's declared tier is honoured whether or not the run
+asked for routing.
 
 ```json
-{"tiers": {"cheap": "api:local7b", "standard": "claude", "strong": "api:gpt"}}
+{"models": {"local7b": {"agent": "api:local7b", "tier": "small", "context": 32000},
+            "big":     {"agent": "claude", "tier": "frontier", "context": 200000}},
+ "defaults": {"small": "local7b", "frontier": "big"}}
 ```
+
+The retired `cheap|standard|strong` spelling still reads, from a bare `tiers` map
+and from `HEART_TIER_CHEAP|STANDARD|STRONG`, mapping onto `small|mid|frontier`.
 
 Every routing call emits a `route.decided` event with its signals, so routing
 quality is auditable in the journal and can later train a learned gate.
-`--escalate` defaults to the strong tier when routing. `HEART_MAX_AGENTS`
+`--escalate` defaults to the `frontier` tier when routing. `HEART_MAX_AGENTS`
 (default 8) caps concurrent agents across parallel episodes and candidates.
 
 ### Fleet concurrency: one local model, many callers
 
 `HEART_MAX_AGENTS` bounds one process. When several processes run at once — a
 `heart batch`, or a few `plexus run` goals working different repos — they each
-get their own cap, and if they route cheap-tier work to the *same* local model
+get their own cap, and if they route `small`-tier work to the *same* local model
 server they sum to N×8 requests against one GPU. Two knobs bound the total,
 both opt-in (unset or `0` changes nothing):
 
@@ -188,7 +207,7 @@ seat (`claude`, `codex`). What routing optimizes depends on that mix:
   Keep concurrency modest on subscription tiers — window throttling surfaces
   as slow/failing turns, not clean retryable errors.
 - **Local models**: near-free capacity that doubles as the RL data engine —
-  cheap-tier episodes are marrow's training traffic, and trained checkpoints
+  `small`-tier episodes are marrow's training traffic, and trained checkpoints
   redeploy into the same profile slot.
 
 Routing can't see remaining subscription quota (no CLI exposes it); when a
@@ -393,7 +412,7 @@ Operational switches:
   stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
   re-runs the sweep any time (dedup makes it safe).
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
-  a cheap tier that keeps failing means the classifier thresholds need moving.
+  a `small` tier that keeps failing means the classifier thresholds need moving.
 - **Cost capture**: `runner.run_agent` extracts tokens and, from a
   `~/.config/heart/models.json` `"pricing"` map keyed by agent string, dollars
   per role, rolled into `episode["usage"]` and the spine. Two rules make the
