@@ -1218,3 +1218,11 @@ def test_a_packet_built_for_an_agent_says_whose_it_is_and_which_lane(monkeypatch
     got = ep._context_packet(_task(network="web"), "implement", "normal", tmp_path, "ep1")
     assert got["status"] == "failed"
     assert seen["ARTERIES_TRUST"] == "untrusted" and seen["ARTERIES_LANE"] == "web"
+
+
+def test_only_the_bind_source_race_is_retried():
+    from heart import runner
+    assert runner._transient_start_failure(
+        'docker: Error response from daemon: invalid mount config for type "bind": '
+        "bind source path does not exist: /host_mnt/x/.git/worktrees/abc")
+    assert not runner._transient_start_failure("docker: Error response from daemon: No such image: x")
