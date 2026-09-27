@@ -289,6 +289,7 @@ if __name__ == "__main__":
     print("ok")
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_stale_sandbox_image_is_reported_with_the_fix():
     """The Dockerfile gained the plugin's lock directory and the image was never
     rebuilt. Every sandboxed run then failed on
@@ -316,6 +317,7 @@ def test_a_stale_sandbox_image_is_reported_with_the_fix():
         assert "docker build" in reason, reason
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_missing_sandbox_image_says_to_build_it():
     from heart.sandbox import image_is_stale
 
