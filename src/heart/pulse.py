@@ -220,14 +220,21 @@ def insights(hours: float = 24) -> list[str]:
     if rounds:
         lines.append(f"fix loop: first-verify-failed={len(attempted)} rescued={len(rescued)}")
 
-    # routing scorecard: a cheap tier that keeps failing is the misroute
+    # routing scorecard: a small tier that keeps failing is the misroute
     # signature — the signal that the heuristic (or a future learned gate)
-    # needs its thresholds moved
+    # needs its thresholds moved. Tier names come off the events rather than a
+    # literal list here, so renaming the vocabulary in routing.py cannot leave
+    # this reading zeros for tiers it has never heard of.
     routes = {e["episode_id"]: _payload(e).get("tier") for e in events
               if e["kind"] == "route.decided" and e.get("episode_id")}
     if routes:
+        # lazy: routing reads this module's journal, so importing it up top is a cycle
+        from .routing import TIERS
         parts = []
-        for tier in ("cheap", "standard", "strong"):
+        order = {t: i for i, t in enumerate(TIERS)}
+        seen = sorted({t for t in routes.values() if t},
+                      key=lambda t: (order.get(t, len(order)), t))
+        for tier in seen:
             outs = [_payload(finished[eid]).get("outcome")
                     for eid, t in routes.items() if t == tier and eid in finished]
             if outs:

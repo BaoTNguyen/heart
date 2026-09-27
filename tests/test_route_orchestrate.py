@@ -16,7 +16,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from heart import orchestrate, route
+from heart import orchestrate, routing
 from heart.orchestrate import Subtask, run_orchestrated
 from heart.taskspec import TaskSpec, Verifier
 
@@ -34,7 +34,7 @@ def _task(prompt="add a function", **kw):
     return TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt=prompt, **kw)
 
 
-# route.route() emits route.decided to the event journal. Without this, synthetic
+# routing.pick() emits route.decided to the event journal. Without this, synthetic
 # test decisions (api:twin, task_id="t") leak into the real ~/.local journal and
 # show up on `pulse serve`. Isolate the journal for the whole module, mirroring the
 # XDG_CONFIG_HOME isolation the orchestration classes already do for config.
@@ -55,34 +55,35 @@ def tearDownModule():
 
 class TestRouter(unittest.TestCase):
     def test_classify_infers_skills_and_difficulty(self):
-        skills, difficulty, _ = route.classify(_task("fix the failing race condition in the server"))
-        self.assertIn("debug", skills)
-        self.assertEqual(difficulty, "hard")  # "race" is a hard word
+        want = routing.demand(_task("fix the failing race condition in the server"))
+        self.assertIn("debug", want.skills)
+        self.assertEqual(want.difficulty, "hard")  # "race" is a hard word
+        self.assertEqual(want.tier, "frontier")    # hard work demands the top tier
 
     def test_declared_skills_win_over_inference(self):
-        skills, _, _ = route.classify(_task("whatever", skills=["frontend"]))
-        self.assertEqual(skills, ["frontend"])
+        self.assertEqual(routing.demand(_task("whatever", skills=["frontend"])).skills,
+                         ["frontend"])
 
     def test_context_constraint_filters(self):
-        d = route.route(_task(skills=["coding"], difficulty="easy", min_context=100_000),
-                        manifest=MANIFEST, stats={})
+        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=100_000)),
+                         manifest=MANIFEST, stats={})
         self.assertNotEqual(d.agent, "api:local")  # local's 32k window is too small
 
     def test_difficulty_ceiling_filters(self):
-        d = route.route(_task(skills=["coding"], difficulty="hard", min_context=1000),
-                        manifest=MANIFEST, stats={})
+        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="hard", min_context=1000)),
+                         manifest=MANIFEST, stats={})
         self.assertNotEqual(d.agent, "api:local")  # local caps at "easy"
 
     def test_ties_break_toward_cheaper(self):
         # claude and twin have identical skills; twin is far cheaper -> twin wins
-        d = route.route(_task(skills=["coding"], difficulty="hard", min_context=1000),
-                        manifest=MANIFEST, stats={})
+        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="hard", min_context=1000)),
+                         manifest=MANIFEST, stats={})
         self.assertEqual(d.agent, "api:twin")
 
     def test_capability_beats_cost_when_scores_differ(self):
         # easy coding: local (0.5) is cheapest but claude/twin (0.9) score higher
-        d = route.route(_task(skills=["coding"], difficulty="easy", min_context=1000),
-                        manifest=MANIFEST, stats={})
+        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=1000)),
+                         manifest=MANIFEST, stats={})
         self.assertIn(d.agent, ("claude", "api:twin"))
         self.assertEqual(d.candidates[0]["score"], 0.9)
 
@@ -90,13 +91,13 @@ class TestRouter(unittest.TestCase):
         # local declared 0.5 for coding, but measured 0.95 over enough samples on
         # easy tasks -> its blended score should overtake the 0.9 declared models
         stats = {"api:local": {"coding|easy": {"n": 40, "mean": 0.98}}}
-        d = route.route(_task(skills=["coding"], difficulty="easy", min_context=1000),
-                        manifest=MANIFEST, stats=stats)
+        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=1000)),
+                         manifest=MANIFEST, stats=stats)
         self.assertEqual(d.agent, "api:local")
 
     def test_blend_shrinkage(self):
-        self.assertEqual(route._blend(0.9, None), 0.9)             # no evidence -> prior
-        self.assertAlmostEqual(route._blend(0.5, {"n": 8, "mean": 1.0}), 0.75)  # w=0.5
+        self.assertEqual(routing._blend(0.9, None), 0.9)             # no evidence -> prior
+        self.assertAlmostEqual(routing._blend(0.5, {"n": 8, "mean": 1.0}), 0.75)  # w=0.5
 
     def test_aggregate_builds_reward_stats(self):
         events = [
@@ -107,7 +108,7 @@ class TestRouter(unittest.TestCase):
             {"kind": "episode.finished", "payload":  # no skills -> ignored
                 {"agent": "claude", "reward": 1.0, "difficulty": "hard"}},
         ]
-        stats = route.aggregate(events)
+        stats = routing.aggregate(events)
         self.assertEqual(stats["claude"]["coding|hard"], {"n": 2, "mean": 0.7})
 
     def test_ordinal_manifest_no_floats(self):
@@ -117,18 +118,18 @@ class TestRouter(unittest.TestCase):
             p.write_text(json.dumps({"models": {
                 "big":   {"agent": "claude", "tier": "frontier",
                           "skills": {"planning": "strong", "vision": "weak"}, "cost": 3.0},
-                "small": {"agent": "api:local", "tier": "small",
+                "little": {"agent": "api:local", "tier": "small",
                           "skills": {"coding": "capable"}, "context": 32000, "cost": 0.1},
             }}))
-            m = route.load_manifest(p)
+            m = routing.load_manifest(p)
             # tier sets baseline + ceiling; ordinal words become coarse priors
             self.assertEqual(m["big"]["max_difficulty"], "hard")     # frontier default
-            self.assertEqual(m["small"]["max_difficulty"], "easy")   # small default
-            self.assertAlmostEqual(m["big"]["skills"]["planning"], route._LEVEL["strong"])
-            self.assertAlmostEqual(m["big"]["baseline"], route._TIER_BASELINE["frontier"])
-            # a hard planning task: small is filtered (ceiling), big wins on the
+            self.assertEqual(m["little"]["max_difficulty"], "easy")  # small default
+            self.assertAlmostEqual(m["big"]["skills"]["planning"], routing._LEVEL["strong"])
+            self.assertAlmostEqual(m["big"]["baseline"], routing._TIER_BASELINE["frontier"])
+            # a hard planning task: little is filtered (ceiling), big wins on the
             # strong note; an unlisted skill would fall back to big's baseline
-            d1 = route.route(_task(skills=["planning"], difficulty="hard", min_context=1000),
+            d1 = routing.pick(routing.demand(_task(skills=["planning"], difficulty="hard", min_context=1000)),
                              manifest=m, stats={})
             self.assertEqual(d1.agent, "claude")
 
@@ -137,9 +138,10 @@ class TestRouter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "models.json"
             p.write_text(json.dumps({"tiers": {"cheap": "api:q", "strong": "claude"}}))
-            m = route.load_manifest(p)
-            self.assertEqual(m["strong"]["agent"], "claude")
-            self.assertEqual(m["cheap"]["max_difficulty"], "easy")
+            m = routing.load_manifest(p)
+            # keyed by the current spelling, not the retired one
+            self.assertEqual(m["frontier"]["agent"], "claude")
+            self.assertEqual(m["small"]["max_difficulty"], "easy")
 
 
 class TestModelPin(unittest.TestCase):
@@ -682,15 +684,14 @@ class TestOrchestrate(unittest.TestCase):
         self.assertIn("declare no lane", ep["orchestration"]["reason"])
 
     def test_off_vocabulary_skills_are_named_not_silently_dropped(self):
-        # route.classify() drops them and falls back to ["coding"], which is the
+        # routing.demand() drops them and falls back to ["coding"], which is the
         # right runtime behaviour and the wrong thing to stay quiet about.
-        from heart import route
         subs = orchestrate._subtasks_from_list([
             {"name": "a", "prompt": "p", "skills": ["coding"]},
             {"name": "b", "prompt": "p", "skills": ["testing", "documentation"]}])
-        unknown = sorted({k for s in subs for k in s.skills if k not in route.SKILLS})
+        unknown = sorted({k for s in subs for k in s.skills if k not in routing.SKILLS})
         self.assertEqual(unknown, ["documentation", "testing"])
-        self.assertIn("docs", route.SKILLS)   # the word the prompt now tells it to use
+        self.assertIn("docs", routing.SKILLS)   # the word the prompt now tells it to use
 
     def test_a_worker_that_raises_falls_back_instead_of_killing_the_run(self):
         # A crashing worker is heart failing, not the agent failing. It used to
@@ -754,11 +755,11 @@ class ReviewAgentHarnessTests(unittest.TestCase):
     def test_shell_is_never_rotated_to_a_real_cli(self):
         """Rotating it made every role-pipeline test spawn a billed CLI locally
         and fail on CI, where the binary does not exist."""
-        with unittest.mock.patch.object(orchestrate.router_mod, "review_pool",
+        with unittest.mock.patch.object(orchestrate.review_mod, "review_pool",
                                         return_value=["claude", "codex"]):
-            self.assertEqual(orchestrate.router_mod.review_agent("shell"), "shell")
+            self.assertEqual(orchestrate.review_mod.review_agent("shell"), "shell")
 
     def test_a_real_agent_still_rotates_family(self):
-        with unittest.mock.patch.object(orchestrate.router_mod, "review_pool",
+        with unittest.mock.patch.object(orchestrate.review_mod, "review_pool",
                                         return_value=["claude:opus", "codex"]):
-            self.assertEqual(orchestrate.router_mod.review_agent("claude:sonnet"), "codex")
+            self.assertEqual(orchestrate.review_mod.review_agent("claude:sonnet"), "codex")

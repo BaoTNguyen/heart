@@ -27,12 +27,65 @@ what lets the loop terminate on a checkable condition instead of on a word.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .agents_api import load_models_json
 
 #: Ordered worst-first. Only `blocker` blocks; the rest are recorded so that an
 #: approval stops discarding what the reviewer noticed.
 SEVERITIES = ("blocker", "concern", "note")
+
+
+# --- who reviews ----------------------------------------------------------
+# Choosing the reviewer lived in the model router, one directory over from the
+# module that defines what a review is. It is a review decision, not a routing
+# one: nothing here consults a tier.
+
+#: Models trusted to review. Ordered, and the order only breaks ties -- what
+#: matters is that a reviewer is never the family that wrote the code, because
+#: a model reviewing its own output brings the same blind spots to finding the
+#: bug that it brought to writing it.
+#:
+#: Override in models.json with a "review_models" list; the rotation below
+#: works for any number of entries, so adding or changing one needs no code.
+DEFAULT_REVIEW_MODELS = ("claude:opus", "codex:sol")
+
+
+def review_pool() -> list[str]:
+    env = os.environ.get("HEART_REVIEW_MODELS")
+    if env:
+        return [a.strip() for a in env.split(",") if a.strip()]
+    configured = load_models_json().get("review_models")
+    return list(configured) if configured else list(DEFAULT_REVIEW_MODELS)
+
+
+def review_agent(coding_agent: str) -> str:
+    """A reviewer that is not the model that wrote the code.
+
+    Matched on the family -- the part before the colon -- not the exact agent
+    string. `claude:opus` reviewing `claude:sonnet` would be a different model
+    and the same training lineage, which is most of what independent review is
+    supposed to rule out.
+
+    A coder outside the pool (a local model, a subscription seat) still gets a
+    reviewer: the first entry. And if every pool entry shares the coder's
+    family, the first entry again -- a same-family reviewer is worth more than
+    none, and refusing here would fail an episode over a config choice.
+    """
+    family = coding_agent.partition(":")[0]
+    if family == "shell":
+        # `shell` runs the prompt as bash; it is the harness, not a model, and
+        # has no lineage to rotate away from. Rotating anyway pointed every
+        # role-pipeline test at whatever real CLI sat first in the pool -- the
+        # toy suite spent real tokens locally and failed on CI, where no such
+        # binary exists.
+        return coding_agent
+    pool = review_pool()
+    if not pool:
+        return coding_agent
+    return next((a for a in pool if a.partition(":")[0] != family), pool[0])
 
 
 @dataclass
