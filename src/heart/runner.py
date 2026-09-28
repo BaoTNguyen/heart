@@ -774,7 +774,7 @@ def sandbox_egress_denied(output: str) -> str | None:
 SANDBOX_MODE = "docker-sbx"
 
 
-_START_RETRIES = 2
+_START_RETRIES = 4
 
 
 def _transient_start_failure(failure: str) -> bool:
@@ -1001,9 +1001,11 @@ def run_agent(
             "answering; not spawning an agent that has nothing to talk to")
 
     t0 = time.monotonic()
-    # ponytail: retries only the Docker Desktop file-sharing race, where a bind
-    # source the host just created is not yet visible to the VM (seen on 2 of
-    # 12 starts). Fix the sharing itself if that ever stops being transient.
+    # ponytail: retries only the Docker sandbox file-sync race, where a bind
+    # source the host just created (a fresh worktree's git dir) is not yet
+    # visible to the sandbox VM. Measured: the dir existed on the host for 4.4s
+    # while three 1-2s retries failed, so back off to ~30s. Fix the sync itself
+    # (or mount the git dir differently) if waiting stops being enough.
     for start in range(_START_RETRIES + 1):
         timed_out = False
         with _GATE, _global_slot(), _local_slot(local_endpoint), open(log_path, "w") as log:
@@ -1024,7 +1026,7 @@ def run_agent(
         tail = _tail(log_path)
         failure = sandbox_start_failure(exit_code, tail)
         if failure and _transient_start_failure(failure) and start < _START_RETRIES:
-            time.sleep(1 + start)
+            time.sleep(2 ** (start + 1))
             continue
         break
     if failure:
