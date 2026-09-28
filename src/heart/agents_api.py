@@ -7,7 +7,7 @@ cwd is the episode workspace.
 
 Config resolution, highest wins:
   1. profile named by HEART_MODEL_PROFILE (set via --agent api:<profile>),
-     read from ~/.config/heart/models.json:
+     read from ~/.vascular/config/heart/models.json:
        {"profiles": {"gpt": {"endpoint": "https://api.openai.com/v1",
                              "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"}}}
   2. env: HEART_API_ENDPOINT, HEART_API_MODEL, HEART_API_KEY

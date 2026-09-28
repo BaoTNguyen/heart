@@ -1005,7 +1005,7 @@ class TestReviewerRotation(unittest.TestCase):
     brings the same blind spots to finding the bug it brought to writing it."""
 
     def setUp(self):
-        # pin the pool: review_pool() reads ~/.config/heart/models.json, and a
+        # pin the pool: review_pool() reads ~/.vascular/config/heart/models.json, and a
         # unit test that asserts on the operator's live config fails whenever
         # they change a model -- which is exactly what it is meant to let them do
         self._patch = unittest.mock.patch.dict(
