@@ -23,7 +23,7 @@ def _no_live_retrieval(monkeypatch):
 def _journal_to_a_tmpdir(tmp_path_factory, monkeypatch):
     """Test episodes write their events somewhere disposable.
 
-    Unset, EVENT_JOURNAL_DIR is ~/.local/share/heart/events -- the real one. So
+    Unset, EVENT_JOURNAL_DIR is ~/.vascular/state/heart/events -- the real one. So
     the suite's synthetic episodes wrote into the real journal and the real
     per-run inboxes, and a sandboxed run's inbox came back holding 18 events
     belonging to two fixture episodes, task_id "scope", indistinguishable from

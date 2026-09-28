@@ -78,8 +78,8 @@ def test_pricing_local_free():
     """Local endpoints are free even under a broad "api" pricing entry; metered
     APIs and subscription seats both price at the map's API rates."""
     with tempfile.TemporaryDirectory() as d:
-        cfg = Path(d) / "heart"
-        cfg.mkdir()
+        cfg = Path(d) / "config" / "heart"
+        cfg.mkdir(parents=True)
         (cfg / "models.json").write_text(json.dumps({
             "profiles": {
                 "local7b": {"endpoint": "http://127.0.0.1:8000/v1", "model": "x"},
@@ -90,8 +90,8 @@ def test_pricing_local_free():
                 "claude": {"in_per_mtok": 3.0, "out_per_mtok": 15.0},
             },
         }))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = d
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = d
         try:
             M = 1_000_000
             assert _price("api:local7b", M, M) == 0.0   # local: free despite "api" entry
@@ -100,9 +100,9 @@ def test_pricing_local_free():
             assert _price("api:gpt", None, M) is None    # no tokens -> no price
         finally:
             if old is None:
-                os.environ.pop("XDG_CONFIG_HOME", None)
+                os.environ.pop("VASCULAR_HOME", None)
             else:
-                os.environ["XDG_CONFIG_HOME"] = old
+                os.environ["VASCULAR_HOME"] = old
 
 
 def test_reasoning_body():

@@ -9,13 +9,16 @@ import subprocess
 import uuid
 from pathlib import Path
 
-WS_ROOT = Path.home() / ".cache" / "heart-ws"
+from . import vascular_paths
 
 
 def _ws_root() -> Path:
     # env-aware so callers/tests that set HEART_WS_ROOT (like `heart clean`) and
-    # this reclaimer agree on where worktrees live
-    return Path(os.environ.get("HEART_WS_ROOT", str(WS_ROOT)))
+    # this reclaimer agree on where worktrees live; resolved per call so
+    # VASCULAR_HOME set by a test takes effect
+    if os.environ.get("HEART_WS_ROOT"):
+        return Path(os.environ["HEART_WS_ROOT"])
+    return vascular_paths.path("cache", "heart", "ws")
 
 
 def _force_rmtree(path: Path) -> bool:
@@ -100,14 +103,14 @@ def _is_live(worktree: Path) -> bool:
     A worktree with no lock file at all predates this and is not owned by
     anyone, so it is reclaimable too.
 
-    (Advisory locks are unreliable on NFS. WS_ROOT is a local cache dir.)
+    (Advisory locks are unreliable on NFS. _ws_root() is a local cache dir.)
     """
     lock = _lock_path(worktree)
     return lock.exists() and _lock_is_held(lock)
 
 
 def reclaim(repo: str | Path | None = None, older_than: float | None = None) -> int:
-    """Remove worktrees under WS_ROOT that no live Workspace owns.
+    """Remove worktrees under _ws_root() that no live Workspace owns.
 
     One reclaimer, because there used to be two. `heart clean` walked the disk
     with an age cutoff; prune_repo_worktrees walked a repo's own worktree list
@@ -247,7 +250,7 @@ def _sweep_once() -> None:
 
     Here rather than in a command someone has to remember: only plexus ever
     called the old reclaimer, so driving heart directly leaked indefinitely and
-    silently. Once per process because the cost is a WS_ROOT walk and leaks do
+    silently. Once per process because the cost is a _ws_root() walk and leaks do
     not appear while we run -- our own trees are locked.
     """
     global _swept

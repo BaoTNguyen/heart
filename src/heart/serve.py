@@ -17,15 +17,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import pulse
-from .cli import WORK_RUNS_DIR
+from .cli import work_runs_dir
 from .events import journal_dir
 
 PAGE = Path(__file__).with_name("pulse.html")
 
 # episode dirs for steering (§6.4 item 1) and drill-down (§6.4 item 2) live
-# here; cli.py imports serve lazily inside cmd_pulse, so importing WORK_RUNS_DIR
-# here at module scope creates no import cycle
-RUNS_DIR = WORK_RUNS_DIR
+# here; cli.py imports serve lazily inside cmd_pulse, so importing work_runs_dir
+# here at module scope creates no import cycle. serve() fills RUNS_DIR at call
+# time so VASCULAR_HOME applies; tests monkeypatch it directly.
+RUNS_DIR: Path | None = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -161,8 +162,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(port: int = 7717, runs_dir: str | Path | None = None) -> None:
     global RUNS_DIR
-    if runs_dir is not None:
-        RUNS_DIR = Path(runs_dir)
+    RUNS_DIR = Path(runs_dir) if runs_dir is not None else work_runs_dir()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"heart pulse: http://127.0.0.1:{port}  (Ctrl-C to stop)")
     try:
