@@ -166,3 +166,33 @@ class TestHomeReturnsPathNotString:
 
     def test_repo_dir_result_is_path(self):
         assert isinstance(vp.repo_dir(".", "x"), Path)
+
+
+class TestHeartPathsUnderVascularHome:
+    """Every path heart writes outside a checkout resolves under VASCULAR_HOME,
+    at call time, so setting it in a test takes effect."""
+
+    OVERRIDES = ("HEART_WS_ROOT", "HEART_ROUTE_STATS", "EVENT_JOURNAL_DIR")
+
+    def test_defaults_land_under_vascular_home(self, monkeypatch, tmp_path):
+        from heart import agents_api, cli, env, events, routing
+
+        monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
+        for k in self.OVERRIDES:
+            monkeypatch.delenv(k, raising=False)
+        assert agents_api.models_json_path() == tmp_path / "config" / "heart" / "models.json"
+        assert env._ws_root() == tmp_path / "cache" / "heart" / "ws"
+        assert routing._stats_path() == tmp_path / "state" / "heart" / "route_stats.json"
+        assert events.journal_dir() == tmp_path / "state" / "heart" / "events"
+        assert cli.work_runs_dir() == tmp_path / "state" / "heart" / "runs"
+
+    def test_specific_overrides_still_win(self, monkeypatch, tmp_path):
+        from heart import env, events, routing
+
+        monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "v"))
+        monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path / "ws"))
+        monkeypatch.setenv("HEART_ROUTE_STATS", str(tmp_path / "stats.json"))
+        monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path / "journal"))
+        assert env._ws_root() == tmp_path / "ws"
+        assert routing._stats_path() == tmp_path / "stats.json"
+        assert events.journal_dir() == tmp_path / "journal"

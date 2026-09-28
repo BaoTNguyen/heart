@@ -53,6 +53,7 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import vascular_paths
 from .agents_api import load_models_json, models_json_path
 from .events import emit
 from .pulse import load_events
@@ -94,8 +95,8 @@ _BLEND_K = 8
 
 
 def _stats_path() -> Path:
-    return Path(os.environ.get("HEART_ROUTE_STATS",
-                               str(Path.home() / ".local" / "share" / "heart" / "route_stats.json")))
+    return Path(os.environ.get("HEART_ROUTE_STATS")
+                or vascular_paths.path("state", "heart", "route_stats.json"))
 
 
 def drank(difficulty: str) -> int:

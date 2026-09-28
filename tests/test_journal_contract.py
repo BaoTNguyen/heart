@@ -21,11 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from heart.events import journal_dir
 
 JOURNAL_ENV = "EVENT_JOURNAL_DIR"
-JOURNAL_DEFAULT = Path.home() / ".local" / "share" / "heart" / "events"
+JOURNAL_DEFAULT = Path("/tmp/vascular-home") / "state" / "heart" / "events"
 
 
 def test_the_default_path_matches_the_contract():
     env = {k: v for k, v in os.environ.items() if k != JOURNAL_ENV}
+    env["VASCULAR_HOME"] = "/tmp/vascular-home"
     with patch.dict(os.environ, env, clear=True):
         assert journal_dir() == JOURNAL_DEFAULT
 

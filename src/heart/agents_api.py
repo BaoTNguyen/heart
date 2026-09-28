@@ -26,6 +26,8 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import vascular_paths
+
 SYSTEM = (
     "You are a coding agent working inside a git repository (the current directory). "
     "Use the bash tool to inspect files, make changes, and run tests. "
@@ -48,7 +50,7 @@ TOOLS = [{
 
 def models_json_path() -> Path:
     """Where heart keeps model profiles, the rate card and the routing tiers."""
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+    return vascular_paths.path("config", "heart", "models.json")
 
 
 def load_models_json() -> dict:
