@@ -17,7 +17,7 @@ floats: consensus gives you "frontier, great at planning, weak at vision," not
 "planning 0.9." The declared part only *orders* models before data exists; the
 real numbers come from the measured reward sidecar, which corrects the prior.
 
-Config (~/.config/heart/models.json):
+Config (~/.vascular/config/heart/models.json):
 
     {"models": {
         "claude":     {"agent": "claude",   "tier": "frontier",

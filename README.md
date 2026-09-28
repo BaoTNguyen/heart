@@ -101,7 +101,7 @@ verification passes and the reviewer approves.
 
 Set a default with `HEART_AGENT`. The `api` agent resolves config from
 `HEART_API_ENDPOINT` / `HEART_API_MODEL` / `HEART_API_KEY`, or named profiles in
-`~/.config/heart/models.json`:
+`~/.vascular/config/heart/models.json`:
 
 ```json
 {"profiles": {
@@ -414,7 +414,7 @@ Operational switches:
 - `heart pulse insights` includes a routing scorecard (pass rate per tier) —
   a `small` tier that keeps failing means the classifier thresholds need moving.
 - **Cost capture**: `runner.run_agent` extracts tokens and, from a
-  `~/.config/heart/models.json` `"pricing"` map keyed by agent string, dollars
+  `~/.vascular/config/heart/models.json` `"pricing"` map keyed by agent string, dollars
   per role, rolled into `episode["usage"]` and the spine. Two rules make the
   dollar figure a usable routing signal rather than a billing artifact:
   - **A local model server is always free** — `0.0`, even if a broad `"api"`
@@ -469,7 +469,7 @@ Operational switches:
   `heart work` — agents never edit CI config in a work run.
 - **`heart clean [--days N] [--runs-dir DIR]`**: deletes episode directories
   older than N days (default 7; `summary.csv` is kept) and removes stale
-  heart worktrees under `~/.cache/heart-ws`, pruning them from their source
+  heart worktrees under `~/.vascular/cache/heart/ws`, pruning them from their source
   repo with `git worktree prune` when the source repo is discoverable.
 
 ## RL environment

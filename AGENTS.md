@@ -13,7 +13,7 @@ Arteries observes turns and assistant responses, builds memory, may surface retr
 
 ## Rate card
 
-Every dollar figure in this stack comes from `~/.config/heart/models.json`.
+Every dollar figure in this stack comes from `~/.vascular/config/heart/models.json`.
 
 **If you see an unpriced model — from `heart models check`, or a plexus cost
 panel reporting `gaps.unpriced` — follow `PRICING.md` before trusting any cost
