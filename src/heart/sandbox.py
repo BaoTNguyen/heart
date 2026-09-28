@@ -668,14 +668,18 @@ def codex_sentinel_mounts() -> tuple[Mount, ...]:
     def seg(d):
         return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
     plan = os.getenv("HEART_SANDBOX_CODEX_PLAN", "plus")
+    # the real account id when the control plane passes one: Codex 0.157 refuses
+    # a token naming an account its routing lookup doesn't list. An identifier,
+    # not a credential -- the proxy sends the same id upstream on every request.
+    account = os.getenv("HEART_SANDBOX_CODEX_ACCOUNT", "heart-sentinel")
     claims = {"exp": 4102444800, "https://api.openai.com/auth": {
-        "chatgpt_plan_type": plan, "chatgpt_account_id": "heart-sentinel",
+        "chatgpt_plan_type": plan, "chatgpt_account_id": account,
         "chatgpt_user_id": "heart-sentinel"}}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     doc = {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
            "tokens": {"id_token": ".".join([seg({"alg": "none"}), seg(claims), "c2VudGluZWw"]),
                       "access_token": _seeded()["chatgpt"], "refresh_token": "heart-sentinel",
-                      "account_id": "heart-sentinel"},
+                      "account_id": account},
            "last_refresh": now}
     # beside the worktree root, not in it: reclaim() removes every directory
     # there that no live Workspace owns, and Docker Desktop still shares it
