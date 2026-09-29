@@ -653,6 +653,31 @@ def _injected() -> set[str]:
     return {r.strip() for r in os.getenv("HEART_SANDBOX_INJECT", "").split(",") if r.strip()}
 
 
+CA_BUNDLE_IN_CONTAINER = "/etc/ssl/heart-ca-bundle.pem"
+
+
+def _inject_tls() -> tuple[str, Path] | None:
+    """(port, CA cert) for the injector's TLS listener, or None to stay on http."""
+    port = os.getenv("HEART_SANDBOX_INJECT_TLS_PORT", "")
+    ca = os.getenv("HEART_SANDBOX_CA_CERT", "")
+    if "chatgpt" not in _injected() or not port or not ca or not Path(ca).is_file():
+        return None
+    return port, Path(ca)
+
+
+def _ca_bundle(ca: Path) -> Path:
+    """System roots plus the proxy's CA, for SSL_CERT_FILE. Reads only the
+    certificate; the key never leaves the proxy."""
+    path = _ws_root().parent / "heart-sentinel" / "ca-bundle.pem"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        roots = Path("/etc/ssl/certs/ca-certificates.crt").read_bytes()
+    except OSError:
+        roots = b""
+    path.write_bytes(roots + b"\n" + ca.read_bytes())
+    return path
+
+
 def codex_sentinel_mounts() -> tuple[Mount, ...]:
     """A Codex auth.json that holds nothing: the sentinel as its access token,
     an id_token carrying only the plan claim Codex reads, and last_refresh set
@@ -688,7 +713,10 @@ def codex_sentinel_mounts() -> tuple[Mount, ...]:
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(doc))
     os.replace(tmp, path)  # a container already running keeps the copy it had
-    return (Mount(str(path), f"{HOME}/.codex/auth.json", writable=False),)
+    mounts = (Mount(str(path), f"{HOME}/.codex/auth.json", writable=False),)
+    if (tls := _inject_tls()) is not None:
+        mounts += (Mount(str(_ca_bundle(tls[1])), CA_BUNDLE_IN_CONTAINER, writable=False),)
+    return mounts
 
 
 def inject_env(proxy_host: str) -> dict[str, str]:
@@ -708,6 +736,11 @@ def inject_env(proxy_host: str) -> dict[str, str]:
     NO_PROXY names the proxy itself: the base URL is plain http on the internal
     network, and sent through HTTP_PROXY it would arrive as an absolute URI for
     a host no allowlist names.
+
+    Codex 0.157 refuses a plain-http ChatGPT backend, so when the proxy runs a
+    TLS listener (HEART_SANDBOX_INJECT_TLS_PORT, CA in HEART_SANDBOX_CA_CERT)
+    the chatgpt URLs use https on that port. The container trusts it through
+    SSL_CERT_FILE, the system roots plus that CA; anthropic stays plain http.
     """
     routes = _injected()
     if not routes & {"anthropic", "chatgpt"} or not proxy_host:
@@ -722,8 +755,13 @@ def inject_env(proxy_host: str) -> dict[str, str]:
         # into `-c` flags; the refresh override points at a route the injector
         # does not have, so a refresh is refused there and never rotates the
         # host's token at OpenAI.
-        env |= {"HEART_CODEX_BASE": f"{at}/chatgpt/backend-api",
-                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": f"{at}/refresh"}
+        base = at
+        if (tls := _inject_tls()) is not None:
+            base = f"https://{proxy_host}:{tls[0]}"
+            _ca_bundle(tls[1])
+            env["SSL_CERT_FILE"] = CA_BUNDLE_IN_CONTAINER
+        env |= {"HEART_CODEX_BASE": f"{base}/chatgpt/backend-api",
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": f"{base}/refresh"}
     return env
 
 
