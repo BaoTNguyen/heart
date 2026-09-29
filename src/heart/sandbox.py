@@ -22,7 +22,9 @@ import datetime
 import json
 import os
 import shutil
+import ssl
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -656,11 +658,39 @@ def _injected() -> set[str]:
 CA_BUNDLE_IN_CONTAINER = "/etc/ssl/heart-ca-bundle.pem"
 
 
+_ROOTS_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _system_roots() -> Path | None:
+    """The host's CA bundle: the first readable, non-empty file among the usual
+    Linux paths, then whatever this Python's OpenSSL was built to use."""
+    for c in (*_ROOTS_CANDIDATES, ssl.get_default_verify_paths().cafile):
+        if not c:
+            continue
+        try:
+            with open(c, "rb") as f:
+                if f.read(1):
+                    return Path(c)
+        except OSError:
+            continue
+    return None
+
+
 def _inject_tls() -> tuple[str, Path] | None:
     """(port, CA cert) for the injector's TLS listener, or None to stay on http."""
     port = os.getenv("HEART_SANDBOX_INJECT_TLS_PORT", "")
     ca = os.getenv("HEART_SANDBOX_CA_CERT", "")
     if "chatgpt" not in _injected() or not port or not ca or not Path(ca).is_file():
+        return None
+    if _system_roots() is None:
+        # a bundle of the proxy's CA alone would break every other https host
+        print("heart: Codex stays on http: no system CA bundle found", file=sys.stderr)
         return None
     return port, Path(ca)
 
@@ -668,13 +698,14 @@ def _inject_tls() -> tuple[str, Path] | None:
 def _ca_bundle(ca: Path) -> Path:
     """System roots plus the proxy's CA, for SSL_CERT_FILE. Reads only the
     certificate; the key never leaves the proxy."""
+    roots = _system_roots()
+    if roots is None:
+        raise RuntimeError("no system CA bundle: refusing to write one with only the proxy's CA")
     path = _ws_root().parent / "heart-sentinel" / "ca-bundle.pem"
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        roots = Path("/etc/ssl/certs/ca-certificates.crt").read_bytes()
-    except OSError:
-        roots = b""
-    path.write_bytes(roots + b"\n" + ca.read_bytes())
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_bytes(roots.read_bytes() + b"\n" + ca.read_bytes())
+    os.replace(tmp, path)  # a container already mounting it never sees half a file
     return path
 
 
