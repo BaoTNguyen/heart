@@ -95,8 +95,10 @@ _BLEND_K = 8
 
 
 def _stats_path() -> Path:
-    return Path(os.environ.get("HEART_ROUTE_STATS")
-                or vascular_paths.path("state", "heart", "route_stats.json"))
+    # set-but-empty is an override too (Path('') is '.'); only unset falls through
+    if "HEART_ROUTE_STATS" in os.environ:
+        return Path(os.environ["HEART_ROUTE_STATS"])
+    return vascular_paths.path("state", "heart", "route_stats.json")
 
 
 def drank(difficulty: str) -> int:

@@ -16,7 +16,8 @@ def _ws_root() -> Path:
     # env-aware so callers/tests that set HEART_WS_ROOT (like `heart clean`) and
     # this reclaimer agree on where worktrees live; resolved per call so
     # VASCULAR_HOME set by a test takes effect
-    if os.environ.get("HEART_WS_ROOT"):
+    # set-but-empty is an override too: Path('') is '.', as before cdd8918
+    if "HEART_WS_ROOT" in os.environ:
         return Path(os.environ["HEART_WS_ROOT"])
     return vascular_paths.path("cache", "heart", "ws")
 
