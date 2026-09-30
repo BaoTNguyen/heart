@@ -26,6 +26,12 @@ from heart.agents_api import endpoint_for, is_local_endpoint  # noqa: E402
 from heart.runner import _flock_pool, _price  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_model_profile(monkeypatch):
+    """Profile resolution must not pick up the caller's HEART_MODEL_PROFILE."""
+    monkeypatch.delenv("HEART_MODEL_PROFILE", raising=False)
+
+
 def test_locality():
     for ep in ("http://127.0.0.1:8000/v1", "http://localhost:1234",
                "http://192.168.1.5:8000/v1", "http://10.0.0.9/v1", "http://[::1]:8000"):
