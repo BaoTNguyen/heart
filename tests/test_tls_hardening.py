@@ -59,3 +59,81 @@ def test_bundle_found_via_default_verify_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(ssl, "get_default_verify_paths",
                         lambda: real._replace(cafile=str(cafile)))
     assert sb._system_roots() == cafile
+
+
+def _proxy_module():
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "contrib" / "egress-proxy.py"
+    spec = importlib.util.spec_from_file_location("egress_proxy", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _garbage_cert(tmp_path):
+    (tmp_path / "proxy.pem").write_text("not a certificate\n")
+    (tmp_path / "proxy.key").write_text("not a key\n")
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_proxy_garbage_cert_tls_off(monkeypatch, tmp_path, capsys):
+    proxy = _proxy_module()
+    _garbage_cert(tmp_path)
+    monkeypatch.setattr(proxy, "TLS_DIR", tmp_path)
+    monkeypatch.setattr(proxy, "INJECT_TLS_PORT", 8443)
+    assert proxy.tls_context() is None
+    assert "credential injector (TLS) not started:" in capsys.readouterr().out
+
+
+def test_proxy_garbage_cert_still_serves_plain(monkeypatch, tmp_path):
+    import asyncio
+    proxy = _proxy_module()
+    _garbage_cert(tmp_path)
+    port, inject = _free_port(), _free_port()
+    monkeypatch.setattr(proxy, "TLS_DIR", tmp_path)
+    monkeypatch.setattr(proxy, "SECRETS", str(tmp_path))
+    monkeypatch.setattr(proxy, "ALLOW", ("example.com",))
+    monkeypatch.setattr(proxy, "PORT", port)
+    monkeypatch.setattr(proxy, "INJECT_PORT", inject)
+    monkeypatch.setattr(proxy, "INJECT_TLS_PORT", _free_port())
+
+    async def run():
+        task = asyncio.create_task(proxy.main())
+        try:
+            for p in (port, inject):
+                for _ in range(100):
+                    try:
+                        _, w = await asyncio.open_connection("127.0.0.1", p)
+                        break
+                    except OSError:
+                        if task.done():
+                            task.result()
+                        await asyncio.sleep(0.02)
+                else:
+                    raise AssertionError(f"nothing listening on {p}")
+                w.close()
+            assert not proxy.TLS_ON
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_proxy_tls_port_without_cert_keeps_allowlist(monkeypatch, tmp_path):
+    proxy = _proxy_module()
+    (tmp_path / "anthropic").write_text("sk-ant-oat01-real\n")
+    monkeypatch.setattr(proxy, "SECRETS", str(tmp_path))
+    monkeypatch.setattr(proxy, "TLS_DIR", tmp_path / "tls")
+    monkeypatch.setattr(proxy, "ALLOW", ("api.anthropic.com",))
+    monkeypatch.setattr(proxy, "INJECT_PORT", 0)
+    monkeypatch.setattr(proxy, "INJECT_TLS_PORT", 8443)
+    assert "api.anthropic.com" in proxy._injected_hosts()
+    assert proxy.tls_context() is None
+    assert proxy.permitted("api.anthropic.com", 443)
