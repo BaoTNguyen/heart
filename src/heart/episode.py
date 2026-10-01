@@ -49,6 +49,11 @@ from .verify import compare_baseline, run_probes, run_verifiers
 # the model for a misconfiguration and teach it the task is impossible.
 UNSCOREABLE = ("blocked", "unverified", "scope_denied")
 
+# The file an implementer writes when it stops for a decision. Checked on disk
+# right after the implement turn, so a block costs no verifier, fixer, tester
+# or reviewer -- each of those would be spending money on a question.
+BLOCKED_FILE = "PLEXUS_BLOCKED"
+
 DEFAULT_ROLES: list[dict] = [
     {"name": "implement", "memory": "normal", "verify_after": True, "prompt": "{prompt}"},
     {
@@ -751,10 +756,12 @@ def _run_episode(
     effective_allowed: list[str] = list(task.allowed_paths)
     diff = ""
     can_fix = fix_rounds > 0 and bool(task.public_verifiers)
+    implement_blocked: str | None = None
     try:
-        for role in [] if probe_failure else (roles or [
-                {"name": "solo", "memory": memory_mode,
-                 "verify_after": can_fix, "prompt": "{prompt}"}]):
+        pipeline = [] if probe_failure else (roles or [
+            {"name": "solo", "memory": memory_mode,
+             "verify_after": can_fix, "prompt": "{prompt}"}])
+        for i, role in enumerate(pipeline):
             role_env = dict(env)
             mem = role.get("memory", memory_mode)
             role_env.pop("ARTERIES_MEMORY", None)
@@ -822,13 +829,22 @@ def _run_episode(
             _agent_turn(role["name"], role_agent, prompt,
                         ws, role_env, role_task, out, agent_cmd, runs_log,
                         memory=mem, profile=role_profile)
+            marker = ws.path / BLOCKED_FILE
+            if role["name"] == "implement" and marker.is_file():
+                implement_blocked = _blocked_reason(
+                    marker.read_text(errors="replace"), BLOCKED_FILE + ":"
+                ) or "(no reason given)"
+                runs_log.extend({"role": r["name"], "skipped": True,
+                                 "reason": "implement blocked"}
+                                for r in pipeline[i + 1:])
+                break
             if role.get("verify_after") and can_fix:
                 verify_rounds = _fix_loop(
                     task, ws, out, agent, env, fix_rounds, escalate, agent_cmd, runs_log,
                     agent_profile, verifier_profile
                 )
         review_role = next((r for r in (roles or []) if r.get("review")), None)
-        if probe_failure:
+        if probe_failure or implement_blocked:
             review_role = None  # nothing was written; there is nothing to review
         if review_role is not None:
             # Three jobs, each named for what it reads: assess reads the diff,
@@ -882,9 +898,13 @@ def _run_episode(
         emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
              diff_lines=reward_mod.diff_changed_lines(diff), commit=commit_sha)
 
-        violations = path_violations(diff, effective_allowed, task.denied_paths)
+        # the marker is how an agent asks, not an edit: a scope that never
+        # listed it must not turn the question into a path_violation
+        violations = [v for v in path_violations(diff, effective_allowed, task.denied_paths)
+                      if v != BLOCKED_FILE]
         secret_hits = scan_secrets(diff)
-        blocked_reason = probe_failure or _blocked_reason(diff, task.blocked_marker)
+        blocked_reason = (probe_failure or implement_blocked
+                          or _blocked_reason(diff, task.blocked_marker))
 
         # Scanned before the ladder, not inside it. The ladder only ever asked
         # about refusals when the diff came back empty, which meant the only
@@ -1007,13 +1027,14 @@ def _run_episode(
         if clean is not None:
             clean.destroy()
 
+    ran = [r for r in runs_log if not r.get("skipped")]
     agent_result = {
-        "exit_code": 0 if all(r["exit_code"] == 0 for r in runs_log) else 1,
-        "timed_out": any(r["timed_out"] for r in runs_log),
-        "duration_s": round(sum(r["duration_s"] for r in runs_log), 2),
+        "exit_code": 0 if all(r["exit_code"] == 0 for r in ran) else 1,
+        "timed_out": any(r["timed_out"] for r in ran),
+        "duration_s": round(sum(r["duration_s"] for r in ran), 2),
     }
     if outcome in ("pass", "fail"):
-        budget = task.timeout_seconds * max(1, len(runs_log))
+        budget = task.timeout_seconds * max(1, len(ran))
         score = reward_mod.compute(
             verifier_results, diff, agent_result["duration_s"], budget,
             hidden_results=hidden_results,
