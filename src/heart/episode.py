@@ -483,8 +483,22 @@ def _situation(task: TaskSpec) -> str:
     are theirs, `--roles` lets a caller invent role names heart cannot map, and
     a mapping that drifts fails as `no_match`, which is indistinguishable from
     the corpus genuinely having nothing.
+
+    Capped at capillaries' limit (`situation` max_length=2000 in
+    capillaries/src/capillaries/agent/api.py). A feature prompt runs longer, and
+    every over-length request came back 422: across 64 episodes no build agent
+    ever received a retrieved prompt. A spec states its intent first, so the
+    head of it is what retrieval needs; cut at a word boundary.
     """
-    return task.prompt
+    text = task.prompt
+    if len(text) <= SITUATION_MAX:
+        return text
+    head = text[:SITUATION_MAX]
+    return head[:head.rfind(" ")] if " " in head else head
+
+
+#: capillaries rejects a longer `situation` with 422 (agent/api.py)
+SITUATION_MAX = 2000
 
 
 def _scope_note(task: TaskSpec) -> str:
