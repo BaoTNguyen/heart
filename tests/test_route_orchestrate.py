@@ -763,3 +763,13 @@ class ReviewAgentHarnessTests(unittest.TestCase):
         with unittest.mock.patch.object(orchestrate.review_mod, "review_pool",
                                         return_value=["claude:opus", "codex"]):
             self.assertEqual(orchestrate.review_mod.review_agent("claude:sonnet"), "codex")
+
+
+def test_situation_fits_capillaries_limit():
+    from heart.episode import SITUATION_MAX, _situation
+    from heart.taskspec import TaskSpec
+    short = TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt="fix the parser")
+    assert _situation(short) == "fix the parser"
+    long = TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt="word " * 1000)
+    s = _situation(long)
+    assert len(s) <= SITUATION_MAX and not s.endswith(" ") and s.startswith("word word")
