@@ -67,6 +67,13 @@ uv sync && uv run pytest -q          # self-check, no network or GPUs needed
 uv tool install --editable .         # `heart` on your PATH, for use in any repo
 ```
 
+**Testing.** Tests never write to an inherited event journal. `tests/conftest.py`
+points `EVENT_JOURNAL_DIR` and `VASCULAR_HOME` at a per-session tmp dir on every
+test, and it overrides them even when they are already set (`setdefault` is not
+enough): inside the sandbox the verifier inherits `EVENT_JOURNAL_DIR=/journal`,
+which is the real inbox. A test that needs a specific journal sets it with
+`monkeypatch` inside the test.
+
 heart stands alone. With [arteries](https://github.com/BaoTNguyen/arteries)
 installed beside it (`uv tool install --editable . --with-editable ../arteries`),
 orchestration workers also share memory; the whole stack
