@@ -10,6 +10,16 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture
+def default_root(monkeypatch, tmp_path):
+    """No VASCULAR_HOME and a throwaway HOME, so the default root is checked
+    without ever touching the account's real ~/.vascular."""
+    monkeypatch.delenv("VASCULAR_HOME", raising=False)
+    monkeypatch.delenv("EVENT_JOURNAL_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path / ".vascular"
+
 # The module must import with zero I/O — no file reads at import time.
 import heart.vascular_paths as vp
 
@@ -30,10 +40,8 @@ class TestKINDS:
 class TestHome:
     """home() returns $VASCULAR_HOME when set, else ~/.vascular."""
 
-    def test_defaults_to_home_dot_vascular(self):
-        with patch.dict(os.environ, {}, clear=True):
-            result = vp.home()
-        assert result == Path.home() / ".vascular"
+    def test_defaults_to_home_dot_vascular(self, default_root):
+        assert vp.home() == Path.home() / ".vascular" == default_root
 
     def test_respects_VASCULAR_HOME(self):
         with patch.dict(os.environ, {"VASCULAR_HOME": "/opt/v"}):
@@ -48,16 +56,14 @@ class TestHome:
 class TestPath:
     """path(kind, component, *parts) builds home()/kind/component/..."""
 
-    def test_valid_kinds_build_correctly(self):
-        with patch.dict(os.environ, {}, clear=True):
-            base = vp.home()
+    def test_valid_kinds_build_correctly(self, default_root):
+        base = Path.home() / ".vascular"
         for kind in vp.KINDS:
             p = vp.path(kind, "mycomp")
             assert p == base / kind / "mycomp"
 
-    def test_extra_parts_are_appended(self):
-        with patch.dict(os.environ, {}, clear=True):
-            base = vp.home()
+    def test_extra_parts_are_appended(self, default_root):
+        base = Path.home() / ".vascular"
         p = vp.path("state", "heart", "events", "2026.ndjson")
         assert p == base / "state" / "heart" / "events" / "2026.ndjson"
 
@@ -65,9 +71,8 @@ class TestPath:
         with pytest.raises(ValueError, match="unknown kind"):
             vp.path("bogus", "comp")
 
-    def test_empty_component_is_allowed(self):
-        with patch.dict(os.environ, {}, clear=True):
-            base = vp.home()
+    def test_empty_component_is_allowed(self, default_root):
+        base = Path.home() / ".vascular"
         p = vp.path("config", "")
         assert p == base / "config" / ""
 
@@ -79,11 +84,9 @@ class TestPath:
 class TestJournalDir:
     """journal_dir() resolves $EVENT_JOURNAL_DIR or heart's state path."""
 
-    def test_defaults_to_heart_state_events(self):
-        with patch.dict(os.environ, {}, clear=True):
-            result = vp.journal_dir()
-        expected = vp.home() / "state" / "heart" / "events"
-        assert result == expected
+    def test_defaults_to_heart_state_events(self, default_root):
+        expected = Path.home() / ".vascular" / "state" / "heart" / "events"
+        assert vp.journal_dir() == expected
 
     def test_respects_EVENT_JOURNAL_DIR(self):
         with patch.dict(os.environ, {"EVENT_JOURNAL_DIR": "/tmp/j"}):
