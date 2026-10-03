@@ -1180,7 +1180,7 @@ def test_a_contained_command_runs_on_the_host_when_no_sandbox_is_asked(monkeypat
 
 
 @pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
-def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch):
+def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch, request):
     """The acceptance check plexus runs after an episode executes whatever the
     agent put in the tree. Contained, a conftest.py that phones home has no
     route, and the operator's home is not there to read."""
@@ -1189,6 +1189,14 @@ def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch):
     import tempfile
 
     monkeypatch.setenv("HEART_SANDBOX", SANDBOX_MODE)
+    # A real container needs a bind source Docker Desktop shares: conftest
+    # points VASCULAR_HOME (and so the workspace root) at a /tmp dir, which it
+    # does not. Use a scratch root under the home cache instead.
+    shared = Path.home() / ".cache"
+    shared.mkdir(parents=True, exist_ok=True)
+    root = tempfile.mkdtemp(prefix="heart-test-ws-", dir=shared)
+    request.addfinalizer(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+    monkeypatch.setenv("HEART_WS_ROOT", root)
     _ws_root().mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=_ws_root()) as ws:
         probe = ("python3 -c \"import socket; s=socket.socket(); s.settimeout(3); "
