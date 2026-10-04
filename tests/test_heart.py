@@ -376,16 +376,16 @@ class TestHeart(unittest.TestCase):
         from heart.env import Workspace
 
         repo = self.root / "toyrepo"
-        (repo / ".arteries" / "hooks").mkdir(parents=True)
-        (repo / ".arteries" / "hooks" / "observe.sh").write_text("#!/bin/sh\necho hi\n")
-        (repo / ".arteries" / "runs").mkdir()
-        (repo / ".arteries" / "runs" / "old.jsonl").write_text("{}\n")
+        (repo / ".vascular" / "arteries" / "hooks").mkdir(parents=True)
+        (repo / ".vascular" / "arteries" / "hooks" / "observe.sh").write_text("#!/bin/sh\necho hi\n")
+        (repo / ".vascular" / "arteries" / "runs").mkdir()
+        (repo / ".vascular" / "arteries" / "runs" / "old.jsonl").write_text("{}\n")
         (repo / ".claude").mkdir()
         (repo / ".claude" / "settings.local.json").write_text("{}")
         ws = Workspace(str(repo), self.commit)
         try:
-            self.assertTrue((ws.path / ".arteries" / "hooks" / "observe.sh").exists())
-            self.assertFalse((ws.path / ".arteries" / "runs").exists())  # fallback data stays home
+            self.assertTrue((ws.path / ".vascular" / "arteries" / "hooks" / "observe.sh").exists())
+            self.assertFalse((ws.path / ".vascular" / "arteries" / "runs").exists())  # fallback data stays home
             self.assertTrue((ws.path / ".claude" / "settings.local.json").exists())
             self.assertEqual(ws.diff(), "")  # copied files never pollute the diff
         finally:
@@ -1994,8 +1994,8 @@ class TestUnrestrictedTasksStayUnrestricted(unittest.TestCase):
 
 
 class TestGitignoredIntegrationFiles(unittest.TestCase):
-    """heart copies .claude/.arteries into every worktree, and most real repos
-    gitignore both. `git add -A -- . :(exclude).claude` then exits 1, because the
+    """heart copies .claude and .vascular/arteries into every worktree, and most
+    real repos gitignore both. `git add -A -- . :(exclude).claude` then exits 1, because the
     `.` names an ignored path and the exclude does not suppress that check --
     so every commit failed on any repo with a .gitignore, and on Path B the
     exception escaped and killed the whole orchestration."""
@@ -2005,7 +2005,7 @@ class TestGitignoredIntegrationFiles(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.head = make_repo(self.root)
         self.repo = self.root / "toyrepo"
-        (self.repo / ".gitignore").write_text(".claude/\n.arteries/\n.env\n")
+        (self.repo / ".gitignore").write_text(".claude/\n.vascular/\n.env\n")
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run([*git, "add", "-A"], check=True)
         subprocess.run([*git, "commit", "-qm", "add gitignore"], check=True)

@@ -226,6 +226,7 @@ tasks/mined-*/
 
 # local integration runtimes (installed per-machine, never committed)
 .arteries/
+.vascular/
 .marrow/
 .claude/settings.local.json
 .codex/config.toml

@@ -198,7 +198,7 @@ def _arteries_context(prompt: str) -> str:
     """CLI agents get arteries via host hooks; this loop has no host, so call
     the repo's observe hook directly — it logs the turn and may return a
     retrieved prompt. Absent or failing hook = empty string, never an error."""
-    hook = Path(".arteries/hooks/observe.sh")
+    hook = vascular_paths.repo_dir(Path.cwd(), "arteries") / "hooks" / "observe.sh"
     if not hook.exists():
         return ""
     try:

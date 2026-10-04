@@ -203,7 +203,7 @@ def prune_repo_worktrees(repo: str | Path) -> int:
 
 # untracked integration files a worktree checkout doesn't carry; without them
 # agents in the workspace run with no arteries memory/retrieval hooks at all
-INTEGRATION_FILES = (".arteries", ".claude/settings.local.json", ".codex/config.toml")
+INTEGRATION_FILES = (".vascular/arteries", ".claude/settings.local.json", ".codex/config.toml")
 
 
 def _run(args: list[str], cwd: str, input_text: str | None = None) -> subprocess.CompletedProcess:
@@ -298,7 +298,7 @@ class Workspace:
     EXCLUDED_PATHS = [
         "__pycache__", "*.pyc", ".pytest_cache", "node_modules",
         # integration files we copied in ourselves (INTEGRATION_FILES)
-        ".arteries", ".claude", ".codex",
+        ".vascular", ".claude", ".codex",
     ]
     DIFF_EXCLUDES = [f":(exclude){p}" for p in EXCLUDED_PATHS]
 
@@ -330,8 +330,8 @@ class Workspace:
         # `git add -A -- . :(exclude)X` fails outright (exit 1) when X is also in
         # .gitignore and present: the `.` names it, git refuses to add a named
         # ignored path, and the exclude does not suppress that check. heart
-        # copies .claude and .arteries into every worktree and most real repos
-        # gitignore both, so heart created the collision itself -- every commit
+        # copies .claude and .vascular/arteries into every worktree and most
+        # real repos gitignore both, so heart created the collision itself -- every commit
         # on such a repo raised, which on Path B took the whole orchestration
         # down. Toy repos with no .gitignore never saw it.
         #
