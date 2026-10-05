@@ -1,8 +1,7 @@
 """Prose must name heart's state where it now lives, under ~/.vascular.
 
 sandbox.py is skipped on purpose: its old path quotes an error message
-measured at the time and stays as history. ~/.config/heart/secrets is out of
-scope and not in OLD.
+measured at the time and stays as history.
 """
 import re
 from pathlib import Path
@@ -10,8 +9,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-OLD = re.compile(r"\.config/heart/models\.json|\.cache/heart-ws|\.local/share/heart")
-FILES = ["README.md", "SPINE.md", "PRICING.md", "tests/conftest.py",
+OLD = re.compile(r"\.config/heart/models\.json|\.cache/heart-ws|\.local/share/heart|\.config/heart/secrets")
+FILES = ["README.md", "AGENTS.md", "SPINE.md", "PRICING.md", "tests/conftest.py",
          "tests/test_heart.py", "src/heart/agents_api.py", "src/heart/routing.py"]
 
 
