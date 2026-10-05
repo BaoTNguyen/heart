@@ -5,11 +5,11 @@ import heart.sandbox as sb
 
 
 def _seeded_env(monkeypatch, tmp_path):
-    # primed like tests/test_sandbox.py: a sentinel seed under XDG_CONFIG_HOME
+    # primed like tests/test_sandbox.py: a sentinel seed under VASCULAR_HOME
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "heart" / "secrets" / "sentinel").write_text("s33d")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
+    (tmp_path / "config" / "heart" / "secrets").mkdir(parents=True)
+    (tmp_path / "config" / "heart" / "secrets" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
 
 

@@ -726,15 +726,15 @@ def test_codex_gets_a_sentinel_auth_file_and_the_proxy_as_its_server(monkeypatch
     import heart.runner as runner
 
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "heart" / "secrets" / "sentinel").write_text("s33d")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
+    (tmp_path / "config" / "heart" / "secrets").mkdir(parents=True)
+    (tmp_path / "config" / "heart" / "secrets" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
     monkeypatch.setenv("HEART_SANDBOX_CODEX_PLAN", "pro")
     (mount,) = sb.codex_sentinel_mounts()
     assert mount.target == f"{HOME}/.codex/auth.json" and not mount.writable
     doc = json.loads(Path(mount.source).read_text())
-    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "heart" / "secrets"))
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "config" / "heart" / "secrets"))
     assert doc["tokens"]["access_token"] == sb.sentinels("s33d")["chatgpt"] \
         == _proxy_module().sentinels()["chatgpt"]
     payload = doc["tokens"]["id_token"].split(".")[1]
@@ -1099,10 +1099,26 @@ def test_a_run_without_the_seed_cannot_use_the_injector(monkeypatch, tmp_path):
     (tmp_path / "sentinel").unlink()
     assert _proxy_module().sentinels() == {}
     # injection asked for with no seed fails loudly, not as "not logged in"
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "none"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "none"))
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "anthropic")
     with pytest.raises(RuntimeError, match="plexus doctor --fix"):
         sb.inject_env("egress")
+
+
+def test_sentinel_seed_reads_vascular_home_not_xdg(monkeypatch, tmp_path):
+    import heart.sandbox as sb
+    seed = tmp_path / "v" / "config" / "heart" / "secrets" / "sentinel"
+    seed.parent.mkdir(parents=True)
+    seed.write_text("abc\n")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "v"))
+    assert sb.sentinel_seed() == "abc"
+    # the old XDG location is not a fallback
+    old = tmp_path / "xdg" / "heart" / "secrets" / "sentinel"
+    old.parent.mkdir(parents=True)
+    old.write_text("old")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "empty"))
+    assert sb.sentinel_seed() == ""
 
 
 def test_an_injected_seat_is_a_sentinel_and_a_base_url_never_a_token(monkeypatch):

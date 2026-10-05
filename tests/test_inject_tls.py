@@ -28,9 +28,9 @@ def test_proxy_tls_context_off_is_silent(monkeypatch, capsys):
 def _sandbox_env(monkeypatch, tmp_path):
     import heart.sandbox as sb
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path / "ws"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "heart" / "secrets" / "sentinel").write_text("s33d")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
+    (tmp_path / "config" / "heart" / "secrets").mkdir(parents=True)
+    (tmp_path / "config" / "heart" / "secrets" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
     monkeypatch.delenv("HEART_SANDBOX_INJECT_TLS_PORT", raising=False)
     monkeypatch.delenv("HEART_SANDBOX_CA_CERT", raising=False)

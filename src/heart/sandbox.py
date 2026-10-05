@@ -31,7 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from . import agents_api
+from . import agents_api, vascular_paths
 from .env import _ws_root
 from .taskspec import TaskSpec
 
@@ -627,9 +627,8 @@ def sentinel_seed() -> str:
     constant anyone could read in this file would have let it. plexus doctor
     creates it; the proxy reads the same file from its mount.
     """
-    cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     try:
-        return (cfg / "heart" / "secrets" / "sentinel").read_text().strip()
+        return vascular_paths.path("config", "heart", "secrets", "sentinel").read_text().strip()
     except OSError:
         return ""
 
