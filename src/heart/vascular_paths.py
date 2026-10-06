@@ -7,10 +7,19 @@ state lands, and uninstall has one place to look:
     ~/.vascular/<kind>/<component>/...      (VASCULAR_HOME overrides ~/.vascular)
 
 kinds:  config   settings a person edits or a setup step writes
-        state    regenerable runtime records (runs, events, usage, daemons)
+        secrets  credentials; callers create these dirs 0700 and files 0600.
+                 Never backed up, never read by pulse; uninstall keeps them
+                 unless --purge
+        state    regenerable runtime records (runs, usage, daemons)
+        spool    append-only NDJSON events for pulse to collect; delete only
+                 behind the collector's checkpoint
+        log      human-readable diagnostics; rotate or trim freely
         cache    safe to delete at any time (worktrees, downloads)
         data     things a person wrote; uninstall keeps them unless --purge
         backups  dumps taken before anything destructive
+
+Each kind has one retention rule, so a collector or an uninstaller can tell
+what a file is from its path alone.
 
 Inside a repo the stack works on, the same idea: <repo>/.vascular/<component>/.
 
@@ -22,7 +31,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-KINDS = ("config", "state", "cache", "data", "backups")
+KINDS = ("config", "secrets", "state", "spool", "log", "cache", "data", "backups")
 
 
 def home() -> Path:
@@ -38,10 +47,11 @@ def path(kind: str, component: str, *parts: str) -> Path:
 
 
 def journal_dir() -> Path:
-    """The event journal heart, arteries and capillaries all append to.
+    """The event journal heart, arteries, capillaries and plexus all append to.
 
-    Shared, so it has one definition: $EVENT_JOURNAL_DIR, else heart's state."""
-    return Path(os.environ.get("EVENT_JOURNAL_DIR") or path("state", "heart", "events"))
+    Shared, so it has one definition: $EVENT_JOURNAL_DIR, else the events spool
+    pulse collects from."""
+    return Path(os.environ.get("EVENT_JOURNAL_DIR") or path("spool", "events"))
 
 
 def repo_dir(root: str | Path, component: str) -> Path:
