@@ -294,9 +294,9 @@ class TestHeart(unittest.TestCase):
 
         old = dict(os.environ)
         try:
-            cfg = self.root / "cfg" / "heart"
+            cfg = self.root / "cfg" / "config" / "heart"
             cfg.mkdir(parents=True, exist_ok=True)
-            os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
+            os.environ["VASCULAR_HOME"] = str(self.root / "cfg")
             for k in list(os.environ):  # ambient tier config must not leak in
                 if k.startswith("HEART_TIER_"):
                     del os.environ[k]
@@ -352,7 +352,7 @@ class TestHeart(unittest.TestCase):
 
         old = dict(os.environ)
         try:
-            os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
+            os.environ["VASCULAR_HOME"] = str(self.root / "cfg")
             for k in list(os.environ):
                 if k.startswith("HEART_TIER_"):
                     del os.environ[k]
@@ -376,16 +376,16 @@ class TestHeart(unittest.TestCase):
         from heart.env import Workspace
 
         repo = self.root / "toyrepo"
-        (repo / ".arteries" / "hooks").mkdir(parents=True)
-        (repo / ".arteries" / "hooks" / "observe.sh").write_text("#!/bin/sh\necho hi\n")
-        (repo / ".arteries" / "runs").mkdir()
-        (repo / ".arteries" / "runs" / "old.jsonl").write_text("{}\n")
+        (repo / ".vascular" / "arteries" / "hooks").mkdir(parents=True)
+        (repo / ".vascular" / "arteries" / "hooks" / "observe.sh").write_text("#!/bin/sh\necho hi\n")
+        (repo / ".vascular" / "arteries" / "runs").mkdir()
+        (repo / ".vascular" / "arteries" / "runs" / "old.jsonl").write_text("{}\n")
         (repo / ".claude").mkdir()
         (repo / ".claude" / "settings.local.json").write_text("{}")
         ws = Workspace(str(repo), self.commit)
         try:
-            self.assertTrue((ws.path / ".arteries" / "hooks" / "observe.sh").exists())
-            self.assertFalse((ws.path / ".arteries" / "runs").exists())  # fallback data stays home
+            self.assertTrue((ws.path / ".vascular" / "arteries" / "hooks" / "observe.sh").exists())
+            self.assertFalse((ws.path / ".vascular" / "arteries" / "runs").exists())  # fallback data stays home
             self.assertTrue((ws.path / ".claude" / "settings.local.json").exists())
             self.assertEqual(ws.diff(), "")  # copied files never pollute the diff
         finally:
@@ -640,7 +640,7 @@ class TestHeart(unittest.TestCase):
         self.assertIn("fell back from Postgres", buf.getvalue())
 
     def test_api_config_resolution(self):
-        cfgdir = self.root / "cfg" / "heart"
+        cfgdir = self.root / "cfg" / "config" / "heart"
         cfgdir.mkdir(parents=True)
         (cfgdir / "models.json").write_text(json.dumps({
             "profiles": {"gpt": {"endpoint": "https://api.openai.com/v1",
@@ -649,7 +649,7 @@ class TestHeart(unittest.TestCase):
         old = dict(os.environ)
         try:
             os.environ.update({
-                "XDG_CONFIG_HOME": str(self.root / "cfg"),
+                "VASCULAR_HOME": str(self.root / "cfg"),
                 "HEART_MODEL_PROFILE": "gpt", "TEST_KEY_VAR": "sk-test",
             })
             cfg = resolve_config()
@@ -1005,7 +1005,7 @@ class TestReviewerRotation(unittest.TestCase):
     brings the same blind spots to finding the bug it brought to writing it."""
 
     def setUp(self):
-        # pin the pool: review_pool() reads ~/.config/heart/models.json, and a
+        # pin the pool: review_pool() reads ~/.vascular/config/heart/models.json, and a
         # unit test that asserts on the operator's live config fails whenever
         # they change a model -- which is exactly what it is meant to let them do
         self._patch = unittest.mock.patch.dict(
@@ -1292,7 +1292,7 @@ class TestCost(unittest.TestCase):
         a profile, and a scheduled change takes effect on its own date."""
         from heart.runner import model_pricing
 
-        cfg = self.root / "heart"
+        cfg = self.root / "config" / "heart"
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "models.json").write_text(json.dumps({
             "profiles": {"sonnet": {"model": "claude-sonnet-5"}},
@@ -1309,8 +1309,8 @@ class TestCost(unittest.TestCase):
                 ],
             },
         }))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root)
         try:
             # model-id entry wins over the profile join, which said $99
             day = model_pricing(on="2026-08-05")
@@ -1325,8 +1325,8 @@ class TestCost(unittest.TestCase):
             self.assertEqual(model_pricing(on="2025-06-01").get("claude-sonnet-5"),
                              {"input": 99.0, "output": 99.0})
         finally:
-            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
-                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+            os.environ.pop("VASCULAR_HOME", None) if old is None \
+                else os.environ.__setitem__("VASCULAR_HOME", old)
 
     def test_set_model_price_demands_provenance(self):
         """A rate with no source cannot be re-verified later, so it is refused
@@ -1334,8 +1334,8 @@ class TestCost(unittest.TestCase):
         about, which is how a stale number survives a price change."""
         from heart.runner import model_pricing, set_model_price
 
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root / "prov")
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root / "prov")
         try:
             with self.assertRaises(ValueError):
                 set_model_price("m", 1.0, 2.0, source="")
@@ -1356,8 +1356,8 @@ class TestCost(unittest.TestCase):
             self.assertEqual(model_pricing(on="2099-06-01")["claude-x"],
                              {"input": 6.0, "output": 12.0})
         finally:
-            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
-                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+            os.environ.pop("VASCULAR_HOME", None) if old is None \
+                else os.environ.__setitem__("VASCULAR_HOME", old)
 
     def test_model_pricing_joins_profiles_to_rates(self):
         """models.json keys rates by provider:profile and models by profile.
@@ -1365,7 +1365,7 @@ class TestCost(unittest.TestCase):
         two have to be joined before an interactive turn can be priced."""
         from heart.runner import model_pricing
 
-        cfg = self.root / "heart"
+        cfg = self.root / "config" / "heart"
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "models.json").write_text(json.dumps({
             "profiles": {
@@ -1383,8 +1383,8 @@ class TestCost(unittest.TestCase):
                 "claude": {"in_per_mtok": 5.0, "out_per_mtok": 25.0},
             },
         }))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root)
         try:
             rates = model_pricing()
             self.assertEqual(rates["claude-haiku-4-5"], {"input": 1.0, "output": 5.0})
@@ -1398,36 +1398,36 @@ class TestCost(unittest.TestCase):
             # the provider-wide key has no profile and must not become a model
             self.assertNotIn("claude", rates)
         finally:
-            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
-                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+            os.environ.pop("VASCULAR_HOME", None) if old is None \
+                else os.environ.__setitem__("VASCULAR_HOME", old)
 
     def test_model_pricing_survives_a_missing_or_broken_config(self):
         """No card is "we cannot price this", never "everything is free"."""
         from heart.runner import model_pricing
 
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root / "nonexistent")
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root / "nonexistent")
         try:
             self.assertEqual(model_pricing(), {})
-            cfg = self.root / "broken" / "heart"
+            cfg = self.root / "broken" / "config" / "heart"
             cfg.mkdir(parents=True, exist_ok=True)
             (cfg / "models.json").write_text("{not json")
-            os.environ["XDG_CONFIG_HOME"] = str(self.root / "broken")
+            os.environ["VASCULAR_HOME"] = str(self.root / "broken")
             self.assertEqual(model_pricing(), {})
         finally:
-            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
-                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+            os.environ.pop("VASCULAR_HOME", None) if old is None \
+                else os.environ.__setitem__("VASCULAR_HOME", old)
 
     def test_price_applies_cache_multipliers(self):
         """Read 0.1x, 5m write 1.25x, 1h write 2x, all off the base input rate."""
         from heart.runner import _price
 
-        cfg = self.root / "heart"
+        cfg = self.root / "config" / "heart"
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "models.json").write_text(json.dumps({"pricing": {
             "claude": {"in_per_mtok": 5.0, "out_per_mtok": 25.0}}}))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root)
         try:
             # 1M uncached in = $5; 1M read = $0.50; 1M 5m write = $6.25;
             # 1M 1h write = $10; 1M out = $25
@@ -1443,8 +1443,8 @@ class TestCost(unittest.TestCase):
             full = _price("claude", 15, 2692, 48_000, 9_000, 3_000)
             self.assertGreater(full, bare)
         finally:
-            os.environ.pop("XDG_CONFIG_HOME", None) if old is None \
-                else os.environ.__setitem__("XDG_CONFIG_HOME", old)
+            os.environ.pop("VASCULAR_HOME", None) if old is None \
+                else os.environ.__setitem__("VASCULAR_HOME", old)
 
     def test_extract_usage_garbage_log(self):
         from heart.runner import _extract_usage
@@ -1480,7 +1480,7 @@ class TestCost(unittest.TestCase):
     def test_price(self):
         from heart.runner import _price
 
-        cfgdir = self.root / "cfg" / "heart"
+        cfgdir = self.root / "cfg" / "config" / "heart"
         cfgdir.mkdir(parents=True)
         (cfgdir / "models.json").write_text(json.dumps({
             "profiles": {
@@ -1492,8 +1492,8 @@ class TestCost(unittest.TestCase):
                 "claude": {"in_per_mtok": 3.0, "out_per_mtok": 15.0},
             }
         }))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.root / "cfg")
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = str(self.root / "cfg")
         try:
             # metered profile prices via the base "api" entry
             self.assertEqual(_price("api:qwen", 1_000_000, 1_000_000), 3.0)
@@ -1507,9 +1507,9 @@ class TestCost(unittest.TestCase):
             self.assertIsNone(_price("claude", None, 100))
         finally:
             if old is None:
-                os.environ.pop("XDG_CONFIG_HOME", None)
+                os.environ.pop("VASCULAR_HOME", None)
             else:
-                os.environ["XDG_CONFIG_HOME"] = old
+                os.environ["VASCULAR_HOME"] = old
 
     def test_episode_usage_is_none_for_shell_agent_and_insights_survives(self):
         from heart import pulse
@@ -1994,8 +1994,8 @@ class TestUnrestrictedTasksStayUnrestricted(unittest.TestCase):
 
 
 class TestGitignoredIntegrationFiles(unittest.TestCase):
-    """heart copies .claude/.arteries into every worktree, and most real repos
-    gitignore both. `git add -A -- . :(exclude).claude` then exits 1, because the
+    """heart copies .claude and .vascular/arteries into every worktree, and most
+    real repos gitignore both. `git add -A -- . :(exclude).claude` then exits 1, because the
     `.` names an ignored path and the exclude does not suppress that check --
     so every commit failed on any repo with a .gitignore, and on Path B the
     exception escaped and killed the whole orchestration."""
@@ -2005,7 +2005,7 @@ class TestGitignoredIntegrationFiles(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.head = make_repo(self.root)
         self.repo = self.root / "toyrepo"
-        (self.repo / ".gitignore").write_text(".claude/\n.arteries/\n.env\n")
+        (self.repo / ".gitignore").write_text(".claude/\n.vascular/\n.env\n")
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run([*git, "add", "-A"], check=True)
         subprocess.run([*git, "commit", "-qm", "add gitignore"], check=True)

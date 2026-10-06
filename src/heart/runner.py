@@ -774,6 +774,15 @@ def sandbox_egress_denied(output: str) -> str | None:
 SANDBOX_MODE = "docker-sbx"
 
 
+_START_RETRIES = 4
+
+
+def _transient_start_failure(failure: str) -> bool:
+    """A start failure worth retrying: Docker Desktop reporting a bind source
+    missing that heart created a moment earlier (a fresh worktree's git dir)."""
+    return "bind source path does not exist" in failure
+
+
 def sandbox_start_failure(exit_code: int, output: str) -> str | None:
     """The docker message when the container never started, or None.
 
@@ -992,24 +1001,35 @@ def run_agent(
             "answering; not spawning an agent that has nothing to talk to")
 
     t0 = time.monotonic()
-    timed_out = False
-    with _GATE, _global_slot(), _local_slot(local_endpoint), open(log_path, "w") as log:
-        # start_new_session so the agent is its own process-group leader: agent
-        # CLIs spawn grandchildren (node, MCP servers, model procs) that a plain
-        # subprocess timeout would orphan to init. On timeout we kill the whole
-        # group, so nothing leaks.
-        proc = subprocess.Popen(
-            cmd, shell=shell, cwd=cwd, env=env,
-            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-        )
-        try:
-            exit_code = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            exit_code = -1
-            _kill_group(proc)
-    tail = _tail(log_path)
-    if failure := sandbox_start_failure(exit_code, tail):
+    # ponytail: retries only the Docker sandbox file-sync race, where a bind
+    # source the host just created (a fresh worktree's git dir) is not yet
+    # visible to the sandbox VM. Measured: the dir existed on the host for 4.4s
+    # while three 1-2s retries failed, so back off to ~30s. Fix the sync itself
+    # (or mount the git dir differently) if waiting stops being enough.
+    for start in range(_START_RETRIES + 1):
+        timed_out = False
+        with _GATE, _global_slot(), _local_slot(local_endpoint), open(log_path, "w") as log:
+            # start_new_session so the agent is its own process-group leader: agent
+            # CLIs spawn grandchildren (node, MCP servers, model procs) that a plain
+            # subprocess timeout would orphan to init. On timeout we kill the whole
+            # group, so nothing leaks.
+            proc = subprocess.Popen(
+                cmd, shell=shell, cwd=cwd, env=env,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            try:
+                exit_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                exit_code = -1
+                _kill_group(proc)
+        tail = _tail(log_path)
+        failure = sandbox_start_failure(exit_code, tail)
+        if failure and _transient_start_failure(failure) and start < _START_RETRIES:
+            time.sleep(2 ** (start + 1))
+            continue
+        break
+    if failure:
         # loud, not scored: a sandbox that cannot start must never look like an
         # agent that did nothing
         raise RuntimeError(f"sandbox failed to start for role {agent!r}: {failure}")
