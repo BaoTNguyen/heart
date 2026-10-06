@@ -28,13 +28,13 @@ class TestKINDS:
     """KINDS is the fixed tuple of recognised kinds."""
 
     def test_exact_contents_and_order(self):
-        assert vp.KINDS == ("config", "state", "cache", "data", "backups")
+        assert vp.KINDS == ("config", "secrets", "state", "spool", "log", "cache", "data", "backups")
 
     def test_is_a_tuple_not_a_list(self):
         assert isinstance(vp.KINDS, tuple)
 
     def test_no_extra_kinds(self):
-        assert len(vp.KINDS) == 5
+        assert len(vp.KINDS) == 8
 
 
 class TestHome:
@@ -76,16 +76,22 @@ class TestPath:
         p = vp.path("config", "")
         assert p == base / "config" / ""
 
+    def test_new_kinds_land_under_home(self, default_root):
+        for kind in ("secrets", "spool", "log"):
+            p = vp.path(kind, "x")
+            assert p == vp.home() / kind / "x"
+            assert p.is_relative_to(vp.home())
+
     def test_returns_path_instance(self):
         p = vp.path("cache", "x", "a", "b")
         assert isinstance(p, Path)
 
 
 class TestJournalDir:
-    """journal_dir() resolves $EVENT_JOURNAL_DIR or heart's state path."""
+    """journal_dir() resolves $EVENT_JOURNAL_DIR or the events spool."""
 
-    def test_defaults_to_heart_state_events(self, default_root):
-        expected = Path.home() / ".vascular" / "state" / "heart" / "events"
+    def test_defaults_to_spool_events(self, default_root):
+        expected = Path.home() / ".vascular" / "spool" / "events"
         assert vp.journal_dir() == expected
 
     def test_respects_EVENT_JOURNAL_DIR(self):
@@ -186,7 +192,7 @@ class TestHeartPathsUnderVascularHome:
         assert agents_api.models_json_path() == tmp_path / "config" / "heart" / "models.json"
         assert env._ws_root() == tmp_path / "cache" / "heart" / "ws"
         assert routing._stats_path() == tmp_path / "state" / "heart" / "route_stats.json"
-        assert events.journal_dir() == tmp_path / "state" / "heart" / "events"
+        assert events.journal_dir() == tmp_path / "spool" / "events"
         assert cli.work_runs_dir() == tmp_path / "state" / "heart" / "runs"
 
     def test_specific_overrides_still_win(self, monkeypatch, tmp_path):
