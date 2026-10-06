@@ -38,7 +38,7 @@ set them) — `pulse goal <goal-id>` reads this back.
 
 ## Journal location
 
-`$EVENT_JOURNAL_DIR`, else `~/.vascular/state/heart/events/`. One file per UTC day:
+`$EVENT_JOURNAL_DIR`, else `~/.vascular/spool/events/`. One file per UTC day:
 `YYYYMMDD.ndjson`. Writers append single lines (atomic enough on Linux);
 readers tolerate torn or malformed lines by skipping them.
 `$VASCULAR_HOME` moves the whole `~/.vascular` root, journal included.

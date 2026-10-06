@@ -4,7 +4,7 @@ Every layer appends here — heart lifecycle, arteries runlog/ledger tee, marrow
 training — one JSON object per line, correlated by episode_id/task_id. Postgres
 (arteries) remains the queryable archive; the journal is the live view.
 
-Journal: $EVENT_JOURNAL_DIR or ~/.vascular/state/heart/events/YYYYMMDD.ndjson
+Journal: $EVENT_JOURNAL_DIR or ~/.vascular/spool/events/YYYYMMDD.ndjson
 Emission must never break the work it observes: emit() swallows everything.
 """
 from __future__ import annotations
