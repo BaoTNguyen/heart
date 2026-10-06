@@ -19,15 +19,32 @@ def _no_live_retrieval(monkeypatch):
         monkeypatch.setenv("ARTERIES_RETRIEVAL", "off")
 
 
-@pytest.fixture(autouse=True)
-def _journal_to_a_tmpdir(tmp_path_factory, monkeypatch):
-    """Test episodes write their events somewhere disposable.
+@pytest.fixture(scope="session")
+def _isolated_state_dirs(tmp_path_factory):
+    root = tmp_path_factory.mktemp("isolated")
+    events, vascular = root / "events", root / "vascular"
+    events.mkdir()
+    vascular.mkdir()
+    return events, vascular
 
-    Unset, EVENT_JOURNAL_DIR is ~/.local/share/heart/events -- the real one. So
-    the suite's synthetic episodes wrote into the real journal and the real
-    per-run inboxes, and a sandboxed run's inbox came back holding 18 events
-    belonging to two fixture episodes, task_id "scope", indistinguishable from
-    work. Measured on episode 20260912-210719-abce2c5d.
+
+@pytest.fixture(autouse=True)
+def _journal_to_a_tmpdir(_isolated_state_dirs, monkeypatch):
+    """Test episodes write their events and state somewhere disposable.
+
+    The rule is override, not setdefault: EVENT_JOURNAL_DIR and VASCULAR_HOME
+    are set on every test whatever the environment already holds. The old
+    fixture backed off when EVENT_JOURNAL_DIR was set, and inside the sandbox
+    the verifier inherits EVENT_JOURNAL_DIR=/journal -- the real inbox. On
+    2026-10-01 ~/.vascular/state/heart/events/incoming/ held 1,053 fake events
+    written by this suite.
+
+    Function-scoped on purpose: test_route_orchestrate's tearDownModule pops
+    EVENT_JOURNAL_DIR, so a value set once per session would be gone for every
+    later test. The directories are made once; the setenv repeats per test. A
+    test that sets either variable itself still wins, since its setenv runs
+    after this one.
     """
-    if "EVENT_JOURNAL_DIR" not in os.environ:
-        monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path_factory.mktemp("events")))
+    events, vascular = _isolated_state_dirs
+    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(events))
+    monkeypatch.setenv("VASCULAR_HOME", str(vascular))

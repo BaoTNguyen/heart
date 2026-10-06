@@ -26,6 +26,12 @@ from heart.agents_api import endpoint_for, is_local_endpoint  # noqa: E402
 from heart.runner import _flock_pool, _price  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_model_profile(monkeypatch):
+    """Profile resolution must not pick up the caller's HEART_MODEL_PROFILE."""
+    monkeypatch.delenv("HEART_MODEL_PROFILE", raising=False)
+
+
 def test_locality():
     for ep in ("http://127.0.0.1:8000/v1", "http://localhost:1234",
                "http://192.168.1.5:8000/v1", "http://10.0.0.9/v1", "http://[::1]:8000"):
@@ -78,8 +84,8 @@ def test_pricing_local_free():
     """Local endpoints are free even under a broad "api" pricing entry; metered
     APIs and subscription seats both price at the map's API rates."""
     with tempfile.TemporaryDirectory() as d:
-        cfg = Path(d) / "heart"
-        cfg.mkdir()
+        cfg = Path(d) / "config" / "heart"
+        cfg.mkdir(parents=True)
         (cfg / "models.json").write_text(json.dumps({
             "profiles": {
                 "local7b": {"endpoint": "http://127.0.0.1:8000/v1", "model": "x"},
@@ -90,8 +96,8 @@ def test_pricing_local_free():
                 "claude": {"in_per_mtok": 3.0, "out_per_mtok": 15.0},
             },
         }))
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = d
+        old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = d
         try:
             M = 1_000_000
             assert _price("api:local7b", M, M) == 0.0   # local: free despite "api" entry
@@ -100,9 +106,9 @@ def test_pricing_local_free():
             assert _price("api:gpt", None, M) is None    # no tokens -> no price
         finally:
             if old is None:
-                os.environ.pop("XDG_CONFIG_HOME", None)
+                os.environ.pop("VASCULAR_HOME", None)
             else:
-                os.environ["XDG_CONFIG_HOME"] = old
+                os.environ["VASCULAR_HOME"] = old
 
 
 def test_reasoning_body():
@@ -289,6 +295,7 @@ if __name__ == "__main__":
     print("ok")
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_stale_sandbox_image_is_reported_with_the_fix():
     """The Dockerfile gained the plugin's lock directory and the image was never
     rebuilt. Every sandboxed run then failed on
@@ -316,6 +323,7 @@ def test_a_stale_sandbox_image_is_reported_with_the_fix():
         assert "docker build" in reason, reason
 
 
+@pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_missing_sandbox_image_says_to_build_it():
     from heart.sandbox import image_is_stale
 

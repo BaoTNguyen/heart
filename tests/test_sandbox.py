@@ -726,15 +726,15 @@ def test_codex_gets_a_sentinel_auth_file_and_the_proxy_as_its_server(monkeypatch
     import heart.runner as runner
 
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "heart" / "secrets" / "sentinel").write_text("s33d")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
+    (tmp_path / "secrets" / "heart").mkdir(parents=True)
+    (tmp_path / "secrets" / "heart" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
     monkeypatch.setenv("HEART_SANDBOX_CODEX_PLAN", "pro")
     (mount,) = sb.codex_sentinel_mounts()
     assert mount.target == f"{HOME}/.codex/auth.json" and not mount.writable
     doc = json.loads(Path(mount.source).read_text())
-    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "heart" / "secrets"))
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "secrets" / "heart"))
     assert doc["tokens"]["access_token"] == sb.sentinels("s33d")["chatgpt"] \
         == _proxy_module().sentinels()["chatgpt"]
     payload = doc["tokens"]["id_token"].split(".")[1]
@@ -1099,10 +1099,32 @@ def test_a_run_without_the_seed_cannot_use_the_injector(monkeypatch, tmp_path):
     (tmp_path / "sentinel").unlink()
     assert _proxy_module().sentinels() == {}
     # injection asked for with no seed fails loudly, not as "not logged in"
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "none"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "none"))
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "anthropic")
     with pytest.raises(RuntimeError, match="plexus doctor --fix"):
         sb.inject_env("egress")
+
+
+def test_sentinel_seed_reads_vascular_home_not_xdg(monkeypatch, tmp_path):
+    import heart.sandbox as sb
+    seed = tmp_path / "v" / "secrets" / "heart" / "sentinel"
+    seed.parent.mkdir(parents=True)
+    seed.write_text("abc\n")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "v"))
+    assert sb.sentinel_seed() == "abc"
+    # the old config/heart/secrets location is not a fallback
+    stale = tmp_path / "stale" / "config" / "heart" / "secrets" / "sentinel"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "stale"))
+    assert sb.sentinel_seed() == ""
+    # the old XDG location is not a fallback
+    old = tmp_path / "xdg" / "heart" / "secrets" / "sentinel"
+    old.parent.mkdir(parents=True)
+    old.write_text("old")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "empty"))
+    assert sb.sentinel_seed() == ""
 
 
 def test_an_injected_seat_is_a_sentinel_and_a_base_url_never_a_token(monkeypatch):
@@ -1180,7 +1202,7 @@ def test_a_contained_command_runs_on_the_host_when_no_sandbox_is_asked(monkeypat
 
 
 @pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
-def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch):
+def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch, request):
     """The acceptance check plexus runs after an episode executes whatever the
     agent put in the tree. Contained, a conftest.py that phones home has no
     route, and the operator's home is not there to read."""
@@ -1189,6 +1211,14 @@ def test_code_an_agent_wrote_runs_with_no_network_and_no_home(monkeypatch):
     import tempfile
 
     monkeypatch.setenv("HEART_SANDBOX", SANDBOX_MODE)
+    # A real container needs a bind source Docker Desktop shares: conftest
+    # points VASCULAR_HOME (and so the workspace root) at a /tmp dir, which it
+    # does not. Use a scratch root under the home cache instead.
+    shared = Path.home() / ".cache"
+    shared.mkdir(parents=True, exist_ok=True)
+    root = tempfile.mkdtemp(prefix="heart-test-ws-", dir=shared)
+    request.addfinalizer(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+    monkeypatch.setenv("HEART_WS_ROOT", root)
     _ws_root().mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=_ws_root()) as ws:
         probe = ("python3 -c \"import socket; s=socket.socket(); s.settimeout(3); "
@@ -1218,3 +1248,11 @@ def test_a_packet_built_for_an_agent_says_whose_it_is_and_which_lane(monkeypatch
     got = ep._context_packet(_task(network="web"), "implement", "normal", tmp_path, "ep1")
     assert got["status"] == "failed"
     assert seen["ARTERIES_TRUST"] == "untrusted" and seen["ARTERIES_LANE"] == "web"
+
+
+def test_only_the_bind_source_race_is_retried():
+    from heart import runner
+    assert runner._transient_start_failure(
+        'docker: Error response from daemon: invalid mount config for type "bind": '
+        "bind source path does not exist: /host_mnt/x/.git/worktrees/abc")
+    assert not runner._transient_start_failure("docker: Error response from daemon: No such image: x")

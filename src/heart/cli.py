@@ -16,6 +16,7 @@ from pathlib import Path
 from . import mine as mine_mod
 from .env import reclaim as env_reclaim
 from . import pulse as pulse_mod
+from . import vascular_paths
 from . import reward as reward_mod
 from .detect import detect_verifiers
 from .events import emit
@@ -28,7 +29,9 @@ from .taskspec import TaskSpec, Verifier, load_task, load_tasks
 from .training import datasets
 from .verify import check_task
 
-WORK_RUNS_DIR = Path.home() / ".local" / "share" / "heart" / "runs"
+def work_runs_dir() -> Path:
+    """Where `heart work` keeps its runs; resolved per call so VASCULAR_HOME applies."""
+    return vascular_paths.path("state", "heart", "runs")
 
 
 def _roles_for(args) -> list[dict] | None:
@@ -535,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
                         "in waves and merged with git (Path B); auto-falls back to a "
                         "single build when the task isn't splittable, the graph is "
                         "invalid, or the repo has no integration verifier")
-    p.set_defaults(func=cmd_work, runs_dir=str(WORK_RUNS_DIR), fix_rounds=2)
+    p.set_defaults(func=cmd_work, runs_dir=str(work_runs_dir()), fix_rounds=2)
 
     p = sub.add_parser("batch", help="run tasks x variants x repeats")
     p.add_argument("tasks_dir")
@@ -554,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
                    choices=["tail", "episode", "goal", "insights", "health", "serve"])
     p.add_argument("--port", type=int, default=7717, help="port for `pulse serve`")
     p.add_argument("--runs-dir", dest="serve_runs_dir", default=None,
-                   help="runs dir `pulse serve` writes steer.txt into (default WORK_RUNS_DIR)")
+                   help="runs dir `pulse serve` writes steer.txt into (default ~/.vascular/state/heart/runs)")
     p.add_argument("id", nargs="?", help="episode id (for `pulse episode`) or goal id (for `pulse goal`)")
     p.add_argument("-n", type=int, default=20, help="history lines before following")
     p.add_argument("--hours", type=float, default=24, help="window for insights/health")
@@ -581,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_models)
 
     p = sub.add_parser("ingest", help="re-run reward ingest over a runs dir (safe: dedup)")
-    p.add_argument("runs_dir", nargs="?", default=str(WORK_RUNS_DIR))
+    p.add_argument("runs_dir", nargs="?", default=str(work_runs_dir()))
     p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("check-task", help="verify determinism at base and pass at fix_commit")
@@ -599,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("clean", help="prune old runs and stale worktrees")
     p.add_argument("--days", type=int, default=7, help="age cutoff in days (default 7)")
-    p.add_argument("--runs-dir", default=str(WORK_RUNS_DIR))
+    p.add_argument("--runs-dir", default=str(work_runs_dir()))
     p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("export", help="episodes -> JSONL")

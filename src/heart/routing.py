@@ -17,7 +17,7 @@ floats: consensus gives you "frontier, great at planning, weak at vision," not
 "planning 0.9." The declared part only *orders* models before data exists; the
 real numbers come from the measured reward sidecar, which corrects the prior.
 
-Config (~/.config/heart/models.json):
+Config (~/.vascular/config/heart/models.json):
 
     {"models": {
         "claude":     {"agent": "claude",   "tier": "frontier",
@@ -53,6 +53,7 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import vascular_paths
 from .agents_api import load_models_json, models_json_path
 from .events import emit
 from .pulse import load_events
@@ -94,8 +95,10 @@ _BLEND_K = 8
 
 
 def _stats_path() -> Path:
-    return Path(os.environ.get("HEART_ROUTE_STATS",
-                               str(Path.home() / ".local" / "share" / "heart" / "route_stats.json")))
+    # set-but-empty is an override too (Path('') is '.'); only unset falls through
+    if "HEART_ROUTE_STATS" in os.environ:
+        return Path(os.environ["HEART_ROUTE_STATS"])
+    return vascular_paths.path("state", "heart", "route_stats.json")
 
 
 def drank(difficulty: str) -> int:

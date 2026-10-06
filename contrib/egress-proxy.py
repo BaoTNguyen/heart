@@ -54,6 +54,11 @@ allowlisted host -- is refused. That second property only holds if the
 injected host is unreachable any other way, so while the injector runs, CONNECT
 to an injected host is refused even when ALLOW or `*` would pass it.
 
+INJECT_TLS_PORT serves the same injector over TLS, using the certificate and key
+at /secrets/tls/proxy.pem and /secrets/tls/proxy.key. Either file missing or
+unloadable and the TLS listener is skipped with one log line; the plain ones are
+unaffected, and so is the allowlist.
+
 The log is worth reading. Claude Code also reaches for mcp-proxy.anthropic.com
 and http-intake.logs.us5.datadoghq.com; under plain bridge egress all of that
 leaves the machine unremarked, and the episodes pass without it. Every line
@@ -71,12 +76,18 @@ import socket
 import ssl
 import sys
 import time
+from pathlib import Path
 
 ALLOW = tuple(h.strip().lower() for h in os.environ.get("ALLOW", "").split(",") if h.strip())
 DENY = tuple(h.strip().lower() for h in os.environ.get("DENY", "").split(",") if h.strip())
 PORT = int(os.environ.get("PORT", "8888"))
 INJECT_PORT = int(os.environ.get("INJECT_PORT", "0") or 0)
+INJECT_TLS_PORT = int(os.environ.get("INJECT_TLS_PORT", "0") or 0)
 SECRETS = os.environ.get("SECRETS_DIR", "/secrets")
+TLS_DIR = Path("/secrets/tls")
+#: True once main() has a TLS context and serves INJECT_TLS_PORT. Only a
+#: listener that runs takes an injected host off the CONNECT allowlist.
+TLS_ON = False
 
 #: The one credential an agent container ever holds: this prefix plus the box's
 #: random seed. Worth nothing away from this proxy, and worth something here
@@ -168,7 +179,7 @@ def permitted(host: str, port: int) -> bool:
     host = host.lower().rstrip(".")
     if _named(host, port, DENY):
         return False
-    if INJECT_PORT and host in _injected_hosts():
+    if (INJECT_PORT or TLS_ON) and host in _injected_hosts():
         return False
     if _named(host, port, (e for e in ALLOW if e != "*")):
         return True
@@ -497,8 +508,30 @@ async def _inject(reader, writer):
     up_w.close()
 
 
+def tls_context() -> ssl.SSLContext | None:
+    """The server context for the TLS injector, or None when it is off or its
+    certificate is missing or will not load. Either is logged, never raised:
+    the plain listeners are still worth running."""
+    if not INJECT_TLS_PORT:
+        return None
+    cert, key = TLS_DIR / "proxy.pem", TLS_DIR / "proxy.key"
+    missing = [str(p) for p in (cert, key) if not p.is_file()]
+    if missing:
+        print(f"credential injector (TLS) not started: missing {', '.join(missing)}",
+              flush=True)
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+    except (ssl.SSLError, OSError, ValueError) as exc:
+        print(f"credential injector (TLS) not started: {exc}", flush=True)
+        return None
+    return ctx
+
+
 async def main():
-    if not ALLOW and not INJECT_PORT:
+    global TLS_ON
+    if not ALLOW and not INJECT_PORT and not INJECT_TLS_PORT:
         sys.exit("ALLOW is empty: refusing to start a proxy that permits nothing "
                  "-- an agent would fail with no explanation")
     servers = [await asyncio.start_server(_handle, "0.0.0.0", PORT)]
@@ -509,6 +542,11 @@ async def main():
         have = [r for r in ROUTES if secret(r)]
         print(f"credential injector on :{INJECT_PORT}, routes with a secret: "
               f"{', '.join(have) or '(none)'}", flush=True)
+    ctx = tls_context()
+    if ctx:
+        TLS_ON = True
+        servers.append(await asyncio.start_server(_inject, "0.0.0.0", INJECT_TLS_PORT, ssl=ctx))
+        print(f"credential injector (TLS) on :{INJECT_TLS_PORT}", flush=True)
     await asyncio.gather(*(s.serve_forever() for s in servers))
 
 

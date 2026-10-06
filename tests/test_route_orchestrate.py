@@ -35,9 +35,9 @@ def _task(prompt="add a function", **kw):
 
 
 # routing.pick() emits route.decided to the event journal. Without this, synthetic
-# test decisions (api:twin, task_id="t") leak into the real ~/.local journal and
+# test decisions (api:twin, task_id="t") leak into the real ~/.vascular journal and
 # show up on `pulse serve`. Isolate the journal for the whole module, mirroring the
-# XDG_CONFIG_HOME isolation the orchestration classes already do for config.
+# VASCULAR_HOME isolation the orchestration classes already do for config.
 _journal_tmp: tempfile.TemporaryDirectory | None = None
 
 
@@ -150,20 +150,20 @@ class TestModelPin(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        cfg = Path(self.tmp.name) / "heart"
-        cfg.mkdir()
+        cfg = Path(self.tmp.name) / "config" / "heart"
+        cfg.mkdir(parents=True)
         (cfg / "models.json").write_text(json.dumps({"profiles": {
             "sonnet": {"model": "claude-sonnet-5"},
             "gpt": {"model": "gpt-5"},
         }}))
-        self._old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = self.tmp.name
+        self._old = os.environ.get("VASCULAR_HOME")
+        os.environ["VASCULAR_HOME"] = self.tmp.name
 
     def tearDown(self):
         if self._old is None:
-            os.environ.pop("XDG_CONFIG_HOME", None)
+            os.environ.pop("VASCULAR_HOME", None)
         else:
-            os.environ["XDG_CONFIG_HOME"] = self._old
+            os.environ["VASCULAR_HOME"] = self._old
         self.tmp.cleanup()
 
     def _model_of(self, cmd):
@@ -763,3 +763,13 @@ class ReviewAgentHarnessTests(unittest.TestCase):
         with unittest.mock.patch.object(orchestrate.review_mod, "review_pool",
                                         return_value=["claude:opus", "codex"]):
             self.assertEqual(orchestrate.review_mod.review_agent("claude:sonnet"), "codex")
+
+
+def test_situation_fits_capillaries_limit():
+    from heart.episode import SITUATION_MAX, _situation
+    from heart.taskspec import TaskSpec
+    short = TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt="fix the parser")
+    assert _situation(short) == "fix the parser"
+    long = TaskSpec(task_id="t", repo_path=".", base_commit="x", prompt="word " * 1000)
+    s = _situation(long)
+    assert len(s) <= SITUATION_MAX and not s.endswith(" ") and s.startswith("word word")

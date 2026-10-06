@@ -7,7 +7,7 @@ cwd is the episode workspace.
 
 Config resolution, highest wins:
   1. profile named by HEART_MODEL_PROFILE (set via --agent api:<profile>),
-     read from ~/.config/heart/models.json:
+     read from ~/.vascular/config/heart/models.json:
        {"profiles": {"gpt": {"endpoint": "https://api.openai.com/v1",
                              "model": "gpt-5", "api_key_env": "OPENAI_API_KEY"}}}
   2. env: HEART_API_ENDPOINT, HEART_API_MODEL, HEART_API_KEY
@@ -25,6 +25,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from . import vascular_paths
 
 SYSTEM = (
     "You are a coding agent working inside a git repository (the current directory). "
@@ -48,7 +50,7 @@ TOOLS = [{
 
 def models_json_path() -> Path:
     """Where heart keeps model profiles, the rate card and the routing tiers."""
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "heart" / "models.json"
+    return vascular_paths.path("config", "heart", "models.json")
 
 
 def load_models_json() -> dict:
@@ -196,7 +198,7 @@ def _arteries_context(prompt: str) -> str:
     """CLI agents get arteries via host hooks; this loop has no host, so call
     the repo's observe hook directly — it logs the turn and may return a
     retrieved prompt. Absent or failing hook = empty string, never an error."""
-    hook = Path(".arteries/hooks/observe.sh")
+    hook = vascular_paths.repo_dir(Path.cwd(), "arteries") / "hooks" / "observe.sh"
     if not hook.exists():
         return ""
     try:

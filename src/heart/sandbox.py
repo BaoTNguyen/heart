@@ -22,14 +22,16 @@ import datetime
 import json
 import os
 import shutil
+import ssl
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from . import agents_api
+from . import agents_api, vascular_paths
 from .env import _ws_root
 from .taskspec import TaskSpec
 
@@ -625,9 +627,8 @@ def sentinel_seed() -> str:
     constant anyone could read in this file would have let it. plexus doctor
     creates it; the proxy reads the same file from its mount.
     """
-    cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     try:
-        return (cfg / "heart" / "secrets" / "sentinel").read_text().strip()
+        return vascular_paths.path("secrets", "heart", "sentinel").read_text().strip()
     except OSError:
         return ""
 
@@ -653,6 +654,60 @@ def _injected() -> set[str]:
     return {r.strip() for r in os.getenv("HEART_SANDBOX_INJECT", "").split(",") if r.strip()}
 
 
+CA_BUNDLE_IN_CONTAINER = "/etc/ssl/heart-ca-bundle.pem"
+
+
+_ROOTS_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _system_roots() -> Path | None:
+    """The host's CA bundle: the first readable, non-empty file among the usual
+    Linux paths, then whatever this Python's OpenSSL was built to use."""
+    for c in (*_ROOTS_CANDIDATES, ssl.get_default_verify_paths().cafile):
+        if not c:
+            continue
+        try:
+            with open(c, "rb") as f:
+                if f.read(1):
+                    return Path(c)
+        except OSError:
+            continue
+    return None
+
+
+def _inject_tls() -> tuple[str, Path] | None:
+    """(port, CA cert) for the injector's TLS listener, or None to stay on http."""
+    port = os.getenv("HEART_SANDBOX_INJECT_TLS_PORT", "")
+    ca = os.getenv("HEART_SANDBOX_CA_CERT", "")
+    if "chatgpt" not in _injected() or not port or not ca or not Path(ca).is_file():
+        return None
+    if _system_roots() is None:
+        # a bundle of the proxy's CA alone would break every other https host
+        print("heart: Codex stays on http: no system CA bundle found", file=sys.stderr)
+        return None
+    return port, Path(ca)
+
+
+def _ca_bundle(ca: Path) -> Path:
+    """System roots plus the proxy's CA, for SSL_CERT_FILE. Reads only the
+    certificate; the key never leaves the proxy."""
+    roots = _system_roots()
+    if roots is None:
+        raise RuntimeError("no system CA bundle: refusing to write one with only the proxy's CA")
+    path = _ws_root().parent / "heart-sentinel" / "ca-bundle.pem"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_bytes(roots.read_bytes() + b"\n" + ca.read_bytes())
+    os.replace(tmp, path)  # a container already mounting it never sees half a file
+    return path
+
+
 def codex_sentinel_mounts() -> tuple[Mount, ...]:
     """A Codex auth.json that holds nothing: the sentinel as its access token,
     an id_token carrying only the plan claim Codex reads, and last_refresh set
@@ -668,14 +723,18 @@ def codex_sentinel_mounts() -> tuple[Mount, ...]:
     def seg(d):
         return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
     plan = os.getenv("HEART_SANDBOX_CODEX_PLAN", "plus")
+    # the real account id when the control plane passes one: Codex 0.157 refuses
+    # a token naming an account its routing lookup doesn't list. An identifier,
+    # not a credential -- the proxy sends the same id upstream on every request.
+    account = os.getenv("HEART_SANDBOX_CODEX_ACCOUNT", "heart-sentinel")
     claims = {"exp": 4102444800, "https://api.openai.com/auth": {
-        "chatgpt_plan_type": plan, "chatgpt_account_id": "heart-sentinel",
+        "chatgpt_plan_type": plan, "chatgpt_account_id": account,
         "chatgpt_user_id": "heart-sentinel"}}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     doc = {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
            "tokens": {"id_token": ".".join([seg({"alg": "none"}), seg(claims), "c2VudGluZWw"]),
                       "access_token": _seeded()["chatgpt"], "refresh_token": "heart-sentinel",
-                      "account_id": "heart-sentinel"},
+                      "account_id": account},
            "last_refresh": now}
     # beside the worktree root, not in it: reclaim() removes every directory
     # there that no live Workspace owns, and Docker Desktop still shares it
@@ -684,7 +743,10 @@ def codex_sentinel_mounts() -> tuple[Mount, ...]:
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(doc))
     os.replace(tmp, path)  # a container already running keeps the copy it had
-    return (Mount(str(path), f"{HOME}/.codex/auth.json", writable=False),)
+    mounts = (Mount(str(path), f"{HOME}/.codex/auth.json", writable=False),)
+    if (tls := _inject_tls()) is not None:
+        mounts += (Mount(str(_ca_bundle(tls[1])), CA_BUNDLE_IN_CONTAINER, writable=False),)
+    return mounts
 
 
 def inject_env(proxy_host: str) -> dict[str, str]:
@@ -704,6 +766,11 @@ def inject_env(proxy_host: str) -> dict[str, str]:
     NO_PROXY names the proxy itself: the base URL is plain http on the internal
     network, and sent through HTTP_PROXY it would arrive as an absolute URI for
     a host no allowlist names.
+
+    Codex 0.157 refuses a plain-http ChatGPT backend, so when the proxy runs a
+    TLS listener (HEART_SANDBOX_INJECT_TLS_PORT, CA in HEART_SANDBOX_CA_CERT)
+    the chatgpt URLs use https on that port. The container trusts it through
+    SSL_CERT_FILE, the system roots plus that CA; anthropic stays plain http.
     """
     routes = _injected()
     if not routes & {"anthropic", "chatgpt"} or not proxy_host:
@@ -718,8 +785,13 @@ def inject_env(proxy_host: str) -> dict[str, str]:
         # into `-c` flags; the refresh override points at a route the injector
         # does not have, so a refresh is refused there and never rotates the
         # host's token at OpenAI.
-        env |= {"HEART_CODEX_BASE": f"{at}/chatgpt/backend-api",
-                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": f"{at}/refresh"}
+        base = at
+        if (tls := _inject_tls()) is not None:
+            base = f"https://{proxy_host}:{tls[0]}"
+            _ca_bundle(tls[1])
+            env["SSL_CERT_FILE"] = CA_BUNDLE_IN_CONTAINER
+        env |= {"HEART_CODEX_BASE": f"{base}/chatgpt/backend-api",
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE": f"{base}/refresh"}
     return env
 
 

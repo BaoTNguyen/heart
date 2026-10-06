@@ -1,6 +1,6 @@
 # The rate card
 
-`~/.config/heart/models.json` is where every dollar figure in this stack comes
+`~/.vascular/config/heart/models.json` is where every dollar figure in this stack comes
 from. heart prices episodes against it; plexus prices interactive turns against
 it through `heart.runner.model_pricing()`. There is deliberately one copy — a
 second card in the control plane would drift, and a wrong cost is still a
