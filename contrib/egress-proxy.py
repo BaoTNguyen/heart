@@ -65,8 +65,12 @@ leaves the machine unremarked, and the episodes pass without it. Every line
 carries the client's address, so `docker inspect` names the container behind
 it.
 
-ponytail: no auth on the proxy itself, no logging to disk, no upstream
-chaining. The network decides who can reach it, and `docker logs` is the log.
+LOG_FILE, a path on a mounted volume, keeps a copy of every line that survives
+recreating the container; it is rotated to LOG_FILE.1 once, at start, when past
+10 MiB. Without it `docker logs` is the only log.
+
+ponytail: no auth on the proxy itself, no upstream chaining. The network
+decides who can reach it.
 """
 import asyncio
 import ipaddress
@@ -109,6 +113,71 @@ CODEX_HEAD = ("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
 #: token is a file the operator saved; Codex's is its own auth.json, read live
 #: so a refresh the host CLI does is picked up without a restart.
 ROUTES = {"anthropic": "api.anthropic.com", "chatgpt": "chatgpt.com"}
+
+
+class _Tee:
+    """sys.stdout that also copies to a log file. Stdout always gets the text
+    first and untouched; a file that fails is dropped, never raised, and the
+    one line saying so waits for the current stdout line to end."""
+
+    def __init__(self, out, log, path: str):
+        self.out, self.log, self.path = out, log, path
+        self.notice = ""
+        self.bol = True  # stdout is at the start of a line
+
+    def write(self, s: str) -> int:
+        n = self.out.write(s)
+        if s:
+            self.bol = s.endswith("\n")
+        if self.log:
+            try:
+                self.log.write(s)
+            except (OSError, ValueError) as exc:
+                self._drop(exc)
+        self._announce()
+        return n
+
+    def flush(self) -> None:
+        self.out.flush()
+        if self.log:
+            try:
+                self.log.flush()
+            except (OSError, ValueError) as exc:
+                self._drop(exc)
+        self._announce()
+
+    def _drop(self, exc) -> None:
+        try:
+            self.log.close()
+        except (OSError, ValueError):
+            pass
+        self.log = None
+        self.notice = f"log file {self.path} unavailable ({exc}): logging to stdout only\n"
+
+    def _announce(self) -> None:
+        if self.notice and self.bol:
+            self.out.write(self.notice)
+            self.out.flush()
+            self.notice = ""
+
+    def __getattr__(self, name):
+        return getattr(self.out, name)
+
+
+def open_log(path: str | None) -> None:
+    """Tee everything printed to `path` as well as stdout. A file that cannot
+    be rotated or opened costs one line on stdout and nothing else."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 10 * 1024 * 1024:
+            # ponytail: rotates only at start, so a proxy up for weeks can grow past 10 MiB; move to logging.handlers.RotatingFileHandler (or logrotate copytruncate) if that bites
+            os.replace(path, path + ".1")
+        log = open(path, "a", buffering=1, encoding="utf-8")
+    except OSError as exc:
+        print(f"log file {path} unavailable ({exc}): logging to stdout only", flush=True)
+        return
+    sys.stdout = _Tee(sys.stdout, log, path)
 
 
 def sentinels() -> dict[str, str]:
@@ -531,6 +600,7 @@ def tls_context() -> ssl.SSLContext | None:
 
 async def main():
     global TLS_ON
+    open_log(os.environ.get("LOG_FILE"))
     if not ALLOW and not INJECT_PORT and not INJECT_TLS_PORT:
         sys.exit("ALLOW is empty: refusing to start a proxy that permits nothing "
                  "-- an agent would fail with no explanation")
