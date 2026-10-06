@@ -727,14 +727,14 @@ def test_codex_gets_a_sentinel_auth_file_and_the_proxy_as_its_server(monkeypatch
 
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
     monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
-    (tmp_path / "config" / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "config" / "heart" / "secrets" / "sentinel").write_text("s33d")
+    (tmp_path / "secrets" / "heart").mkdir(parents=True)
+    (tmp_path / "secrets" / "heart" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
     monkeypatch.setenv("HEART_SANDBOX_CODEX_PLAN", "pro")
     (mount,) = sb.codex_sentinel_mounts()
     assert mount.target == f"{HOME}/.codex/auth.json" and not mount.writable
     doc = json.loads(Path(mount.source).read_text())
-    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "config" / "heart" / "secrets"))
+    monkeypatch.setenv("SECRETS_DIR", str(tmp_path / "secrets" / "heart"))
     assert doc["tokens"]["access_token"] == sb.sentinels("s33d")["chatgpt"] \
         == _proxy_module().sentinels()["chatgpt"]
     payload = doc["tokens"]["id_token"].split(".")[1]
@@ -1107,11 +1107,17 @@ def test_a_run_without_the_seed_cannot_use_the_injector(monkeypatch, tmp_path):
 
 def test_sentinel_seed_reads_vascular_home_not_xdg(monkeypatch, tmp_path):
     import heart.sandbox as sb
-    seed = tmp_path / "v" / "config" / "heart" / "secrets" / "sentinel"
+    seed = tmp_path / "v" / "secrets" / "heart" / "sentinel"
     seed.parent.mkdir(parents=True)
     seed.write_text("abc\n")
     monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "v"))
     assert sb.sentinel_seed() == "abc"
+    # the old config/heart/secrets location is not a fallback
+    stale = tmp_path / "stale" / "config" / "heart" / "secrets" / "sentinel"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale")
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "stale"))
+    assert sb.sentinel_seed() == ""
     # the old XDG location is not a fallback
     old = tmp_path / "xdg" / "heart" / "secrets" / "sentinel"
     old.parent.mkdir(parents=True)

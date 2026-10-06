@@ -628,7 +628,7 @@ def sentinel_seed() -> str:
     creates it; the proxy reads the same file from its mount.
     """
     try:
-        return vascular_paths.path("config", "heart", "secrets", "sentinel").read_text().strip()
+        return vascular_paths.path("secrets", "heart", "sentinel").read_text().strip()
     except OSError:
         return ""
 
