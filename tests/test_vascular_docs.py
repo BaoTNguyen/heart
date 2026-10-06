@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-OLD = re.compile(r"\.config/heart/models\.json|\.cache/heart-ws|\.local/share/heart|\.config/heart/secrets")
+OLD = re.compile(r"\.config/heart/models\.json|\.cache/heart-ws|\.local/share/heart|config/heart/secrets")
 FILES = ["README.md", "AGENTS.md", "SPINE.md", "PRICING.md", "tests/conftest.py",
          "tests/test_heart.py", "src/heart/agents_api.py", "src/heart/routing.py"]
 
@@ -37,3 +37,10 @@ def test_src_heart_clean_except_sandbox_history():
             if p.name != "sandbox.py"
             for n, line in enumerate(p.read_text().splitlines(), 1) if OLD.search(line)]
     assert not hits, hits
+
+
+@pytest.mark.parametrize("rel", ["SPINE.md", "src/heart/events.py"])
+def test_journal_prose_names_spool(rel):
+    text = (ROOT / rel).read_text()
+    assert "~/.vascular/spool/events/" in text
+    assert "state/heart/events" not in text
