@@ -8,8 +8,8 @@ def _seeded_env(monkeypatch, tmp_path):
     # primed like tests/test_sandbox.py: a sentinel seed under VASCULAR_HOME
     monkeypatch.setenv("HEART_WS_ROOT", str(tmp_path))
     monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
-    (tmp_path / "config" / "heart" / "secrets").mkdir(parents=True)
-    (tmp_path / "config" / "heart" / "secrets" / "sentinel").write_text("s33d")
+    (tmp_path / "secrets" / "heart").mkdir(parents=True)
+    (tmp_path / "secrets" / "heart" / "sentinel").write_text("s33d")
     monkeypatch.setenv("HEART_SANDBOX_INJECT", "chatgpt")
 
 
