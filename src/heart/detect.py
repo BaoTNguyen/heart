@@ -39,11 +39,8 @@ def detect_verifiers(repo_path: str | Path) -> list[Verifier]:
     repo = Path(repo_path)
     verifiers: list[Verifier] = []
 
-    has_py_tests = (
-        (repo / "tests").is_dir()
-        or any(repo.glob("test_*.py"))
-        or any(repo.glob("tests/**/*.py"))
-    )
+    # Python files, not a tests/ dir: cargo keeps its integration tests there too
+    has_py_tests = any(repo.glob("test_*.py")) or any(repo.glob("tests/**/*.py"))
     if has_py_tests:
         verifiers.append(Verifier(name="pytest", command="python3 -m pytest -x -q"))
 
