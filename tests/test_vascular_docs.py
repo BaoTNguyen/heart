@@ -44,3 +44,9 @@ def test_journal_prose_names_spool(rel):
     text = (ROOT / rel).read_text()
     assert "~/.vascular/spool/events/" in text
     assert "state/heart/events" not in text
+
+
+def test_spine_points_at_pulse_contract():
+    text = (ROOT / "SPINE.md").read_text()
+    assert "contract/envelope.json" in text
+    assert "contract/catalog.json" in text
