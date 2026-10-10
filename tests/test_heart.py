@@ -1662,6 +1662,23 @@ class TestDetectStatic(unittest.TestCase):
         names = [v.name for v in detect_verifiers(repo)]
         self.assertNotIn("ruff", names)
 
+    def test_a_rust_tests_dir_is_not_python_tests(self):
+        # cargo keeps integration tests in tests/*.rs. Reading the bare dir as
+        # pytest's added a verifier that found no tests and failed every
+        # feature after pulse's first one landed.
+        repo = self.root / "rustrepo"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "Cargo.toml").write_text('[package]\nname = "x"\n')
+        (repo / "tests" / "envelope.rs").write_text("#[test]\nfn t() {}\n")
+        names = [v.name for v in detect_verifiers(repo)]
+        self.assertEqual(names, ["cargo-test"])
+
+    def test_python_tests_still_detected(self):
+        repo = self.root / "pyrepo3"
+        (repo / "tests" / "unit").mkdir(parents=True)
+        (repo / "tests" / "unit" / "test_x.py").write_text("def test_x():\n    pass\n")
+        self.assertIn("pytest", [v.name for v in detect_verifiers(repo)])
+
 
 class TestClean(unittest.TestCase):
     def test_clean_removes_old_episodes_keeps_fresh_and_summary(self):
