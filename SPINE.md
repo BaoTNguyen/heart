@@ -1,5 +1,15 @@
 # The event spine
 
+## Canonical contract: pulse
+
+pulse ([github.com/BaoTNguyen/pulse](https://github.com/BaoTNguyen/pulse)) now owns
+the contract. The canonical wire format is pulse's `contract/envelope.json`, and the
+kind catalog is pulse's `contract/catalog.json`. The new optional fields (`id`,
+`schema_version`, `project`, trace ids, `context_id`, `emitter_seq`, `trust`) are
+defined there. This file keeps the prose: the two drift rules, the
+`sandbox.denied` vs `guardrail.hit` distinction, and the SRE mapping. The catalog
+table below is a summary and may lag behind pulse's catalog.
+
 The contract for cross-stack observability. This file is the canon; emitters in
 other repos (arteries `journal.py`, marrow via `heart.events`) conform to it.
 There is deliberately **no shared library** — the standard is this wire format,
