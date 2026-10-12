@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "about": "The envelope every pulse event line carries. One JSON object per line, UTF-8, newline-terminated. Vendored verbatim into each emitting repo; keep the copies identical (umbrella CI compares hashes). Additive only: fields are added, never renamed or removed.",
+  "required": {
+    "ts": "timestamp",
+    "source": "name",
+    "kind": "kind"
+  },
+  "optional": {
+    "id": "uuid",
+    "schema_version": "integer",
+    "project": "string",
+    "trace_id": "string",
+    "span_id": "string",
+    "parent_span_id": "string",
+    "context_id": "string",
+    "emitter_seq": "integer",
+    "goal_id": "string",
+    "feature_id": "string",
+    "task_id": "string",
+    "episode_id": "string",
+    "run_id": "string",
+    "turn_id": "string",
+    "role": "string",
+    "duration_ms": "number",
+    "payload": "object",
+    "origin": "origin"
+  },
+  "types": {
+    "string": "a JSON string",
+    "integer": "a JSON number that is a whole number >= 0",
+    "number": "a JSON number >= 0",
+    "object": "a JSON object",
+    "uuid": "a string in RFC 4122 text form: 8-4-4-4-12 lowercase or uppercase hex digits",
+    "timestamp": "a string in RFC 3339 form with an explicit offset (Z or +hh:mm); emitters write UTC as +00:00",
+    "name": "a string matching ^[a-z][a-z0-9_-]*$",
+    "kind": "a string matching ^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+    "origin": "the string \"operator\" (a person at the keyboard), \"agent\" (written by an agent of this stack) or \"external\" (entered from outside: web pages, search results, text written by third parties)"
+  },
+  "rules": [
+    "A line that is not a JSON object is invalid.",
+    "A required field that is missing, null, or of the wrong type makes the line invalid.",
+    "An optional field that is null counts as absent. One of the wrong type makes the line invalid.",
+    "Unknown top-level fields are kept, never rejected, and never dropped (skip and retain).",
+    "Unknown kinds are kept. The catalog describes kinds; it does not gate them.",
+    "origin describes where the content of this event came from, not where it ran (sandbox and network lane are provenance, recorded on the context row). An absent origin means unknown: exports treat it like external unless a filter opts it in."
+  ]
+}
