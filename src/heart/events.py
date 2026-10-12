@@ -9,12 +9,10 @@ Emission must never break the work it observes: emit() swallows everything.
 """
 from __future__ import annotations
 
-import datetime
-import json
 import os
 from pathlib import Path
 
-from . import vascular_paths
+from . import pulse_emit, vascular_paths
 
 
 def journal_dir() -> Path:
@@ -32,18 +30,10 @@ def emit(
     **payload,
 ) -> None:
     try:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        event: dict = {"ts": now.isoformat(), "source": source, "kind": kind}
         # env fallback lets subprocesses (agents, arteries hooks) stamp the
         # episode without plumbing arguments through
         episode_id = episode_id or os.environ.get("ARTERIES_EPISODE_ID")
         task_id = task_id or os.environ.get("ARTERIES_TASK_ID")
-        for key, value in (
-            ("episode_id", episode_id), ("task_id", task_id),
-            ("role", role), ("duration_ms", duration_ms),
-        ):
-            if value is not None:
-                event[key] = value
         # goal lineage: plexus sets these env vars around its dispatch; every
         # event heart emits picks them up unless the call site already set
         # them explicitly (additive payload fields, SPINE.md-legal)
@@ -52,13 +42,11 @@ def emit(
                 value = os.environ.get(env_var)
                 if value:
                     payload[key] = value
-        if payload:
-            event["payload"] = payload
-        d = journal_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        # ponytail: one small append per event is atomic enough on Linux;
-        # revisit with a buffered writer only if hook latency ever shows it
-        with open(d / now.strftime("%Y%m%d.ndjson"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, default=str) + "\n")
+        # ts/source/kind and the envelope fields come from pulse_emit
+        pulse_emit.emit(
+            source, kind, journal_dir(), vascular_paths.path("state", "pulse", "contexts"),
+            episode_id=episode_id, task_id=task_id, role=role, duration_ms=duration_ms,
+            payload=payload or None,
+        )
     except Exception:
         pass  # observability must never take down the observed
