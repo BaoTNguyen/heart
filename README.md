@@ -10,13 +10,17 @@ It sits on top of two sibling systems and below two:
 ```text
 capillaries  prompt/skill retrieval   (rides along via arteries)
 arteries     memory + trace substrate (rides along via CLI hooks)
-heart        orchestration + environment + reward   <- this repo
+heart        orchestration + environment + verify   <- this repo
 plexus       goal decomposition + acceptance loop (imports heart as a library)
 marrow       RL training on heart's exported episodes (separate repo)
 ```
 
 Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
-as a library for reward computation.
+as a library.
+
+Episodes carry an outcome (`pass`, `fail`, `blocked`, `path_violation`, ...), not
+a reward. Reward assignment was removed on 2026-10-13 until marrow's link to
+pulse is reworked.
 
 ## What sets it apart
 
@@ -34,10 +38,10 @@ training data:
   (pytest, npm, cargo, go, plus ruff/mypy/tsc/eslint when configured), runs the
   agent's diff on a clean checkout, and scores it. `--apply` lands the change
   only when verification passes and the reviewer approves.
-- **Reward hacking is blocked by construction.** Verification happens on a fresh
+- **Gaming the verifier is blocked by construction.** Verification happens on a fresh
   worktree with only the diff applied; editing a test to make it pass doesn't
   travel. `allowed_paths`/`denied_paths` violations and a secret scanner both
-  zero the reward. `.github/workflows/` is never editable in a work run.
+  fail the episode. `.github/workflows/` is never editable in a work run.
 - **It is an RL environment, not just an orchestrator.** `heart mine` builds
   TaskSpecs from git history, `heart batch --candidates N` is best-of-N that
   doubles as a data engine, and `heart export`/`heart dataset` emit SFT and DPO
@@ -48,8 +52,8 @@ training data:
   episode cards you can steer mid-run, no build step.
 - **Routing that learns.** `--agent auto` scores each model in a manifest against
   the task's inferred skills, difficulty, and context size, filters to the ones
-  that can actually run it, and picks the cheapest capable match — with declared
-  scores corrected by a measured-reward sidecar so they can't drift unchecked.
+  that can actually run it, and picks the cheapest capable match by declared
+  capability.
 - **Orchestrator-worker over a dependency graph.** A decomposer breaks a task
   into subtasks with `depends_on` edges. Everything with no unmet dependency runs
   at once — each routed to its own model and effort, in its own isolated episode —
@@ -147,9 +151,8 @@ A tier is `small`, `mid` or `frontier`. A task demands one — from the difficul
 planner declared, or from a keyword heuristic when it declared none — and a model
 declares one in `models.json` along with the few `skills` it is notably strong or
 weak at, a context window and a difficulty ceiling. `pick` filters to the models
-that can actually run the task, then takes the cheapest capable match, with
-declared scores corrected by a measured-reward sidecar so they cannot drift
-unchecked.
+that can actually run the task, then takes the cheapest capable match by declared
+capability. Nothing measured corrects the declared scores yet.
 
 `defaults` names the model to use when something asks for a tier by name rather
 than by task: a role declaring `"tier": "small"` (the test-writing role does), or
@@ -232,7 +235,7 @@ Four coding-specific mechanisms, composable per run:
   APPROVE/REJECT). Custom pipelines via `--roles roles.json`; each role may set
   its own `agent`, `memory`, `prompt`, `verify_after`.
 - **Candidates** (`--candidates N`): N independent attempts in parallel
-  worktrees, best reward wins. Doubles as the RL data engine.
+  worktrees; a pass wins, ties go to the smallest diff.
 - **Orchestrator-worker** (`orchestrate.py`, Path A/B): a decomposer either keeps
   the task on the sequential role pipeline in one worktree (Path A, the safe
   default for coupled work) or splits it into workers — each run as an isolated
@@ -325,8 +328,8 @@ Operational switches:
   A host the agents need but the list omits is **not** scored. The proxy stamps
   `HEART_EGRESS_DENIED` on every refusal and heart raises on it, because a list
   missing a host is missing it for the whole batch. Without that, a denied host
-  arrived as an ordinary API error and the episode scored `no_change` at reward
-  0.0 — measured. Build the list by running a few episodes and reading the
+  arrived as an ordinary API error and the episode recorded `no_change` —
+  measured. Build the list by running a few episodes and reading the
   proxy's deny lines; Claude Code also reaches for `mcp-proxy.anthropic.com`
   and `http-intake.logs.us5.datadoghq.com`, and the episodes pass without them.
 
@@ -390,10 +393,10 @@ Operational switches:
 
   A refusal on ground the spec permitted emits `sandbox.denied` regardless of
   how the episode ends, and marks the record `scope_suspect` when the episode
-  still scored. The reward is never adjusted for it: the number stands, the
-  doubt is recorded next to it, and the consumer decides.
+  still produced a diff. The outcome is never adjusted for it: the verdict
+  stands, the doubt is recorded next to it, and the consumer decides.
 
-  Containment for accidents and reward hacking, not a boundary against a
+  Containment for accidents and verifier gaming, not a boundary against a
   hostile model: an allowlisted host is still a host, and a determined model
   with something to say can say it to an endpoint you permitted.
 
@@ -414,7 +417,7 @@ Operational switches:
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
-- **Reward ingest**: after `run`/`work`/`batch`, heart calls `art ingest` on
+- **Episode ingest**: after `run`/`work`/`batch`, heart calls `art episodes` on
   the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
   stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
   re-runs the sweep any time (dedup makes it safe).
@@ -445,7 +448,7 @@ Operational switches:
   all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
 - **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
-  outcome/reward/cost, grouped from `episode.finished` events whose payload
+  outcome/cost, grouped from `episode.finished` events whose payload
   carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
   from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
 - **Steering + episode drill-down** (`pulse serve`): running-episode cards get
@@ -469,7 +472,7 @@ Operational switches:
 - **Guardrails**: `heart work` refuses to hand back or apply dangerous diffs.
   `guard.scan_secrets` scans added lines for AWS keys, private key headers,
   GitHub/Slack tokens, and generic `key/secret/token/password = "..."`
-  assignments — a hit zeroes reward with outcome `guardrail_violation`,
+  assignments — a hit fails the episode with outcome `guardrail_violation`,
   mirroring a path violation. A size fuse in `cmd_work --apply` refuses diffs
   over `HEART_MAX_DIFF_LINES` (default 2000) changed lines unless
   `--allow-large` is passed. `.github/workflows/` is always a denied path in
@@ -485,14 +488,14 @@ Operational switches:
 heart mine ~/some/repo --out tasks/        # TaskSpecs from git history
 heart check-task tasks/foo.json            # verifier determinism gate
 heart batch tasks/ --variants normal:on,clean:on,normal:off,clean:off --repeat 3 --parallel 4
-heart stats                                # pass rate / reward by ablation variant
+heart stats                                # pass rate by ablation variant
 heart export --out episodes.jsonl
 heart dataset sft --out sft.jsonl && heart dataset dpo --out dpo.jsonl
 ```
 
-Reward hacking is blocked structurally: verification happens on a fresh
+Gaming the verifier is blocked structurally: verification happens on a fresh
 worktree with only the agent's diff applied, and `allowed_paths` /
-`denied_paths` violations zero the reward. `tasks/holdout/` is never trained
+`denied_paths` violations fail the episode. `tasks/holdout/` is never trained
 on — it's the evaluation set for marrow checkpoints.
 
 ## Design notes

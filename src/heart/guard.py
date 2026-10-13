@@ -1,6 +1,6 @@
-"""Guardrails: secret scanning over an episode's diff. STACK_READINESS.md
-doesn't cover this directly but it's the same "don't ship a silent failure"
-spirit as path_violations — a hit zeroes reward exactly like a path violation.
+"""Guardrails over an episode's diff: secret scanning, and the changed-line
+count the apply limit and `diff_lines` read. A secret hit is a
+`guardrail_violation`, handled exactly like a path violation.
 """
 from __future__ import annotations
 
@@ -25,6 +25,15 @@ _RULES: list[tuple[str, re.Pattern]] = [
         ),
     ),
 ]
+
+
+def diff_changed_lines(diff_text: str) -> int:
+    return sum(
+        1
+        for line in diff_text.splitlines()
+        if (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
+    )
 
 
 def scan_secrets(diff_text: str) -> list[str]:

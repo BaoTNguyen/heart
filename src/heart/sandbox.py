@@ -488,7 +488,7 @@ def api_agent_env(model_profile: str) -> dict[str, str]:
     container has no models.json -- ~/.config is not mounted -- so an agent
     handed HEART_MODEL_PROFILE exits on
     `cannot read profiles from /home/agent/.config/heart/models.json`, which the
-    outcome ladder then records as `no_change` at reward 0.0. Measured.
+    outcome ladder then records as `no_change`. Measured.
 
     Mounting models.json instead would not be enough: a profile's own
     `endpoint` outranks HEART_API_ENDPOINT in resolve_config, so the container
@@ -843,7 +843,7 @@ def _proxy_on(network: str) -> str:
     it reaches exactly the other containers on it and nothing else. So a run
     with no proxy set is not "less isolated", it is unsatisfiable -- and it used
     to say so 250 seconds in, as a name-resolution traceback three roles deep,
-    recorded as `no_change` at reward 0.0 and indistinguishable from an agent
+    recorded as `no_change` and indistinguishable from an agent
     that looked and found nothing. Both halves of that are fixed here: the
     common case needs no env var, and the impossible case refuses before the
     container starts.
@@ -1035,7 +1035,7 @@ def verifier_profile_for(
 
     Writability. The agent must write the worktree; the verifier must not. If a
     verifier can edit the tree it is judging, "produce" and "judge" stop being
-    separate steps -- which is a reward-integrity property, not a security one,
+    separate steps -- which is a verdict-integrity property, not a security one,
     and the reason this profile exists at all.
 
     Network. Always none, never derived from the task. A test suite has no

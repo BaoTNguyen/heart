@@ -149,15 +149,3 @@ def test_empty_override_ws_root(monkeypatch, tmp_path):
     monkeypatch.delenv("HEART_WS_ROOT")
     assert env._ws_root() == env.vascular_paths.path("cache", "heart", "ws")
     assert tmp_path in env._ws_root().parents
-
-
-def test_empty_override_stats_path(monkeypatch, tmp_path):
-    from heart import routing
-    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path))
-    monkeypatch.setenv("HEART_ROUTE_STATS", "")
-    got = routing._stats_path()
-    assert got == Path("")
-    assert not str(got).startswith(str(tmp_path))
-    monkeypatch.delenv("HEART_ROUTE_STATS")
-    assert routing._stats_path() == routing.vascular_paths.path("state", "heart", "route_stats.json")
-    assert tmp_path in routing._stats_path().parents

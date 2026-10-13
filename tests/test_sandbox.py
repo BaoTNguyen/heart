@@ -1014,15 +1014,6 @@ def test_the_profile_does_not_pin_an_endpoint_of_its_own():
         assert "HEART_API_ENDPOINT" not in profile_for(task, "/ws", "/c", "/i").env
 
 
-def test_a_scope_denial_carries_no_reward_signal():
-    """0.0 asserts the episode did badly. A sandbox refusing writes says nothing
-    about the model, and training on it teaches that the task is impossible."""
-    from heart.episode import UNSCOREABLE
-
-    assert "scope_denied" in UNSCOREABLE
-    assert "pass" not in UNSCOREABLE and "fail" not in UNSCOREABLE
-
-
 def test_a_refusal_on_forbidden_ground_is_not_an_escape_from_scoring():
     """The hack this closes: an agent heading for a bad score writes one byte
     into a denied path, gets an empty diff plus a refusal, and scope_denied

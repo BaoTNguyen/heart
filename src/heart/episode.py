@@ -1,5 +1,5 @@
 """One episode: reset repo -> orchestrate agents -> capture diff -> verify on a
-clean checkout -> score -> persist. This is the vertical slice everything else
+clean checkout -> persist. This is the vertical slice everything else
 feeds.
 
 Orchestration logic (coding-specific, borrowed from what works):
@@ -25,11 +25,10 @@ import uuid
 from pathlib import Path
 
 from . import review as review_mod
-from . import reward as reward_mod
 from . import routing
 from .env import Workspace
 from .events import emit
-from .guard import scan_secrets
+from .guard import diff_changed_lines, scan_secrets
 from . import sandbox
 from .runner import SANDBOX_MODE, run_agent
 from .taskspec import TaskSpec
@@ -38,17 +37,6 @@ from .verify import compare_baseline, run_probes, run_verifiers
 # Memory modes follow the handoff doc's subagent pattern: implementer sees
 # project memory, test-writer runs clean so tests aren't biased by the
 # implementer's assumptions, reviewer reads memory but leaves no trace.
-# Outcomes carrying no correctness signal, so reward is None rather than 0.0.
-# 0.0 asserts the episode did badly; None says the axes do not apply. Getting
-# this wrong is worse than it looks -- compute() renormalizes over surviving
-# components, and the survivors are diff_quality and efficiency, so a do-nothing
-# episode would score ~0.97.
-#
-# scope_denied is here for the mirror-image reason: the sandbox refused the
-# writes, so the model never got to produce a signal. Scoring it 0.0 would blame
-# the model for a misconfiguration and teach it the task is impossible.
-UNSCOREABLE = ("blocked", "unverified", "scope_denied")
-
 # The file an implementer writes when it stops for a decision. Checked on disk
 # right after the implement turn, so a block costs no verifier, fixer, tester
 # or reviewer -- each of those would be spending money on a question.
@@ -193,8 +181,8 @@ _DENIAL_SIGNS = (
 # is the fallback for shells that do not. The leading slash is part of the
 # fallback alternative on purpose: inside a container every refusal names an
 # absolute path, and a lookbehind that excluded "/" matched none of them --
-# which made every denied-path probe read as `scope_denied`, the exact reward
-# hack the branch below exists to close.
+# which made every denied-path probe read as `scope_denied`, the exact escape
+# hatch the branch below exists to close.
 _DENIED_PATH_RE = re.compile(
     r"""['"]([^'"\n]{1,200})['"]|(?<![\w])(/?[\w.-]+/[\w./-]+)""")
 
@@ -257,9 +245,9 @@ def _probed_forbidden(denials: list[str], denied_paths: list[str]) -> bool:
     """True when a refusal names a path the spec explicitly forbids.
 
     The distinction decides whether an episode is unscoreable or a violation,
-    and without it `scope_denied` is a reward hack: an agent heading for a bad
-    score writes one byte into a denied path, produces an empty diff plus a
-    refusal, and escapes being scored at all. A refusal on forbidden ground is
+    and without it `scope_denied` is an escape hatch: an agent heading for a
+    fail writes one byte into a denied path, produces an empty diff plus a
+    refusal, and is excused instead of failed. A refusal on forbidden ground is
     the agent's doing; a refusal on ground the spec permitted is ours.
     """
     if not denied_paths:
@@ -276,7 +264,7 @@ def _probed_forbidden(denials: list[str], denied_paths: list[str]) -> bool:
 #: echoed them back. The detector scraped its own test data: `test_calc.py`,
 #: `src/secrets/key.pem`, `src/app.py` and the literal `], [` all arrived as
 #: refused paths, and all three episodes carried `scope_suspect: true` on that
-#: basis. A reward signal reading a test fixture is worse than no signal.
+#: basis. A signal read off a test fixture is worse than no signal.
 _TEST_REPORT_RE = re.compile(
     r"""^(?:E\s|>\s|\s*(?:assert|self\.assert)\b        # pytest failure frames
         |(?:FAILED|PASSED|ERROR)\b                        # its result lines
@@ -888,7 +876,7 @@ def _run_episode(
 
         diff = ws.diff()
         (out / "diff.patch").write_text(diff)
-        # The commit is the artifact; the patch stays because reward, serve, cli
+        # The commit is the artifact; the patch stays because serve, cli
         # and orchestrate all still read diff.patch, and because a text diff is
         # what the path/secret scanners below know how to inspect.
         commit_sha = ws.commit(f"heart episode {episode_id}: {task.prompt[:64]}",
@@ -896,7 +884,7 @@ def _run_episode(
         if commit_sha:
             (out / "commit").write_text(commit_sha + "\n")
         emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
-             diff_lines=reward_mod.diff_changed_lines(diff), commit=commit_sha)
+             diff_lines=diff_changed_lines(diff), commit=commit_sha)
 
         # the marker is how an agent asks, not an edit: a scope that never
         # listed it must not turn the question into a path_violation
@@ -912,7 +900,7 @@ def _run_episode(
         # nothing -- and the common case, a scope tight enough to stop an agent
         # finishing but not starting, was recorded nowhere at all. A refusal is
         # worth reporting whether or not it changed the outcome; what it must
-        # not do is change the reward, which is why the ladder below is
+        # not do is change the outcome, which is why the ladder below is
         # untouched.
         denials = _scope_denials(out)
         probed_forbidden = _probed_forbidden(denials, task.denied_paths)
@@ -926,8 +914,8 @@ def _run_episode(
         if violations:
             outcome = "path_violation"
         elif secret_hits:
-            # mirrors path_violation handling: a secret in the diff zeroes
-            # reward exactly like an out-of-bounds edit, no verify run
+            # mirrors path_violation handling: a secret in the diff fails the
+            # episode exactly like an out-of-bounds edit, no verify run
             outcome = "guardrail_violation"
             emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
                  rules=sorted({h.split(":", 1)[0] for h in secret_hits}))
@@ -1033,28 +1021,6 @@ def _run_episode(
         "timed_out": any(r["timed_out"] for r in ran),
         "duration_s": round(sum(r["duration_s"] for r in ran), 2),
     }
-    if outcome in ("pass", "fail"):
-        budget = task.timeout_seconds * max(1, len(ran))
-        score = reward_mod.compute(
-            verifier_results, diff, agent_result["duration_s"], budget,
-            hidden_results=hidden_results,
-        )
-    elif outcome in UNSCOREABLE:
-        # No correctness signal exists, so there is nothing to score. 0.0 would
-        # assert the episode did badly; None says the axes don't apply. Scoring
-        # these is actively harmful: compute() renormalizes over the surviving
-        # components, and the survivors are diff_quality and efficiency — small
-        # diff, finished fast — which is exactly what stopping early looks like.
-        # A blocked episode would score ~0.97 for doing nothing.
-        #
-        # scope_denied belongs here for the opposite reason: 0.0 would blame the
-        # model for a sandbox drawn too tight. The agent never got the chance to
-        # produce a correctness signal, so there is nothing to score either way,
-        # and training on it would teach the model that this task is impossible.
-        score = {"total": None, "components": {}}
-    else:
-        score = {"total": 0.0, "components": {}}
-
     def _sum(key: str) -> float | int | None:
         vals = [r[key] for r in runs_log if r.get(key) is not None]
         return sum(vals) if vals else None
@@ -1084,16 +1050,14 @@ def _run_episode(
         "blocked_reason": blocked_reason,
         "violations": violations if outcome == "path_violation"
         else secret_hits if outcome == "guardrail_violation" else [],
-        # Tagged, not rescored. An episode where the sandbox refused a write the
-        # spec permitted and the agent still produced a diff gets scored on that
-        # diff -- but the score may be measuring our mount table rather than the
-        # model, and a consumer training on it deserves to know. Rescoring these
-        # to None instead would satisfy the same worry and reopen the escape
-        # hatch: the agent would only have to write something small, then probe,
-        # rather than forfeiting the episode entirely.
+        # Tagged, not reclassified. An episode where the sandbox refused a write
+        # the spec permitted and the agent still produced a diff is judged on
+        # that diff -- but the verdict may be measuring our mount table rather
+        # than the model, and a consumer deserves to know. Reclassifying these
+        # as scope_denied would reopen the escape hatch: the agent would only
+        # have to write something small, then probe.
         #
-        # False when the outcome already says it (scope_denied, path_violation);
-        # the tag is for the episodes that carry a number.
+        # False when the outcome already says it (scope_denied, path_violation).
         # The plugin has no network flag, so heart detaches the sandbox from
         # bridge and re-attaches it to the network the spec asked for, between
         # creating it and running anything in it. Both steps are fatal, so a
@@ -1125,35 +1089,31 @@ def _run_episode(
         "env_snapshot": {k: v for k, v in env.items() if k.startswith("ARTERIES_")},
         "verifier_results": verifier_results,
         "hidden_verifier_results": hidden_results,
-        "diff_lines": reward_mod.diff_changed_lines(diff),
-        "reward": score,
+        "diff_lines": diff_changed_lines(diff),
         "usage": usage,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     (out / "episode.json").write_text(json.dumps(episode, indent=2))
     usage_payload = {k: v for k, v in usage.items() if v is not None}
-    # skills/difficulty ride the event so route.aggregate can build per-(model,
-    # skill,difficulty) reward stats — the measured signal that corrects declared
-    # manifest scores. Empty skills (unrouted task) simply don't feed the loop.
+    # skills/difficulty ride the event so a consumer can group outcomes by
+    # (model, skill, difficulty). Empty skills (unrouted task) are left off.
     route_payload = {}
     if getattr(task, "skills", None):
         route_payload = {"skills": task.skills, "difficulty": task.difficulty}
     emit("heart", "episode.finished", episode_id=episode_id, task_id=task.task_id,
          duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
-         reward=score["total"], review_verdict=review_verdict, agent=agent,
+         review_verdict=review_verdict, agent=agent,
          blocked_reason=blocked_reason, **usage_payload, **route_payload)
     return episode
 
 
 def best_episode(episodes: list[dict]) -> dict:
-    # unscored (blocked/unverified) sorts below every scored episode: with no
-    # correctness signal there is no case for preferring it over one that has one.
-    return max(episodes, key=lambda e: (e["outcome"] == "pass",
-                                        _score(e) if _score(e) is not None else -1.0))
+    """A passing episode over a failing one, then the smallest diff.
 
-
-def _score(episode: dict) -> float | None:
-    return episode["reward"]["total"]
+    ponytail: pass + fewest changed lines. Rework when candidates (N>1) get
+    real use and something better than diff size should break the tie.
+    """
+    return min(episodes, key=lambda e: (e["outcome"] != "pass", e.get("diff_lines") or 0))
 
 
 def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs) -> list[dict]:
