@@ -127,6 +127,15 @@ def test_a_verifier_still_reports_through_the_journal():
     assert _mount(_verifier(_task()), JOURNAL).writable is True
 
 
+def test_a_verifier_reads_dependent_checkouts_and_an_agent_never_does():
+    """F85: a caller's suite judges the candidate, so its checkout is mounted
+    into the verifier -- read-only, and never into an agent's container."""
+    task = _task(verifier_mounts={"/src/plexus": "/deps/plexus"})
+    m = _mount(_verifier(task), "/deps/plexus")
+    assert m is not None and m.source == "/src/plexus" and m.writable is False
+    assert _mount(_profile(task), "/deps/plexus") is None
+
+
 
 
 

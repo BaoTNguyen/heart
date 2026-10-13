@@ -1051,6 +1051,8 @@ def verifier_profile_for(
         mounts=(
             Mount(str(workspace), WORK, writable=False),
             Mount(str(inbox_dir), JOURNAL, writable=True),
+            *(Mount(host, target, writable=False)
+              for host, target in (getattr(task, "verifier_mounts", None) or {}).items()),
             # The agent CLIs come along even here. Not for the verifier's use --
             # docker-sbx takes an agent name positionally and refuses to start a
             # sandbox whose image lacks that binary, so a verifier-only sandbox
