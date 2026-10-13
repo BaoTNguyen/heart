@@ -36,9 +36,25 @@ def test_the_environment_variable_overrides_it():
         assert journal_dir() == Path("/tmp/elsewhere")
 
 
-def test_the_sandbox_asks_arteries_rather_than_guessing():
-    """heart used to compute the inbox path itself when arteries was absent.
-    A container writing where the drain does not read loses the run's memory
+def test_the_inbox_is_where_arteries_drains_from(tmp_path):
+    """arteries.journal.inbox() is <journal>/incoming/<run>; the drain reads
+    exactly that. heart must agree without running arteries to ask (F82)."""
+    from heart.sandbox import inbox_for
+
+    art = tmp_path / "bin" / "art"
+    art.parent.mkdir()
+    art.write_text("#!/bin/sh\n")
+    art.chmod(0o755)
+    journal = tmp_path / "journal"
+    with patch.dict(os.environ, {"PATH": str(art.parent), JOURNAL_ENV: str(journal)}):
+        box = inbox_for("ep-1")
+    assert box == journal / "incoming" / "ep-1"
+    # docker-sbx refuses a --workspace that doesn't exist, so it must
+    assert box.is_dir()
+
+
+def test_the_sandbox_refuses_without_arteries():
+    """No arteries means no drain: a container's events would be lost
     silently, so a missing arteries must raise."""
     from heart.sandbox import inbox_for
 
@@ -48,4 +64,5 @@ def test_the_sandbox_asks_arteries_rather_than_guessing():
         except RuntimeError as exc:
             assert "arteries" in str(exc)
         else:
-            raise AssertionError("inbox_for must not guess the path")
+            raise AssertionError("inbox_for must refuse when arteries is absent")
+
