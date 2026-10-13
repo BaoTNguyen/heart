@@ -44,6 +44,11 @@ class TaskSpec:
     # mined tasks pin the fix-commit's tests so they actually fail at base.
     # Overlay paths are excluded from diffs, so agents can't edit them away.
     overlay_files: dict[str, str] = field(default_factory=dict)
+    # host path -> container path, mounted read-only into verifier containers
+    # only: the checkouts of repos that import this one, so their suites can
+    # judge the candidate too (a change that breaks a caller must fail here,
+    # not after it lands). Agents never see them.
+    verifier_mounts: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 300
     difficulty: str = "unknown"
     # routing: which capabilities the task needs (routing.SKILLS), how much
