@@ -1058,28 +1058,26 @@ def reader_profile_for(
 
 
 def inbox_for(key: str) -> Path:
-    """The journal inbox a container writes into, asked of arteries.
+    """The journal inbox a container writes into: <journal>/incoming/<key>.
 
     Keyed by episode, not by subtask: the inbox is the isolation unit (one per
     container) while ARTERIES_RUN_ID is the identity unit (one per role). Every
     role in an episode appends to the same directory and the drain separates
     them by the run_id on each event.
 
-    Asked, never computed. Guessing the path is the failure that cannot be
-    noticed: a container writing where the drain does not read loses everything
-    that run remembered, silently, and the episode looks like it simply had no
-    memory. Raising here follows the same rule as a missing docker binary -- a
-    requested sandbox must fail loudly rather than quietly degrade.
+    Computed from vascular_paths, which is vendored byte-identical into arteries
+    and checked by the umbrella CI, so heart and the drain cannot disagree on
+    the directory. It used to be asked of `python3 -m arteries.cli`, which broke
+    whenever the inherited PATH led to an interpreter without arteries (F82).
+    arteries must still be installed: without it nothing drains the inbox, a
+    run's memory is lost silently, and a requested sandbox must fail loudly
+    rather than quietly degrade -- the same rule as a missing docker binary.
     """
-    try:
-        out = subprocess.run(["python3", "-m", "arteries.cli", "journal", "inbox", key],
-                             capture_output=True, text=True, timeout=30, check=True)
-    except Exception as exc:
+    if not shutil.which("art"):
+        # the prefix is the one plexus reads as "never reached the agent", so
+        # this costs the feature no attempt (F83)
         raise RuntimeError(
-            "HEART_SANDBOX=docker needs arteries to name the journal inbox "
-            f"(`art journal inbox {key}`); it is not answering: {exc}"
-        ) from exc
-    path = Path(out.stdout.strip())
-    if not path.is_absolute():
-        raise RuntimeError(f"arteries returned a non-absolute inbox path: {path!r}")
-    return path
+            "sandbox failed to start: HEART_SANDBOX=docker needs arteries "
+            f"installed to drain the journal inbox (no `art` on PATH); {key}'s "
+            "container would write where nothing reads")
+    return vascular_paths.journal_dir() / "incoming" / key
