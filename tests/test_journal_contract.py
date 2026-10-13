@@ -45,9 +45,12 @@ def test_the_inbox_is_where_arteries_drains_from(tmp_path):
     art.parent.mkdir()
     art.write_text("#!/bin/sh\n")
     art.chmod(0o755)
-    with patch.dict(os.environ, {"PATH": str(art.parent),
-                                 JOURNAL_ENV: "/tmp/elsewhere"}):
-        assert inbox_for("ep-1") == Path("/tmp/elsewhere/incoming/ep-1")
+    journal = tmp_path / "journal"
+    with patch.dict(os.environ, {"PATH": str(art.parent), JOURNAL_ENV: str(journal)}):
+        box = inbox_for("ep-1")
+    assert box == journal / "incoming" / "ep-1"
+    # docker-sbx refuses a --workspace that doesn't exist, so it must
+    assert box.is_dir()
 
 
 def test_the_sandbox_refuses_without_arteries():

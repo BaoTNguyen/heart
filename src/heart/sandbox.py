@@ -1123,4 +1123,8 @@ def inbox_for(key: str) -> Path:
             "sandbox failed to start: HEART_SANDBOX=docker needs arteries "
             f"installed to drain the journal inbox (no `art` on PATH); {key}'s "
             "container would write where nothing reads")
-    return vascular_paths.journal_dir() / "incoming" / key
+    # created here, as `art journal inbox` did: docker-sbx's --workspace points
+    # at it, and the plugin refuses a workspace that doesn't exist
+    inbox = vascular_paths.journal_dir() / "incoming" / key
+    inbox.mkdir(parents=True, exist_ok=True)
+    return inbox
