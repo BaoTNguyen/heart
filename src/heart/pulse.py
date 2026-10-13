@@ -113,7 +113,7 @@ def episode_timeline(episode_id: str) -> list[str]:
 
 
 def goal_timeline(goal_id: str) -> list[str]:
-    """Goal lineage: goal -> features -> episodes -> outcome/reward/cost, a
+    """Goal lineage: goal -> features -> episodes -> outcome/cost, a
     groupby over episode.finished events carrying payload.goal_id (stamped
     from PLEXUS_GOAL_ID by events.emit)."""
     events = [e for e in load_events() if _payload(e).get("goal_id") == goal_id]
@@ -144,8 +144,6 @@ def goal_timeline(goal_id: str) -> list[str]:
                 continue
             p = _payload(fe)
             parts = [f"outcome={p.get('outcome')}"]
-            if p.get("reward") is not None:
-                parts.append(f"reward={p['reward']}")
             if p.get("cost_usd") is not None:
                 parts.append(f"cost=${p['cost_usd']:.2f}")
             lines.append(f"feature {fid}: episode {eid} " + " ".join(parts))

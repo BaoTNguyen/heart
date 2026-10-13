@@ -51,8 +51,7 @@ AGENT_COMMANDS: dict[str, list[str]] = {
     # only way the CLI reports what a turn cost. Without it every codex episode
     # logged `usage: {}` and `cost_usd: null`, so a codex run was free to the
     # ledger, to PRICING, and to every budget that reads them -- while the same
-    # task on claude:haiku reported $1.45. Reward is unaffected: `efficiency` is
-    # wall-clock against the timeout and never read tokens.
+    # task on claude:haiku reported $1.45.
     # _extract_usage renders the JSONL back to a readable transcript.
     "codex": ["codex", "exec", "--json", "-s", "workspace-write", "{prompt}"],
     "gemini": ["gemini", "--yolo", "-p", "{prompt}"],
@@ -748,7 +747,7 @@ def sandbox_egress_denied(output: str) -> str | None:
     """The allowlist refusing a host the agent needed, or None.
 
     An egress denial reaches the agent as an ordinary API error, so the run ends
-    with no diff and the ladder reads it as `no_change` at reward 0.0. Measured
+    with no diff and the ladder reads it as `no_change`. Measured
     against a deliberately narrow allowlist: the agent logged
     "403 api.anthropic.com is not in the sandbox allowlist" and the episode
     scored zero. That is the sandbox being wrong about what the work needed,
@@ -793,9 +792,8 @@ def sandbox_start_failure(exit_code: int, output: str) -> str | None:
     That has to be told apart from the command running and failing, because
     every consumer downstream reads a non-zero exit as a verdict on the work. A
     typo in HEART_SANDBOX_IMAGE otherwise produces an episode per task with an
-    empty diff and reward 0.0 -- a whole batch teaching marrow that the model
-    can do nothing, when in fact nothing ever ran. Verified: it scored
-    `no_change` at 0.0 rather than raising.
+    empty diff -- a whole batch saying the model can do nothing, when in fact
+    nothing ever ran. Verified: it recorded `no_change` rather than raising.
 
     125 alone is not enough -- a verifier is free to exit 125 on its own -- so
     the docker message has to be there too.

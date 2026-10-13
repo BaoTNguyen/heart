@@ -31,7 +31,6 @@ def build_sft(episodes_path: str | Path, runs_dir: str | Path, out_path: str | P
                 "task_id": ep["task_id"],
                 "prompt": ep["prompt"],
                 "completion": _read_diff(ep, runs_dir),
-                "reward": ep["reward"]["total"],
             }) + "\n")
             rows += 1
     return rows
