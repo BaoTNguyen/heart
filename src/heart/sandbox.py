@@ -292,6 +292,47 @@ def image_is_stale(image: str | None = None,
             f"    docker build -t {image} {dockerfile.parent}")
 
 
+# The label an image that bakes heart in carries: the heart commit it was built
+# from (vascular/verifier.Dockerfile sets it from --build-arg HEART_COMMIT).
+HEART_COMMIT_LABEL = "vascular.heart.commit"
+
+
+def baked_heart_drift(image: str | None = None,
+                      repo: Path | None = None) -> str | None:
+    """A reason the heart baked into `image` differs from this checkout, or None.
+
+    Verifiers import the image's heart, not the checkout's, so a stale image
+    judges every episode by old code: plexus suites failed collection and two
+    paid episodes chased the wrong cause (F38, after F1 and F4). Only src/ and
+    pyproject.toml are baked, so a tests-only commit doesn't count. An image
+    with no label doesn't claim to bake heart and isn't judged.
+    """
+    image = image or os.getenv("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
+    repo = repo or Path(__file__).resolve().parent.parent.parent
+    try:
+        out = subprocess.run(["docker", "image", "inspect", image, "--format",
+                              "{{index .Config.Labels \"" + HEART_COMMIT_LABEL + "\"}}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    baked = out.stdout.strip() if out.returncode == 0 else ""
+    if baked in ("", "<no value>"):
+        return None
+    rebuild = ("rebuild it (vascular/verifier.Dockerfile, with "
+               "--build-arg HEART_COMMIT=$(git -C <heart> rev-parse HEAD))")
+    if baked == "unset":
+        return f"sandbox image {image!r} was built without HEART_COMMIT; {rebuild}"
+    diff = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", baked,
+                           "--", "src", "pyproject.toml"],
+                          capture_output=True, text=True)
+    if diff.returncode == 0:
+        return None
+    what = ("changed since" if diff.returncode == 1
+            else "can't be compared with")
+    return (f"sandbox image {image!r} bakes heart {baked[:12]}, and this "
+            f"checkout's heart src {what} it; {rebuild}")
+
+
 def _dockerfile_changed_at(dockerfile: Path) -> float:
     """When the recipe last changed, by commit time where git knows.
 
