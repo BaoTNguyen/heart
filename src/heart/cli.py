@@ -475,6 +475,8 @@ def cmd_dataset(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="heart")
     sub = parser.add_subparsers(dest="command", required=True)
+    from .handoff import add_commands as add_handoff_commands
+    add_handoff_commands(sub)
 
     def add_agent_flags(p):
         p.add_argument(

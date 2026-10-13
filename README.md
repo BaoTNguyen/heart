@@ -18,6 +18,76 @@ marrow       RL training on heart's exported episodes (separate repo)
 Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
 as a library.
 
+## Recovering a CLI session after a usage limit
+
+On Linux, recover an existing Claude Code session without asking Claude for a
+summary. Run from a terminal, using the exact directory Claude was working in:
+
+```bash
+heart handoff --repo /path/to/project
+heart handoff --repo /path/to/project --session CLAUDE_SESSION_ID --launch
+```
+
+The first command writes a private checkpoint and prints its location. It
+does not launch a model or change project files. The second reads the selected
+session's native JSONL transcript, captures current git state including
+untracked files, verifies receipt in a read-only Codex session, and resumes
+that exact Codex thread to continue working. Omit `--session` to select the
+most recently modified transcript whose recorded working directory matches
+`--repo`; use an explicit ID when several tasks share a directory. An exported
+local transcript can be supplied with `--transcript /path/session.jsonl`.
+
+Exit the old Claude CLI before using `--launch`. Partial edits stay in place;
+Heart does not reset, stash, commit, apply patches, or create a new worktree.
+Unfinished tool calls are marked uncertain so the replacement checks their
+actual outcome before repeating them. Parent links preserve the active branch
+of the conversation after a rewind; thinking blocks and raw tool-result bodies
+are excluded. Earlier user requests and the latest compaction summary remain
+in the full checkpoint even when the initial prompt preview must be shortened.
+
+For future sessions, start Claude through the supervisor:
+
+```bash
+heart session --repo /path/to/project "Finish the settings editor"
+heart session --repo /path/to/project --resume CLAUDE_SESSION_ID
+```
+
+This forwards the native terminal UI and supplies session-only checkpoint
+hooks alongside existing Claude hooks. Native transcripts remain the event
+log; structured checkpoints refresh as tool/turn events arrive. A typed
+`StopFailure` event with `error=rate_limit` stops the owned source process
+group, captures a final checkpoint, and performs the Codex handoff. Terminal
+output mentioning a limit does not trigger a switch. Authentication, server,
+and other error classes do not trigger automatic failover. A worktree lock
+prevents concurrent Heart supervisors, and Linux process checks reject a
+replacement while an unmanaged Claude CLI is still running in that directory.
+
+Codex must return the exact packet ID, task ID, and working directory plus a
+next action. Source transcript and worktree fingerprints must still match
+before edits are enabled. Codex continues with `workspace-write` and
+`on-request` approvals; a source in plan mode continues read-only. Source
+CLI-specific tool allow/deny settings are not translated: Codex applies its
+own policy and repository instructions. No permission-bypass flags are used.
+If preflight fails (including Codex being exhausted), the checkpoint remains
+available and no editing session is launched. This first implementation is
+one-way Claude-to-Codex; it does not cycle providers, import subagent sessions,
+or recover a Claude session lacking a local transcript. Automatic detection
+requires a Claude version supporting `StopFailure` and enabled command hooks;
+manual recovery works without those hooks. Existing sessions do not gain
+automatic failover until relaunched through `heart session --resume`.
+
+Checkpoints and local preflight diagnostics contain private task text. They
+live under `~/.vascular/state/heart/handoffs/` (or `$VASCULAR_HOME`), in private
+directories with checkpoints written atomically as mode 0600. Use
+`--directory /private/path` to select a different location outside the working
+tree. Native CLI records retain their own permissions and lifecycle. Read-only
+preflight consumes one Codex turn; it is resumed rather than starting a second
+thread. Heart's model router also treats availability and minimum context as
+hard constraints, including its difficulty fallback.
+
+Without a PATH installation, use `uv run --project /path/to/heart heart ...`
+or the checkout's `.venv/bin/heart` entrypoint.
+
 Episodes carry an outcome (`pass`, `fail`, `blocked`, `path_violation`, ...), not
 a reward. Reward assignment was removed on 2026-10-13 until marrow's link to
 pulse is reworked.
