@@ -325,22 +325,28 @@ def pick(
     if not manifest:
         # no manifest: the tier default is the best answer available, and the
         # caller's own agent is the answer when there isn't even one of those
+        agent = resolve(want.tier, default=default or "claude")
+        if available is not None and not available(agent):
+            raise ValueError(f"no available model; {agent}:unavailable (tier default)")
         return decided(Choice(
-            agent=resolve(want.tier, default=default or "claude"),
+            agent=agent,
             effort=want.effort, tier=want.tier, skills=skills,
             difficulty=difficulty, reason="no model manifest; tier default"))
 
     scored: list[dict] = []
     filtered: list[str] = []
+    runnable: list[tuple[str, dict]] = []
     for name, m in manifest.items():
+        # Availability is physical, not a preference we can relax on fallback.
+        if available is not None and not available(m["agent"]):
+            filtered.append(f"{name}:unavailable")
+            continue
         if m["context"] < want.min_context:
             filtered.append(f"{name}:context<{want.min_context}")
             continue
+        runnable.append((name, m))
         if drank(m["max_difficulty"]) < drank(difficulty):
             filtered.append(f"{name}:below {difficulty}")
-            continue
-        if available is not None and not available(m["agent"]):
-            filtered.append(f"{name}:unavailable")
             continue
         # unlisted skills fall back to the model's tier baseline, not zero — a
         # frontier model is generally competent even where you didn't annotate it
@@ -350,9 +356,11 @@ def pick(
                        "cost": m["cost"]})
 
     if not scored:
+        if not runnable:
+            raise ValueError("no available model satisfies context constraints; " + "; ".join(filtered))
         # every model filtered out — take the highest-ceiling model as a last
         # resort rather than failing the task outright
-        best = max(manifest.items(), key=lambda kv: drank(kv[1]["max_difficulty"]))
+        best = max(runnable, key=lambda kv: drank(kv[1]["max_difficulty"]))
         return decided(Choice(
             agent=best[1]["agent"], effort="high", tier=want.tier,
             skills=skills, difficulty=difficulty, name=best[0],
