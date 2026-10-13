@@ -292,6 +292,47 @@ def image_is_stale(image: str | None = None,
             f"    docker build -t {image} {dockerfile.parent}")
 
 
+# The label an image that bakes heart in carries: the heart commit it was built
+# from (vascular/verifier.Dockerfile sets it from --build-arg HEART_COMMIT).
+HEART_COMMIT_LABEL = "vascular.heart.commit"
+
+
+def baked_heart_drift(image: str | None = None,
+                      repo: Path | None = None) -> str | None:
+    """A reason the heart baked into `image` differs from this checkout, or None.
+
+    Verifiers import the image's heart, not the checkout's, so a stale image
+    judges every episode by old code: plexus suites failed collection and two
+    paid episodes chased the wrong cause (F38, after F1 and F4). Only src/ and
+    pyproject.toml are baked, so a tests-only commit doesn't count. An image
+    with no label doesn't claim to bake heart and isn't judged.
+    """
+    image = image or os.getenv("HEART_SANDBOX_IMAGE", DEFAULT_IMAGE)
+    repo = repo or Path(__file__).resolve().parent.parent.parent
+    try:
+        out = subprocess.run(["docker", "image", "inspect", image, "--format",
+                              "{{index .Config.Labels \"" + HEART_COMMIT_LABEL + "\"}}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    baked = out.stdout.strip() if out.returncode == 0 else ""
+    if baked in ("", "<no value>"):
+        return None
+    rebuild = ("rebuild it (vascular/verifier.Dockerfile, with "
+               "--build-arg HEART_COMMIT=$(git -C <heart> rev-parse HEAD))")
+    if baked == "unset":
+        return f"sandbox image {image!r} was built without HEART_COMMIT; {rebuild}"
+    diff = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", baked,
+                           "--", "src", "pyproject.toml"],
+                          capture_output=True, text=True)
+    if diff.returncode == 0:
+        return None
+    what = ("changed since" if diff.returncode == 1
+            else "can't be compared with")
+    return (f"sandbox image {image!r} bakes heart {baked[:12]}, and this "
+            f"checkout's heart src {what} it; {rebuild}")
+
+
 def _dockerfile_changed_at(dockerfile: Path) -> float:
     """When the recipe last changed, by commit time where git knows.
 
@@ -1010,6 +1051,8 @@ def verifier_profile_for(
         mounts=(
             Mount(str(workspace), WORK, writable=False),
             Mount(str(inbox_dir), JOURNAL, writable=True),
+            *(Mount(host, target, writable=False)
+              for host, target in (getattr(task, "verifier_mounts", None) or {}).items()),
             # The agent CLIs come along even here. Not for the verifier's use --
             # docker-sbx takes an agent name positionally and refuses to start a
             # sandbox whose image lacks that binary, so a verifier-only sandbox
@@ -1058,28 +1101,30 @@ def reader_profile_for(
 
 
 def inbox_for(key: str) -> Path:
-    """The journal inbox a container writes into, asked of arteries.
+    """The journal inbox a container writes into: <journal>/incoming/<key>.
 
     Keyed by episode, not by subtask: the inbox is the isolation unit (one per
     container) while ARTERIES_RUN_ID is the identity unit (one per role). Every
     role in an episode appends to the same directory and the drain separates
     them by the run_id on each event.
 
-    Asked, never computed. Guessing the path is the failure that cannot be
-    noticed: a container writing where the drain does not read loses everything
-    that run remembered, silently, and the episode looks like it simply had no
-    memory. Raising here follows the same rule as a missing docker binary -- a
-    requested sandbox must fail loudly rather than quietly degrade.
+    Computed from vascular_paths, which is vendored byte-identical into arteries
+    and checked by the umbrella CI, so heart and the drain cannot disagree on
+    the directory. It used to be asked of `python3 -m arteries.cli`, which broke
+    whenever the inherited PATH led to an interpreter without arteries (F82).
+    arteries must still be installed: without it nothing drains the inbox, a
+    run's memory is lost silently, and a requested sandbox must fail loudly
+    rather than quietly degrade -- the same rule as a missing docker binary.
     """
-    try:
-        out = subprocess.run(["python3", "-m", "arteries.cli", "journal", "inbox", key],
-                             capture_output=True, text=True, timeout=30, check=True)
-    except Exception as exc:
+    if not shutil.which("art"):
+        # the prefix is the one plexus reads as "never reached the agent", so
+        # this costs the feature no attempt (F83)
         raise RuntimeError(
-            "HEART_SANDBOX=docker needs arteries to name the journal inbox "
-            f"(`art journal inbox {key}`); it is not answering: {exc}"
-        ) from exc
-    path = Path(out.stdout.strip())
-    if not path.is_absolute():
-        raise RuntimeError(f"arteries returned a non-absolute inbox path: {path!r}")
-    return path
+            "sandbox failed to start: HEART_SANDBOX=docker needs arteries "
+            f"installed to drain the journal inbox (no `art` on PATH); {key}'s "
+            "container would write where nothing reads")
+    # created here, as `art journal inbox` did: docker-sbx's --workspace points
+    # at it, and the plugin refuses a workspace that doesn't exist
+    inbox = vascular_paths.journal_dir() / "incoming" / key
+    inbox.mkdir(parents=True, exist_ok=True)
+    return inbox
