@@ -62,3 +62,4 @@ def test_the_sandbox_refuses_without_arteries():
             assert "arteries" in str(exc)
         else:
             raise AssertionError("inbox_for must refuse when arteries is absent")
+

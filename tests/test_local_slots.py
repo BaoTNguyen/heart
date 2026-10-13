@@ -341,6 +341,45 @@ def test_a_current_image_is_not_flagged():
     assert image_is_stale() is None, image_is_stale()
 
 
+def test_a_baked_heart_older_than_the_checkout_is_named(tmp_path, monkeypatch):
+    """F38: the verifier imports the image's heart. A label naming an older
+    heart commit than the checkout must read as drift; the same commit must
+    not, and neither must a tests-only change."""
+    import subprocess
+    from heart import sandbox
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), *a], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.email", "t@example.com"); git("config", "user.name", "T")
+    (tmp_path / "src").mkdir(); (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n")
+    git("add", "."); git("commit", "-qm", "base")
+    baked = git("rev-parse", "HEAD")
+
+    label = {"value": baked}
+    real_run = subprocess.run
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, label["value"] + "\n", "")
+        return real_run(cmd, *a, **k)
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+
+    assert sandbox.baked_heart_drift("img", tmp_path) is None
+    (tmp_path / "tests" / "t.py").write_text("")
+    git("add", "."); git("commit", "-qm", "tests only")
+    assert sandbox.baked_heart_drift("img", tmp_path) is None
+    (tmp_path / "src" / "a.py").write_text("x = 2\n")
+    git("commit", "-qam", "src change")
+    reason = sandbox.baked_heart_drift("img", tmp_path)
+    assert reason and baked[:12] in reason and "rebuild" in reason, reason
+    label["value"] = "<no value>"                  # an image that bakes no heart
+    assert sandbox.baked_heart_drift("img", tmp_path) is None
+    label["value"] = "unset"
+    assert "without HEART_COMMIT" in sandbox.baked_heart_drift("img", tmp_path)
+
+
 def _work_help() -> str:
     """`heart work --help`, captured.
 
