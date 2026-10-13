@@ -1764,7 +1764,7 @@ class TestGoalLineage(unittest.TestCase):
                 os.environ["PLEXUS_FEATURE_ID"] = old_feat
 
         lines = sorted(journal_dir().glob("*.ndjson"))[0].read_text().splitlines()
-        events = {json.loads(line)["episode_id"]: json.loads(line) for line in lines}
+        events = {e["episode_id"]: e for e in map(json.loads, lines) if "episode_id" in e}
         self.assertEqual(events["ep-env"]["payload"]["goal_id"], "g-env")
         self.assertEqual(events["ep-env"]["payload"]["feature_id"], "f-env")
         self.assertEqual(events["ep-env2"]["payload"]["goal_id"], "explicit-g")
