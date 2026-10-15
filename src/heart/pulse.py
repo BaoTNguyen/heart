@@ -12,7 +12,6 @@ import json
 import os
 import time
 from collections import Counter, defaultdict
-from pathlib import Path
 
 from .events import journal_dir
 
@@ -77,31 +76,43 @@ def tail(
         print(render(e))
     if not follow:
         return
-    # follow the newest journal file; new days create new files, so re-resolve
-    offsets: dict[Path, int] = {}
     try:
-        while True:
-            files = sorted(journal_dir().glob("*.ndjson"))
-            for path in files[-2:]:  # current day + rollover window
-                if path not in offsets:
-                    offsets[path] = path.stat().st_size  # skip history, printed above
-                    continue
-                pos = offsets[path]
-                size = path.stat().st_size
-                if size > pos:
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        f.seek(pos)
-                        for line in f:
-                            try:
-                                e = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if _matches(e, episode, task, source):
-                                print(render(e), flush=True)
-                    offsets[path] = size
-            time.sleep(0.5)
+        for e in follow():
+            if e is not None and _matches(e, episode, task, source):
+                print(render(e), flush=True)
     except KeyboardInterrupt:
         pass
+
+
+def follow(interval: float = 0.5):
+    """Yield events appended to the journal from now on, and None after each
+    poll that found nothing more, so a caller can send a keepalive.
+
+    The offset kept is the byte after the last complete line read, not a size
+    measured before reading: a line still being written waits for the next
+    poll instead of being skipped, and an append that lands mid-read is not
+    read twice. A file that appears mid-follow -- a new UTC day -- is read
+    from its start. History before the call is the caller's to print.
+    """
+    offsets = {p: p.stat().st_size for p in sorted(journal_dir().glob("*.ndjson"))[-2:]}
+    while True:
+        for path in sorted(journal_dir().glob("*.ndjson"))[-2:]:  # today + rollover
+            pos = offsets.get(path, 0)
+            if path.stat().st_size <= pos:
+                continue
+            with open(path, "rb") as f:
+                f.seek(pos)
+                for raw in f:
+                    if not raw.endswith(b"\n"):
+                        break
+                    pos += len(raw)
+                    offsets[path] = pos
+                    try:
+                        yield json.loads(raw)
+                    except ValueError:  # junk or undecodable bytes
+                        continue
+        yield None
+        time.sleep(interval)
 
 
 def episode_timeline(episode_id: str) -> list[str]:
