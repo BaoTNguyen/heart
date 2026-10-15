@@ -85,13 +85,17 @@ def test_env_fallbacks_and_goal_stamp(journal, monkeypatch):
     first, second = _events(journal)
     assert (first["episode_id"], first["task_id"]) == ("ep-env", "t-env")
     assert first["payload"] == {"attempt": 0, "goal_id": "g-env", "feature_id": "f-env"}
+    assert (first["goal_id"], first["feature_id"]) == ("g-env", "f-env")
+    # an explicit kwarg wins over the env stamp, in the payload and the envelope
     assert second["payload"]["goal_id"] == "explicit-g"
+    assert (second["goal_id"], second["feature_id"]) == ("explicit-g", "f-env")
 
 
 def test_no_payload_without_kwargs_or_env(journal):
     emit("heart", "episode.started", episode_id="ep1")
     [ev] = _events(journal)
     assert "payload" not in ev
+    assert "goal_id" not in ev and "feature_id" not in ev
 
 
 def test_unwritable_journal_does_not_raise(journal, monkeypatch, tmp_path):

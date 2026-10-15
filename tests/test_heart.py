@@ -1709,33 +1709,6 @@ class TestGoalLineage(unittest.TestCase):
         with open(d / "20260101.ndjson", "a") as f:
             f.write(json.dumps(event) + "\n")
 
-    def test_emit_stamps_goal_lineage_from_env(self):
-        from heart.events import emit, journal_dir
-
-        old_goal = os.environ.get("PLEXUS_GOAL_ID")
-        old_feat = os.environ.get("PLEXUS_FEATURE_ID")
-        os.environ["PLEXUS_GOAL_ID"] = "g-env"
-        os.environ["PLEXUS_FEATURE_ID"] = "f-env"
-        try:
-            emit("heart", "episode.started", episode_id="ep-env", task_id="t-env")
-            # explicit payload kwargs are never overwritten by the env stamp
-            emit("heart", "episode.finished", episode_id="ep-env2", goal_id="explicit-g")
-        finally:
-            if old_goal is None:
-                os.environ.pop("PLEXUS_GOAL_ID", None)
-            else:
-                os.environ["PLEXUS_GOAL_ID"] = old_goal
-            if old_feat is None:
-                os.environ.pop("PLEXUS_FEATURE_ID", None)
-            else:
-                os.environ["PLEXUS_FEATURE_ID"] = old_feat
-
-        lines = sorted(journal_dir().glob("*.ndjson"))[0].read_text().splitlines()
-        events = {e["episode_id"]: e for e in map(json.loads, lines) if "episode_id" in e}
-        self.assertEqual(events["ep-env"]["payload"]["goal_id"], "g-env")
-        self.assertEqual(events["ep-env"]["payload"]["feature_id"], "f-env")
-        self.assertEqual(events["ep-env2"]["payload"]["goal_id"], "explicit-g")
-
     def test_goal_timeline_groups_by_feature_then_episode(self):
         from heart import pulse
 
@@ -2453,39 +2426,3 @@ class TestCodexUsage(unittest.TestCase):
         usage, _, _ = self._extract('{"type":"thread.started"}')
         self.assertIsNone(usage["tokens_in"])
 
-
-def _envelope_goal_line(monkeypatch, tmp_path, **kwargs):
-    import heart.events
-    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path / "journal"))
-    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "home"))
-    heart.events.emit("heart", "test.envelope_goal", **kwargs)
-    lines = [json.loads(line) for f in (tmp_path / "journal").glob("*.ndjson")
-             for line in f.read_text().splitlines()]
-    # pulse_emit may also announce context.started; keep only ours
-    (ev,) = [ev for ev in lines if ev["kind"] == "test.envelope_goal"]
-    return ev
-
-
-def test_envelope_goal_from_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("PLEXUS_GOAL_ID", "g1")
-    monkeypatch.setenv("PLEXUS_FEATURE_ID", "f1")
-    ev = _envelope_goal_line(monkeypatch, tmp_path)
-    assert ev["goal_id"] == "g1"
-    assert ev["feature_id"] == "f1"
-    assert ev["payload"]["goal_id"] == "g1"
-
-
-def test_envelope_goal_explicit_kwarg_wins(monkeypatch, tmp_path):
-    monkeypatch.setenv("PLEXUS_GOAL_ID", "g1")
-    monkeypatch.setenv("PLEXUS_FEATURE_ID", "f1")
-    ev = _envelope_goal_line(monkeypatch, tmp_path, goal_id="g2")
-    assert ev["goal_id"] == "g2"
-    assert ev["payload"]["goal_id"] == "g2"
-
-
-def test_envelope_goal_absent_without_env(monkeypatch, tmp_path):
-    monkeypatch.delenv("PLEXUS_GOAL_ID", raising=False)
-    monkeypatch.delenv("PLEXUS_FEATURE_ID", raising=False)
-    ev = _envelope_goal_line(monkeypatch, tmp_path)
-    assert "goal_id" not in ev
-    assert "feature_id" not in ev
