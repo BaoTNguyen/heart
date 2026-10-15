@@ -21,6 +21,10 @@ What every line gets, beyond what the caller passes:
                   from $PULSE_TRACE_ID / $PULSE_PARENT_SPAN, when a parent
                   process set them
 Fields the caller passes win over all of these.
+
+new_span() returns a fresh 16-hex span id. artifact(data, journal) stores bytes
+or a file's contents as <journal>/artifacts/<sha256> and returns the hash, or
+None on failure (it never raises either).
 """
 from __future__ import annotations
 
@@ -178,3 +182,44 @@ def emit(source: str, kind: str, journal: Path, state: Path | None = None, **fie
         append(event(source, kind, **fields), journal)
     except Exception:
         pass
+
+
+def new_span() -> str:
+    """A fresh span id: 16 lowercase hex chars."""
+    return os.urandom(8).hex()
+
+
+def artifact(data: bytes | Path, journal: Path) -> str | None:
+    """Store `data` (bytes, or a file streamed in 1 MiB chunks) as
+    <journal>/artifacts/<sha256>. Returns the hex digest, or None. Never raises.
+
+    Writes to a .tmp-* name first (never 64 hex, so the collector skips it),
+    then renames atomically. A blob already at that name holds the same bytes.
+    """
+    tmp = None
+    try:
+        artifacts = journal / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        path = artifacts / f".tmp-{os.getpid()}-{os.urandom(8).hex()}"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        tmp = path
+        h = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out:
+            if isinstance(data, Path):
+                with data.open("rb") as src:
+                    while chunk := src.read(1 << 20):
+                        h.update(chunk)
+                        out.write(chunk)
+            else:
+                h.update(data)
+                out.write(data)
+        digest = h.hexdigest()
+        os.replace(tmp, artifacts / digest)
+        return digest
+    except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+        return None
