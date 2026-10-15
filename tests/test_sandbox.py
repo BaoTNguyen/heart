@@ -974,24 +974,6 @@ def test_a_clean_log_reports_no_denial(tmp_path):
     assert _scope_denials(tmp_path) == []
 
 
-def test_review_reasoning_survives_an_approval(tmp_path):
-    """An APPROVE that also flags a real problem is the most considered thing an
-    episode produces. It used to be deleted with the run directory."""
-    from heart.episode import _review_notes
-
-    log = tmp_path / "review.log"
-    log.write_text("The retry logic will break under concurrency.\nAPPROVE looks correct\n")
-
-    notes = _review_notes(log)
-
-    assert "retry logic will break" in notes
-
-
-def test_missing_review_log_yields_nothing():
-    from heart.episode import _review_notes
-    assert _review_notes(Path("/nonexistent/review.log")) == ""
-
-
 def test_a_containerised_agent_is_pointed_at_a_reachable_model():
     """127.0.0.1 inside a container is the container. An agent resolving the
     host's endpoint connects to itself and reports the model as down."""

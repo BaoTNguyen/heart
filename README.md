@@ -120,7 +120,7 @@ training data:
   `pulse health` (exit code as the alert primitive), a systemd health timer, and
   `pulse serve` — the whole factory floor as one localhost HTML page with live
   episode cards you can steer mid-run, no build step.
-- **Routing that learns.** `--agent auto` scores each model in a manifest against
+- **Routing by declared capability.** `--agent auto` scores each model in a manifest against
   the task's inferred skills, difficulty, and context size, filters to the ones
   that can actually run it, and picks the cheapest capable match by declared
   capability.
@@ -199,8 +199,8 @@ so `local` and `local-think` share one loaded model on one port — a fast
 executor and a thinking planner without a reload. `HEART_API_REASONING=1`
 forces it for a single run. When on, the token floor rises to 4000 so a
 reasoning trace can't consume the whole budget and return an empty answer.
-Point these at the [hot-swap model manager](../plexus/local_model_ideas/) and
-the model behind the fixed port swaps underneath without the profiles changing.
+Put a hot-swap model manager behind the fixed port and the model can change
+underneath without the profiles changing.
 
 CLI agents keep arteries memory/retrieval hooks alive if installed in the
 target repo (episode worktrees carry the repo's `.arteries/` and CLI hook

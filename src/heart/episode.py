@@ -79,25 +79,6 @@ def _review_verdict(log_path: Path) -> str | None:
     return hits[-1].lower() if hits else None
 
 
-def _review_notes(log_path: Path, limit: int = 1500) -> str:
-    """The reviewer's reasoning, whatever the verdict was.
-
-    Only a rejection currently does anything with this: `review-fix` gets the
-    log tail. An APPROVE that also says "this works but the retry logic will
-    break under concurrency" is read by nobody and deleted with the run
-    directory -- the most considered thing an episode produced, thrown away for
-    passing.
-
-    Emitting it puts the reasoning in the journal, which is the path into
-    arteries' memory. Insight from a review is worth remembering precisely
-    because it survives the episode that generated it.
-    """
-    if not log_path.exists():
-        return ""
-    text = log_path.read_text(errors="replace").strip()
-    return text[-limit:]
-
-
 def _consume_steer(out: Path) -> str | None:
     """Read+clear a mid-run steer note the dashboard dropped into the
     episode's own out dir (`serve.py`'s POST /api/steer writes steer.txt
