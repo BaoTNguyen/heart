@@ -46,6 +46,8 @@ def emit(
         pulse_emit.emit(
             source, kind, journal_dir(), vascular_paths.path("state", "pulse", "contexts"),
             episode_id=episode_id, task_id=task_id, role=role, duration_ms=duration_ms,
+            # top-level copies are what pulse queries by; None (never "") drops the key
+            goal_id=payload.get("goal_id") or None, feature_id=payload.get("feature_id") or None,
             payload=payload or None,
         )
     except Exception:
