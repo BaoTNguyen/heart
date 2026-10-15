@@ -44,7 +44,9 @@ fields on its own events; no field changes here were needed. heart's own
 `events.emit()` mirrors this: when `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` are set
 in the environment, it stamps `payload.goal_id`/`payload.feature_id` onto
 every event it emits (optional, additive, skipped if the call site already
-set them) — `pulse goal <goal-id>` reads this back.
+set them) — `pulse goal <goal-id>` reads this back. They are also set as
+the envelope's top-level `goal_id`/`feature_id`, which is what pulse queries
+by; the payload copies stay for older readers.
 
 ## Journal location
 

@@ -2455,3 +2455,40 @@ class TestCodexUsage(unittest.TestCase):
     def test_a_stream_with_no_usage_reports_none_rather_than_zero(self):
         usage, _, _ = self._extract('{"type":"thread.started"}')
         self.assertIsNone(usage["tokens_in"])
+
+
+def _envelope_goal_line(monkeypatch, tmp_path, **kwargs):
+    import heart.events
+    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "home"))
+    heart.events.emit("heart", "test.envelope_goal", **kwargs)
+    lines = [json.loads(line) for f in (tmp_path / "journal").glob("*.ndjson")
+             for line in f.read_text().splitlines()]
+    # pulse_emit may also announce context.started; keep only ours
+    (ev,) = [ev for ev in lines if ev["kind"] == "test.envelope_goal"]
+    return ev
+
+
+def test_envelope_goal_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PLEXUS_GOAL_ID", "g1")
+    monkeypatch.setenv("PLEXUS_FEATURE_ID", "f1")
+    ev = _envelope_goal_line(monkeypatch, tmp_path)
+    assert ev["goal_id"] == "g1"
+    assert ev["feature_id"] == "f1"
+    assert ev["payload"]["goal_id"] == "g1"
+
+
+def test_envelope_goal_explicit_kwarg_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("PLEXUS_GOAL_ID", "g1")
+    monkeypatch.setenv("PLEXUS_FEATURE_ID", "f1")
+    ev = _envelope_goal_line(monkeypatch, tmp_path, goal_id="g2")
+    assert ev["goal_id"] == "g2"
+    assert ev["payload"]["goal_id"] == "g2"
+
+
+def test_envelope_goal_absent_without_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("PLEXUS_GOAL_ID", raising=False)
+    monkeypatch.delenv("PLEXUS_FEATURE_ID", raising=False)
+    ev = _envelope_goal_line(monkeypatch, tmp_path)
+    assert "goal_id" not in ev
+    assert "feature_id" not in ev
