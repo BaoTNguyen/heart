@@ -5,7 +5,6 @@ All writes go to tmp_path — never into the read-only checkout.
 """
 
 import importlib.util
-import os
 import sys
 from io import StringIO
 from pathlib import Path
@@ -136,9 +135,6 @@ def test_rotation_at_start(capsys, tmp_path):
 
     mod.open_log(str(log_path))
     print("new line", flush=True)
-
-    sys.stdout = captured
-    out_text = captured.getvalue()
 
     # The old .1 should have been replaced with the oversized content
     assert old_one_path.read_bytes() == big_content

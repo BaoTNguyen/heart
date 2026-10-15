@@ -150,9 +150,6 @@ class Mount:
     target: str
     writable: bool = False
 
-    def arg(self) -> str:
-        return f"{self.source}:{self.target}:{'rw' if self.writable else 'ro'}"
-
 
 @dataclass(frozen=True)
 class SandboxProfile:

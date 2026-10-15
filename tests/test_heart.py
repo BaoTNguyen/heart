@@ -585,8 +585,6 @@ class TestHeart(unittest.TestCase):
         self.assertIn("Error", crashed[0]["payload"]["error"])
 
     def test_insights_and_health(self):
-        from heart import pulse
-
         self.run_ep(FIX_CMD)
         self.run_ep("sed -i 's/a - b/a * b/' calc.py")
         with contextlib.redirect_stdout(io.StringIO()) as buf:

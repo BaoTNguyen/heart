@@ -696,9 +696,6 @@ def resolve_model(profile: str) -> str:
     return agents_api.profile_config(profile).get("model") or profile
 
 
-_resolve_model = resolve_model  # the name before plexus needed it
-
-
 #: How each CLI is told not to build its own sandbox inside heart's. Two
 #: sandboxes are not twice the containment: the inner one needs privileges the
 #: outer one exists to withhold, so it fails rather than nests. The container is
