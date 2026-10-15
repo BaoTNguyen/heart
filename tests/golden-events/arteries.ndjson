@@ -7,6 +7,5 @@
 {"ts": "2026-07-08T17:50:10.253660+00:00", "source": "arteries", "kind": "memory.compile.completed", "payload": {"store": "db", "status": "compiled", "claimed": 1, "new_persistent": 0, "superseded": 0}}
 {"ts": "2026-07-05T05:20:27.231749+00:00", "source": "arteries", "kind": "memory.ephemeral.extracted", "payload": {"count": 2}}
 {"ts": "2026-07-06T13:45:22.393964+00:00", "source": "arteries", "kind": "memory.frame.built", "turn_id": "a17cb4ea-ffdb-43d6-ae8d-ee585a5d2f48", "payload": {"store": "db", "recent_messages": 3, "session_insights": 0, "ground_truth_insights": 1}}
-{"ts": "2026-07-19T05:41:22.669014+00:00", "source": "arteries", "kind": "reward.episode", "episode_id": "20260718-234111-d6ba6168", "task_id": "demo-route-1", "payload": {"value": 1.0, "reward_source": "heart", "store": "db"}}
 {"ts": "2026-07-05T05:20:27.231618+00:00", "source": "arteries", "kind": "run.started"}
 {"ts": "2026-07-05T05:20:27.231023+00:00", "source": "arteries", "kind": "turn.observed", "payload": {"not_json": "<Mock name='not-json' id='123594095495504'>"}}
