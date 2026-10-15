@@ -2386,8 +2386,7 @@ class TestCodexUsage(unittest.TestCase):
     """Every codex episode logged `usage: {}` and `cost_usd: null`, so a codex
     run was free to the ledger and to every budget that reads it -- while the
     same task on claude:haiku reported $1.45. The CLI does report it, behind
-    --json. (Reward is untouched: `efficiency` is wall-clock against the
-    timeout and never read tokens.)"""
+    --json."""
 
     #: a real stream, trimmed: `codex exec --json -s read-only --model gpt-5.6-luna`
     STREAM = "\n".join([

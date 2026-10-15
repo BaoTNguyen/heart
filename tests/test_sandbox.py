@@ -864,9 +864,9 @@ def test_the_secret_is_the_bare_token_or_a_credentials_file(monkeypatch, tmp_pat
 
 def test_an_allowlist_refusal_is_not_an_agent_that_did_nothing():
     """A denied host reaches the agent as an ordinary API error, so the run ends
-    with no diff and the ladder reads `no_change` at reward 0.0. Measured
-    against a narrow allowlist before this existed: the episode scored zero for
-    never reaching a model."""
+    with no diff and the ladder reads `no_change`. Measured against a narrow
+    allowlist before this existed: the episode failed for never reaching a
+    model."""
     from heart.runner import EGRESS_DENIED_MARKER, sandbox_egress_denied
 
     envelope = ('{"is_error":true,"result":"API Error: 403 '
@@ -914,7 +914,7 @@ def test_no_proxy_variables_when_none_is_configured(monkeypatch):
 def test_a_container_that_never_started_is_not_an_agent_that_did_nothing():
     """Docker exits 125 before running anything when the image or the network
     is missing, or a bind is unshared. Read as a verdict, a typo in
-    HEART_SANDBOX_IMAGE produces a whole batch of empty diffs at reward 0.0 --
+    HEART_SANDBOX_IMAGE produces a whole batch of `no_change` episodes --
     marrow learning the model can do nothing, from runs that never happened."""
     from heart.runner import sandbox_start_failure
 
@@ -999,7 +999,7 @@ def test_the_profile_does_not_pin_an_endpoint_of_its_own():
 def test_a_refusal_on_forbidden_ground_is_not_an_escape_from_scoring():
     """The hack this closes: an agent heading for a bad score writes one byte
     into a denied path, gets an empty diff plus a refusal, and scope_denied
-    would hand it reward=None instead of 0.0."""
+    would excuse it instead of failing it."""
     from heart.episode import _probed_forbidden
 
     denial = ["implement: [Errno 30] Read-only file system: 'src/secrets/key.pem'"]
