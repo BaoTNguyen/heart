@@ -66,7 +66,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,12 +73,12 @@ from typing import Callable
 
 from . import episode as episode_mod
 from . import review as review_mod
-from . import reward as reward_mod
 from . import routing
 from .detect import detect_verifiers
 from .env import Workspace
 from .episode import run_episode
 from .events import emit
+from .guard import diff_changed_lines
 from .runner import run_agent, turn_profile
 from .verify import run_probes, run_verifiers
 
@@ -363,7 +362,6 @@ def run_orchestrated(
     (episode_id, outcome, review_verdict, usage) with diff.patch written under
     runs_dir/<id>/, so callers treat A and B results uniformly."""
     manifest = manifest if manifest is not None else routing.load_manifest()
-    started = time.monotonic()
     # Path B safety gate: it combines independently-built parts, so a clean merge
     # proves nothing unless a verifier actually exercises the seam. No integration
     # test => unsafe to split => build it as one coherent tree (A), where a single
@@ -470,11 +468,7 @@ def run_orchestrated(
     if len(waves) > 1:
         label = f"waves:{len(waves)}" + ("+incremental" if label == "incremental" else "")
     done = _finish_b(task, merged, verifiers, manifest, agent, episode_ids,
-                     runs_dir, agent_cmd, parent, label,
-                     elapsed=time.monotonic() - started,
-                     # one sequential leg for the decompose, one per wave
-                     budget=task.timeout_seconds * (1 + len(waves)),
-                     roles=roles)
+                     runs_dir, agent_cmd, parent, label, roles=roles)
     if done is not None:
         return done
     return _fallback_a(task, agent, roles, runs_dir, agent_cmd,
@@ -502,17 +496,11 @@ def _run_workers(subs, task, base_commit, agent, manifest, parent, runs_dir, age
 
 
 def _finish_b(task, merged, verifiers, manifest, agent, episode_ids, runs_dir,
-              agent_cmd, parent, merge_label, elapsed=None, budget=None,
-              roles=None) -> dict | None:
+              agent_cmd, parent, merge_label, roles=None) -> dict | None:
     """Verify the merged tree, repair once if it fails (rejecting a repair that
     went green by weakening tests), and materialize a Path-B result. Returns None
     when repair can't save it, so the caller falls back to whole-task A. Shared by
-    the clean-merge path and the incremental retry.
-
-    The integration results are kept rather than dropped: the merged tree is real
-    work with a real diff that just faced the real suite, so it gets a real
-    reward. Only the workers stay unscored, because a fragment genuinely was not
-    measured against anything."""
+    the clean-merge path and the incremental retry."""
     passed, results = _integration_check(task, merged, verifiers)
     if passed is not False:
         outcome = "pass" if passed else "unverified"
@@ -520,7 +508,6 @@ def _finish_b(task, merged, verifiers, manifest, agent, episode_ids, runs_dir,
                                            runs_dir, agent_cmd, parent)
         return _materialize(runs_dir, task, merged, outcome, episode_ids,
                             merge=merge_label, integration="pass" if passed else "none",
-                            reward=_score(results, merged, elapsed, budget),
                             review_verdict=verdict, review_findings=findings)
     strong = _strong_agent(manifest, agent)
     merged2, passed2, results = _repair(task, merged, verifiers, strong, runs_dir,
@@ -534,7 +521,6 @@ def _finish_b(task, merged, verifiers, manifest, agent, episode_ids, runs_dir,
                                            runs_dir, agent_cmd, parent)
         return _materialize(runs_dir, task, merged2, "pass", episode_ids,
                             merge=merge_label, integration="repaired",
-                            reward=_score(results, merged2, elapsed, budget),
                             review_verdict=verdict, review_findings=findings)
     return None
 
@@ -792,30 +778,6 @@ def _repair(task, merged_diff: str, verifiers: list, agent: str,
         ws.destroy()
 
 
-def _score(results: dict, diff: str, elapsed, budget) -> dict | None:
-    """Reward for a merged Path-B tree, or None when nothing measured it.
-
-    None is not zero. An unscored episode and a failed one are different facts,
-    and collapsing them feeds marrow failures that never happened — the same
-    distinction SPINE.md draws between `sandbox.denied` (reward None) and
-    `guardrail.hit` (reward 0.0).
-
-    The efficiency budget is the task timeout times the number of sequential
-    legs — one decompose plus one per wave — because that is the wall clock the
-    orchestration actually had. Scoring a multi-wave build against a single
-    role's timeout would zero its efficiency for a structural reason and make
-    Path B look worse than Path A at identical work.
-
-    # ponytail: hidden verifiers are not run on the merged tree, so a Path-B
-    # reward uses the no-hidden-tests weights while a Path-A reward on the same
-    # task may not. Comparable within a path, not across one; fix by running the
-    # hidden suite here once someone needs the two to line up.
-    """
-    if not results:
-        return None
-    return reward_mod.compute(results, diff, elapsed or 0.0, int(budget or 0))
-
-
 def _review_merged(task, diff: str, roles, agent: str, runs_dir, agent_cmd,
                    parent: str) -> tuple[str | None, list]:
     """Assess the merged tree with the same three stages Path A uses.
@@ -911,7 +873,7 @@ def _worker_usage(runs_dir, worker_ids: list[str]) -> dict:
 
 
 def _materialize(runs_dir, task, diff: str, outcome: str, worker_ids: list[str],
-                 merge: str, integration: str, reward: dict | None = None,
+                 merge: str, integration: str,
                  review_verdict: str | None = None,
                  review_findings: list | None = None) -> dict:
     """Write a Path-B result as an episode dir so callers read it like any
@@ -924,16 +886,15 @@ def _materialize(runs_dir, task, diff: str, outcome: str, worker_ids: list[str],
                      "worker_episodes": worker_ids}
     ep = {
         "episode_id": ep_id, "task_id": task.task_id, "outcome": outcome,
-        "diff_lines": reward_mod.diff_changed_lines(diff),
+        "diff_lines": diff_changed_lines(diff),
         "review_verdict": review_verdict, "blocked_reason": None,
         "review_findings": [{"severity": f.severity, "file": f.file,
                              "line": f.line, "claim": f.claim,
                              "evidence": f.evidence} for f in (review_findings or [])],
-        "reward": reward or {"total": None, "components": {}},
         "usage": _worker_usage(runs_dir, worker_ids),
         "orchestration": orchestration,
     }
     (out / "episode.json").write_text(json.dumps(ep, indent=2))
     emit("heart", "orchestration.finished", episode_id=ep_id, task_id=task.task_id,
-         outcome=outcome, reward=ep["reward"]["total"], **orchestration)
+         outcome=outcome, **orchestration)
     return ep

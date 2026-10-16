@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stack-smoke: one goal through plexus -> heart -> arteries, then assert the
 # same episode_id in four places: plexus ledger, heart runs dir, spine events,
-# arteries reward ingest. STACK_READINESS §1.3.
+# arteries episode ingest. STACK_READINESS §1.3.
 #
 # Deterministic by default — a scripted agent plans and fixes, zero tokens.
 # The capillaries gate only fires for hook-instrumented CLI agents, so here

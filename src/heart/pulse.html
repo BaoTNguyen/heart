@@ -143,7 +143,7 @@ function fold(e) {              // fold one spine event into episode state
   if (e.kind === "verify.round") ep.verify.push((e.payload || {}).passed);
   if (e.kind === "episode.finished") {
     const p = e.payload || {};
-    ep.status = p.outcome || "done"; ep.reward = p.reward; ep.verdict = p.review_verdict;
+    ep.status = p.outcome || "done"; ep.verdict = p.review_verdict;
     ep.cost = p.cost_usd;
   }
   if (e.kind === "episode.failed") ep.status = "crashed";
@@ -173,7 +173,6 @@ function renderBoard() {
         <span class="task">${esc(short(ep.task || "?"))}</span>
         ${ep.tier ? `<span class="chip">${esc(ep.tier)}</span>` : ""}
         ${ep.verdict ? `<span class="chip">review: ${esc(ep.verdict)}</span>` : ""}
-        ${ep.reward != null ? `<span class="chip">r=${Number(ep.reward).toFixed(2)}</span>` : ""}
         ${ep.cost != null ? `<span class="chip">$${Number(ep.cost).toFixed(2)}</span>` : ""}
         <span class="id clickable" onclick="openDrilldown('${esc(ep.id)}')">${esc(ep.id)}</span>
       </div>

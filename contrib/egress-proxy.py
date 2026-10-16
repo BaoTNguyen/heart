@@ -329,7 +329,7 @@ async def _splice(reader, writer, up_r, up_w, meter: str = ""):
 
 #: Carried in every refusal so heart can tell "the allowlist stopped this" from
 #: "the agent failed". Without it a too-narrow ALLOW scores every episode
-#: `no_change` at reward 0.0 -- measured -- and a batch teaches the model it
+#: `no_change` -- measured -- and a batch teaches the model it
 #: cannot work, from runs that never reached a model. A token rather than a
 #: sentence because an agent echoing the phrase should not be able to trip it by
 #: accident.

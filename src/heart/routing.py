@@ -14,8 +14,7 @@ Capabilities are authored ORDINALLY, not as scores — a general `tier` sets a
 baseline competence (and, by default, the difficulty ceiling), and `skills`
 optionally notes the few a model is notably strong/weak at. No hand-written
 floats: consensus gives you "frontier, great at planning, weak at vision," not
-"planning 0.9." The declared part only *orders* models before data exists; the
-real numbers come from the measured reward sidecar, which corrects the prior.
+"planning 0.9." The declared part *orders* models; nothing measured corrects it yet.
 
 Config (~/.vascular/config/heart/models.json):
 
@@ -38,8 +37,7 @@ is allowed and means "when mid-tier work shows up, use this".
 `tier` -> baseline competence + difficulty ceiling (override the ceiling with an
 explicit `max_difficulty`). `skills` values are strong|capable|weak; an
 unlisted skill inherits the tier baseline. Legacy numeric skill scores still
-parse. Measured stats live in a SEPARATE machine-written sidecar so the
-aggregator never clobbers hand-authored edits.
+parse.
 
 The retired `cheap|standard|strong` spelling still reads, from a `tiers` map and
 from HEART_TIER_CHEAP/STANDARD/STRONG, so a config written before this keeps
@@ -49,14 +47,11 @@ from __future__ import annotations
 
 import json
 import os
-import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import vascular_paths
 from .agents_api import load_models_json, models_json_path
 from .events import emit
-from .pulse import load_events
 
 # The shared skill vocabulary. Both a model's manifest scores and a task's
 # required skills draw from this; anything off-list is ignored. Extend by editing.
@@ -84,22 +79,11 @@ DEMAND_TIER = {"trivial": "small", "easy": "small", "unknown": "mid",
 
 # General competence tier -> baseline skill prior + default difficulty ceiling.
 # These are the only place a tier-word becomes a coarse number, and that number
-# is just a rank seed the measured reward overrides — not a claim of precision.
+# is just a rank seed, not a claim of precision.
 _TIER_BASELINE = {"frontier": 0.6, "mid": 0.45, "small": 0.3}
 _TIER_CEILING = {"frontier": "hard", "mid": "medium", "small": "easy"}
 # Per-skill ordinal notes override the baseline for that skill.
 _LEVEL = {"strong": 0.85, "capable": 0.6, "weak": 0.35}
-
-# shrinkage: measured mean fully takes over from the declared prior at ~K samples
-_BLEND_K = 8
-
-
-def _stats_path() -> Path:
-    # set-but-empty is an override too (Path('') is '.'); only unset falls through
-    if "HEART_ROUTE_STATS" in os.environ:
-        return Path(os.environ["HEART_ROUTE_STATS"])
-    return vascular_paths.path("state", "heart", "route_stats.json")
-
 
 def drank(difficulty: str) -> int:
     return _DIFF_RANK.get(difficulty, 2)
@@ -229,69 +213,6 @@ def resolve(name: str, default: str | None = None) -> str:
     return name
 
 
-# --- measured feedback loop ----------------------------------------------
-
-def aggregate(events: list[dict]) -> dict:
-    """Roll episode outcomes into per-(model, skill, difficulty) reward stats.
-
-    Reads `episode.finished` events that carry agent + reward + the task's skills
-    and difficulty. Multi-skill tasks credit every listed skill equally — noisy
-    per task, but the confound washes out in aggregate (documented v1 choice).
-    Keyed by difficulty too, so a model fed only hard tasks isn't unfairly
-    compared to one fed easy ones.
-    """
-    acc: dict = {}
-    for e in events:
-        if e.get("kind") != "episode.finished":
-            continue
-        p = e.get("payload") or {}
-        agent, reward = p.get("agent"), p.get("reward")
-        skills, difficulty = p.get("skills") or [], p.get("difficulty", "unknown")
-        if not agent or reward is None or not skills:
-            continue
-        for s in skills:
-            cell = acc.setdefault(agent, {}).setdefault(f"{s}|{difficulty}", {"n": 0, "sum": 0.0})
-            cell["n"] += 1
-            cell["sum"] += float(reward)
-    return {
-        agent: {key: {"n": c["n"], "mean": round(c["sum"] / c["n"], 4)}
-                for key, c in cells.items()}
-        for agent, cells in acc.items()
-    }
-
-
-def refresh_stats() -> dict:
-    """Rebuild the sidecar from the journal. Best-effort; returns the stats."""
-    try:
-        stats = aggregate(load_events())
-    except Exception:
-        return {}
-    path = _stats_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(stats))
-    except OSError:
-        pass
-    return stats
-
-
-def load_stats() -> dict:
-    try:
-        return json.loads(_stats_path().read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _blend(declared: float, cell: dict | None, k: int = _BLEND_K) -> float:
-    """Declared score corrected by measured evidence. n=0 -> pure prior; the
-    measured mean takes over as evidence accrues (weight n/(n+k))."""
-    if not cell or not cell.get("n"):
-        return declared
-    n, mean = cell["n"], cell["mean"]
-    w = n / (n + k)
-    return (1 - w) * declared + w * mean
-
-
 # --- stage one: what the task demands (heuristic; the LLM seam is the planner) --
 
 _SKILL_WORDS = {
@@ -373,10 +294,7 @@ class Choice:
 def pick(
     want: Demand,
     manifest: dict | None = None,
-    stats: dict | None = None,
     available=None,
-    explore: float = 0.0,
-    rng: random.Random | None = None,
     default: str | None = None,
     episode_id: str | None = None,
 ) -> Choice:
@@ -385,14 +303,10 @@ def pick(
     Hard filters first (a match to a model that can't run the task is useless):
     context window >= what the task touches, difficulty ceiling >= the task's
     difficulty, and availability if a probe is given. Then score the survivors by
-    mean blended skill match, breaking ties toward the cheaper model — don't send
-    easy work to the expensive one. With probability `explore`, pick a viable but
-    under-measured candidate instead, so new/updated models earn the data that
-    keeps their declared scores honest.
+    mean declared skill match, breaking ties toward the cheaper model — don't send
+    easy work to the expensive one.
     """
     manifest = manifest if manifest is not None else load_manifest()
-    stats = stats if stats is not None else load_stats()
-    rng = rng or random
     skills, difficulty = want.skills, want.difficulty
 
     def decided(choice: Choice, filtered: list[str] = ()) -> Choice:
@@ -411,52 +325,49 @@ def pick(
     if not manifest:
         # no manifest: the tier default is the best answer available, and the
         # caller's own agent is the answer when there isn't even one of those
+        agent = resolve(want.tier, default=default or "claude")
+        if available is not None and not available(agent):
+            raise ValueError(f"no available model; {agent}:unavailable (tier default)")
         return decided(Choice(
-            agent=resolve(want.tier, default=default or "claude"),
+            agent=agent,
             effort=want.effort, tier=want.tier, skills=skills,
             difficulty=difficulty, reason="no model manifest; tier default"))
 
     scored: list[dict] = []
     filtered: list[str] = []
+    runnable: list[tuple[str, dict]] = []
     for name, m in manifest.items():
-        if m["context"] < want.min_context:
-            filtered.append(f"{name}:context<{want.min_context}")
-            continue
-        if drank(m["max_difficulty"]) < drank(difficulty):
-            filtered.append(f"{name}:below {difficulty}")
-            continue
+        # Availability is physical, not a preference we can relax on fallback.
         if available is not None and not available(m["agent"]):
             filtered.append(f"{name}:unavailable")
             continue
-        cells = stats.get(m["agent"]) or stats.get(name) or {}
+        if m["context"] < want.min_context:
+            filtered.append(f"{name}:context<{want.min_context}")
+            continue
+        runnable.append((name, m))
+        if drank(m["max_difficulty"]) < drank(difficulty):
+            filtered.append(f"{name}:below {difficulty}")
+            continue
         # unlisted skills fall back to the model's tier baseline, not zero — a
         # frontier model is generally competent even where you didn't annotate it
-        per_skill = [_blend(m["skills"].get(s, m.get("baseline", 0.45)),
-                            cells.get(f"{s}|{difficulty}")) for s in skills]
+        per_skill = [m["skills"].get(s, m.get("baseline", 0.45)) for s in skills]
         score = sum(per_skill) / len(per_skill)
-        measured_n = sum(cells.get(f"{s}|{difficulty}", {}).get("n", 0) for s in skills)
         scored.append({"name": name, "agent": m["agent"], "score": round(score, 4),
-                       "cost": m["cost"], "n": measured_n})
+                       "cost": m["cost"]})
 
     if not scored:
+        if not runnable:
+            raise ValueError("no available model satisfies context constraints; " + "; ".join(filtered))
         # every model filtered out — take the highest-ceiling model as a last
         # resort rather than failing the task outright
-        best = max(manifest.items(), key=lambda kv: drank(kv[1]["max_difficulty"]))
+        best = max(runnable, key=lambda kv: drank(kv[1]["max_difficulty"]))
         return decided(Choice(
             agent=best[1]["agent"], effort="high", tier=want.tier,
             skills=skills, difficulty=difficulty, name=best[0],
             reason=f"no model cleared constraints ({'; '.join(filtered)}); "
                    f"forced highest-ceiling model"), filtered)
 
-    # exploration: occasionally give a viable low-evidence candidate the traffic
-    if explore and rng.random() < explore:
-        least = min(scored, key=lambda c: c["n"])
-        if least["n"] < _BLEND_K:
-            chosen, why = least, f"exploration (n={least['n']})"
-        else:
-            chosen, why = _best(scored), "capability match"
-    else:
-        chosen, why = _best(scored), "capability match"
+    chosen, why = _best(scored), "capability match"
 
     return decided(Choice(
         agent=chosen["agent"], effort=want.effort, tier=want.tier, skills=skills,

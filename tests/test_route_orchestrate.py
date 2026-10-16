@@ -66,50 +66,26 @@ class TestRouter(unittest.TestCase):
 
     def test_context_constraint_filters(self):
         d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=100_000)),
-                         manifest=MANIFEST, stats={})
+                         manifest=MANIFEST)
         self.assertNotEqual(d.agent, "api:local")  # local's 32k window is too small
 
     def test_difficulty_ceiling_filters(self):
         d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="hard", min_context=1000)),
-                         manifest=MANIFEST, stats={})
+                         manifest=MANIFEST)
         self.assertNotEqual(d.agent, "api:local")  # local caps at "easy"
 
     def test_ties_break_toward_cheaper(self):
         # claude and twin have identical skills; twin is far cheaper -> twin wins
         d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="hard", min_context=1000)),
-                         manifest=MANIFEST, stats={})
+                         manifest=MANIFEST)
         self.assertEqual(d.agent, "api:twin")
 
     def test_capability_beats_cost_when_scores_differ(self):
         # easy coding: local (0.5) is cheapest but claude/twin (0.9) score higher
         d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=1000)),
-                         manifest=MANIFEST, stats={})
+                         manifest=MANIFEST)
         self.assertIn(d.agent, ("claude", "api:twin"))
         self.assertEqual(d.candidates[0]["score"], 0.9)
-
-    def test_measured_stats_override_declared_prior(self):
-        # local declared 0.5 for coding, but measured 0.95 over enough samples on
-        # easy tasks -> its blended score should overtake the 0.9 declared models
-        stats = {"api:local": {"coding|easy": {"n": 40, "mean": 0.98}}}
-        d = routing.pick(routing.demand(_task(skills=["coding"], difficulty="easy", min_context=1000)),
-                         manifest=MANIFEST, stats=stats)
-        self.assertEqual(d.agent, "api:local")
-
-    def test_blend_shrinkage(self):
-        self.assertEqual(routing._blend(0.9, None), 0.9)             # no evidence -> prior
-        self.assertAlmostEqual(routing._blend(0.5, {"n": 8, "mean": 1.0}), 0.75)  # w=0.5
-
-    def test_aggregate_builds_reward_stats(self):
-        events = [
-            {"kind": "episode.finished", "payload":
-                {"agent": "claude", "reward": 0.8, "skills": ["coding"], "difficulty": "hard"}},
-            {"kind": "episode.finished", "payload":
-                {"agent": "claude", "reward": 0.6, "skills": ["coding"], "difficulty": "hard"}},
-            {"kind": "episode.finished", "payload":  # no skills -> ignored
-                {"agent": "claude", "reward": 1.0, "difficulty": "hard"}},
-        ]
-        stats = routing.aggregate(events)
-        self.assertEqual(stats["claude"]["coding|hard"], {"n": 2, "mean": 0.7})
 
     def test_ordinal_manifest_no_floats(self):
         import json
@@ -130,7 +106,7 @@ class TestRouter(unittest.TestCase):
             # a hard planning task: little is filtered (ceiling), big wins on the
             # strong note; an unlisted skill would fall back to big's baseline
             d1 = routing.pick(routing.demand(_task(skills=["planning"], difficulty="hard", min_context=1000)),
-                             manifest=m, stats={})
+                             manifest=m)
             self.assertEqual(d1.agent, "claude")
 
     def test_legacy_tiers_synthesize_a_manifest(self):
@@ -390,7 +366,6 @@ class TestOrchestrate(unittest.TestCase):
                               runs_dir=self.runs, manifest={})
         self.assertEqual(called, [])
         self.assertEqual(ep["outcome"], "blocked")
-        self.assertIsNone(ep["reward"]["total"])
 
     def test_workers_inherit_the_measurements_and_do_not_re_probe(self):
         task = dataclasses.replace(
@@ -422,28 +397,6 @@ class TestOrchestrate(unittest.TestCase):
         diff = (Path(self.runs) / ep["episode_id"] / "diff.patch").read_text()
         self.assertIn("a.txt", diff)
         self.assertIn("b.txt", diff)
-
-    def test_the_merged_episode_is_scored_and_the_workers_are_not(self):
-        # The merged tree is real work: a real diff that faced the real suite,
-        # so it carries a real reward. A worker built a fragment nothing could
-        # judge, so its None stays None -- unscored is not the same as failed.
-        task = self._task("(orchestrated)", "test -f a.txt && test -f b.txt")
-        subs = [Subtask("wa", "printf 'a\\n' > a.txt"),
-                Subtask("wb", "printf 'b\\n' > b.txt")]
-        ep = run_orchestrated(task, agent="shell", decomposer=lambda _t: subs,
-                              runs_dir=self.runs, manifest={})
-        self.assertEqual(ep["outcome"], "pass")
-        self.assertIsNotNone(ep["reward"]["total"])
-        self.assertGreater(ep["reward"]["total"], 0.0)
-        self.assertIn("public_tests", ep["reward"]["components"])
-        for wid in ep["orchestration"]["worker_episodes"]:
-            worker = json.loads((Path(self.runs) / wid / "episode.json").read_text())
-            self.assertIsNone(worker["reward"]["total"])
-
-    def test_an_unmeasured_merge_scores_none_not_zero(self):
-        # _score refuses to invent a number when nothing ran. Feeding marrow a
-        # 0.0 here would be a failure that never happened.
-        self.assertIsNone(orchestrate._score({}, "diff", 1.0, 60))
 
     def test_the_merged_tree_is_reviewed_when_a_review_role_is_configured(self):
         # No worker ever sees the merged tree, and it is what lands. Without

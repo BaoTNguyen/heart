@@ -30,7 +30,7 @@ Append-only NDJSON, one event per line:
 |---|---|---|
 | `ts` | yes | UTC ISO-8601, emitter's clock |
 | `source` | yes | `heart` \| `arteries` \| `capillaries` \| `marrow` \| `plexus` \| `agent` |
-| `kind` | yes | dotted event name, `noun.verb` or `decision.<type>` / `reward.<type>` |
+| `kind` | yes | dotted event name, `noun.verb` or `decision.<type>` |
 | `episode_id` | when known | heart-generated episode id (also via `ARTERIES_EPISODE_ID` env) |
 | `task_id` | when known | TaskSpec id (also via `ARTERIES_TASK_ID` env) |
 | `turn_id` / `role` | when known | finer correlation |
@@ -44,7 +44,9 @@ fields on its own events; no field changes here were needed. heart's own
 `events.emit()` mirrors this: when `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` are set
 in the environment, it stamps `payload.goal_id`/`payload.feature_id` onto
 every event it emits (optional, additive, skipped if the call site already
-set them) — `pulse goal <goal-id>` reads this back.
+set them) — `pulse goal <goal-id>` reads this back. They are also set as
+the envelope's top-level `goal_id`/`feature_id`, which is what pulse queries
+by; the payload copies stay for older readers.
 
 ## Journal location
 
@@ -66,7 +68,7 @@ take down the observed.
 
 | Kind | Source | Notable payload |
 |---|---|---|
-| `episode.started/finished/failed` | heart | agent, memory_mode, retrieval, pipeline; outcome, reward; error |
+| `episode.started/finished/failed` | heart | agent, memory_mode, retrieval, pipeline; outcome; error |
 | `role.started/finished` | heart | agent, memory, exit_code, timed_out |
 | `route.decided` | heart | tier, agent, reason (heuristic signals or task.difficulty) |
 | `verify.round` | heart | attempt, passed |
@@ -76,7 +78,6 @@ take down the observed.
 | `batch.progress` | heart | done, total, outcome |
 | `turn.observed`, `memory.*`, `prompt.*`, `*.failed` | arteries/capillaries | runlog tee; `store: db\|jsonl` |
 | `decision.<type>` | arteries | chosen, available, cost, `store` |
-| `reward.<type>` | arteries | value, reward_source, `store` |
 | `training.started/progress/finished` | marrow | stage (sft/dpo/grpo), step, loss and other numeric trainer logs |
 | `goal.started/finished` | plexus | goal_id; outcome |
 | `plan.created/approved` | plexus | goal_id, feature count |
@@ -86,15 +87,15 @@ take down the observed.
 
 `sandbox.denied` and `guardrail.hit` are the two halves of one distinction, and
 consumers must keep them apart: the first says the sandbox refused ground the
-spec permitted (heart drew the mount table too tight, and the episode carries
-no reward — `None`, not `0.0`), the second says the agent reached for ground the
-spec forbade (its violation, scored `0.0`). Collapse them and `scope_denied`
-becomes an escape from being scored at all.
+spec permitted (heart drew the mount table too tight, and the episode is
+excused as `scope_denied`), the second says the agent reached for ground the
+spec forbade (its violation, `path_violation`). Collapse them and `scope_denied`
+becomes an escape from failing.
 
 `sandbox.denied` fires whenever a refusal on permitted ground appears in the
 episode's logs, whatever the outcome — a passing episode can carry one. It is a
 report that the mount table was tighter than the work needed, not a verdict on
-the episode, and it never moves the reward. Consumers that only looked at it
+the episode, and it never moves the outcome. Consumers that only looked at it
 alongside `scope_denied` were seeing the tail of the distribution: the scopes so
 tight the agent produced nothing, never the far more common scope that let an
 agent start and not finish. Episodes in the second group carry `scope_suspect:
@@ -115,7 +116,7 @@ signal (`pulse health` watches it).
 |---|---|
 | Latency | `role.finished`/`episode.finished` durations → `pulse insights` p50/p95, split pass vs fail (slow failures are worst) |
 | Traffic | episodes + turns per window → `pulse insights` |
-| Errors | `episode.failed`, `*.failed`, outcomes (`apply_failed`, `path_violation`), reward=0 classes |
+| Errors | `episode.failed`, `*.failed`, outcomes (`apply_failed`, `path_violation`, `guardrail_violation`) |
 | Saturation | verifier timeouts, fix-round exhaustion, duration vs timeout budget |
 
 Symptoms vs causes: `pulse health` is the symptom check (few, simple, reliable
