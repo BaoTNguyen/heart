@@ -864,9 +864,9 @@ def test_the_secret_is_the_bare_token_or_a_credentials_file(monkeypatch, tmp_pat
 
 def test_an_allowlist_refusal_is_not_an_agent_that_did_nothing():
     """A denied host reaches the agent as an ordinary API error, so the run ends
-    with no diff and the ladder reads `no_change` at reward 0.0. Measured
-    against a narrow allowlist before this existed: the episode scored zero for
-    never reaching a model."""
+    with no diff and the ladder reads `no_change`. Measured against a narrow
+    allowlist before this existed: the episode failed for never reaching a
+    model."""
     from heart.runner import EGRESS_DENIED_MARKER, sandbox_egress_denied
 
     envelope = ('{"is_error":true,"result":"API Error: 403 '
@@ -914,7 +914,7 @@ def test_no_proxy_variables_when_none_is_configured(monkeypatch):
 def test_a_container_that_never_started_is_not_an_agent_that_did_nothing():
     """Docker exits 125 before running anything when the image or the network
     is missing, or a bind is unshared. Read as a verdict, a typo in
-    HEART_SANDBOX_IMAGE produces a whole batch of empty diffs at reward 0.0 --
+    HEART_SANDBOX_IMAGE produces a whole batch of `no_change` episodes --
     marrow learning the model can do nothing, from runs that never happened."""
     from heart.runner import sandbox_start_failure
 
@@ -974,24 +974,6 @@ def test_a_clean_log_reports_no_denial(tmp_path):
     assert _scope_denials(tmp_path) == []
 
 
-def test_review_reasoning_survives_an_approval(tmp_path):
-    """An APPROVE that also flags a real problem is the most considered thing an
-    episode produces. It used to be deleted with the run directory."""
-    from heart.episode import _review_notes
-
-    log = tmp_path / "review.log"
-    log.write_text("The retry logic will break under concurrency.\nAPPROVE looks correct\n")
-
-    notes = _review_notes(log)
-
-    assert "retry logic will break" in notes
-
-
-def test_missing_review_log_yields_nothing():
-    from heart.episode import _review_notes
-    assert _review_notes(Path("/nonexistent/review.log")) == ""
-
-
 def test_a_containerised_agent_is_pointed_at_a_reachable_model():
     """127.0.0.1 inside a container is the container. An agent resolving the
     host's endpoint connects to itself and reports the model as down."""
@@ -1014,19 +996,10 @@ def test_the_profile_does_not_pin_an_endpoint_of_its_own():
         assert "HEART_API_ENDPOINT" not in profile_for(task, "/ws", "/c", "/i").env
 
 
-def test_a_scope_denial_carries_no_reward_signal():
-    """0.0 asserts the episode did badly. A sandbox refusing writes says nothing
-    about the model, and training on it teaches that the task is impossible."""
-    from heart.episode import UNSCOREABLE
-
-    assert "scope_denied" in UNSCOREABLE
-    assert "pass" not in UNSCOREABLE and "fail" not in UNSCOREABLE
-
-
 def test_a_refusal_on_forbidden_ground_is_not_an_escape_from_scoring():
     """The hack this closes: an agent heading for a bad score writes one byte
     into a denied path, gets an empty diff plus a refusal, and scope_denied
-    would hand it reward=None instead of 0.0."""
+    would excuse it instead of failing it."""
     from heart.episode import _probed_forbidden
 
     denial = ["implement: [Errno 30] Read-only file system: 'src/secrets/key.pem'"]

@@ -11,14 +11,12 @@ token before ever binding beyond loopback.
 from __future__ import annotations
 
 import json
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import pulse
 from .cli import work_runs_dir
-from .events import journal_dir
 
 PAGE = Path(__file__).with_name("pulse.html")
 
@@ -132,26 +130,12 @@ class Handler(BaseHTTPRequestHandler):
             for e in pulse.load_events():
                 if e.get("ts", "") >= cutoff:
                     self._event(e)
-            # follow the journal exactly the way `pulse tail` does
-            offsets: dict[Path, int] = {}
-            while True:
-                for path in sorted(journal_dir().glob("*.ndjson"))[-2:]:
-                    if path not in offsets:
-                        offsets[path] = path.stat().st_size
-                        continue
-                    size = path.stat().st_size
-                    if size > offsets[path]:
-                        with open(path, encoding="utf-8", errors="replace") as f:
-                            f.seek(offsets[path])
-                            for line in f:
-                                try:
-                                    self._event(json.loads(line))
-                                except json.JSONDecodeError:
-                                    continue
-                        offsets[path] = size
+            for e in pulse.follow(interval=1):  # the same tail `pulse tail` reads
+                if e is not None:
+                    self._event(e)
+                    continue
                 self.wfile.write(b": ping\n\n")  # keepalive + disconnect probe
                 self.wfile.flush()
-                time.sleep(1)
         except (BrokenPipeError, ConnectionResetError):
             pass  # browser tab closed
 

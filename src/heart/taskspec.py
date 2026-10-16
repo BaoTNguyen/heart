@@ -32,7 +32,7 @@ class TaskSpec:
     denied_paths: list[str] = field(default_factory=list)
     # Environment facts measured at base_commit BEFORE any agent runs. Each
     # probe does two jobs from one command: a non-zero exit blocks the episode
-    # (reward None -- nothing was attempted, so there is nothing to score), and
+    # (outcome `blocked` -- nothing was attempted), and
     # its stdout is handed to the agent as measured fact. The second job is the
     # point. A plan written against an assumed extension version, an absent
     # binary or a group membership nobody has is wrong before the first token,

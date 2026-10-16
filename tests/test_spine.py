@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from heart.episode import run_episode  # noqa: E402
-from heart.taskspec import TaskSpec, Verifier  # noqa: E402
+from heart.taskspec import TaskSpec  # noqa: E402
 
 GOLDEN_DIR = Path(__file__).resolve().parent / "golden-events"
 

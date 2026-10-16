@@ -20,7 +20,7 @@ it answers.**
 | Question | Owner | Consequence |
 | --- | --- | --- |
 | What should be built next; is the scope satisfied? | plexus | goals, plans, acceptance, escalation, retry budgets |
-| Was this task done correctly, and how do agents run? | heart | worktrees, roles, verifiers, sandbox, routing, reward, cost *capture* |
+| Was this task done correctly, and how do agents run? | heart | worktrees, roles, verifiers, sandbox, routing, cost *capture* |
 | What happened, and what do we remember? | arteries | ledger (episodes/decisions/rewards/costs), memory tiers, turn observation |
 | Which prompt/skill fits, and is it getting better? | capillaries | retrieval, skill lifecycle, DSPy optimization, promotion gates |
 | Read side of everything | heart `pulse` | insights, health, dashboard — readers only, no state of their own |
@@ -220,7 +220,7 @@ provides the knobs.
 
 ### 4.2 Guardrails on the diff (pre-apply, pre-reward)
 
-All in one place — `reward.py`/apply path already zero-rewards denied paths:
+All in one place — the outcome ladder already fails denied paths (`path_violation`, `guardrail_violation`):
 
 - **Secrets scan**: regex set (AWS keys, private key headers, `ghp_`, generic
   high-entropy assignment) over the diff; hit → zero reward + `guardrail.hit`

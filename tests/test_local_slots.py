@@ -268,33 +268,6 @@ def test_the_pool_path_matches_what_arteries_computes():
         f"pools have diverged: {heart_pool} vs {arteries_slots.pool_for(endpoint)}")
 
 
-if __name__ == "__main__":
-    test_locality()
-    test_the_model_pool_is_not_named_after_this_repo()
-    test_agent_slots_stay_heart_specific()
-    test_the_pool_path_matches_what_arteries_computes()
-    test_a_stale_sandbox_image_is_reported_with_the_fix()
-    test_a_missing_sandbox_image_says_to_build_it()
-    test_a_current_image_is_not_flagged()
-    test_work_can_say_which_network_the_sandbox_gets()
-    test_the_network_default_is_still_deny()
-    test_a_newborn_workspace_lock_is_not_litter()
-    test_prune_runs_under_the_same_lock_as_worktree_add()
-    test_a_live_server_is_reachable()
-    test_a_dead_port_is_not_reachable()
-    test_a_broken_probe_does_not_block_work()
-    test_a_non_200_answer_still_counts_as_listening()
-    test_default_is_the_servers_parallelism_not_unbounded()
-    test_an_unreachable_server_falls_back_rather_than_uncapping()
-    test_the_server_is_asked_once_per_endpoint()
-    test_an_explicit_setting_still_wins()
-    test_pool_serializes()
-    test_pool_two_slots_overlap()
-    test_pricing_local_free()
-    test_reasoning_body()
-    print("ok")
-
-
 @pytest.mark.skipif(not DOCKER_USABLE, reason="no docker daemon, or the sandbox image is not built")
 def test_a_stale_sandbox_image_is_reported_with_the_fix():
     """The Dockerfile gained the plugin's lock directory and the image was never

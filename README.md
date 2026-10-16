@@ -10,13 +10,87 @@ It sits on top of two sibling systems and below two:
 ```text
 capillaries  prompt/skill retrieval   (rides along via arteries)
 arteries     memory + trace substrate (rides along via CLI hooks)
-heart        orchestration + environment + reward   <- this repo
+heart        orchestration + environment + verify   <- this repo
 plexus       goal decomposition + acceptance loop (imports heart as a library)
 marrow       RL training on heart's exported episodes (separate repo)
 ```
 
 Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
-as a library for reward computation.
+as a library.
+
+## Recovering a CLI session after a usage limit
+
+On Linux, recover an existing Claude Code session without asking Claude for a
+summary. Run from a terminal, using the exact directory Claude was working in:
+
+```bash
+heart handoff --repo /path/to/project
+heart handoff --repo /path/to/project --session CLAUDE_SESSION_ID --launch
+```
+
+The first command writes a private checkpoint and prints its location. It
+does not launch a model or change project files. The second reads the selected
+session's native JSONL transcript, captures current git state including
+untracked files, verifies receipt in a read-only Codex session, and resumes
+that exact Codex thread to continue working. Omit `--session` to select the
+most recently modified transcript whose recorded working directory matches
+`--repo`; use an explicit ID when several tasks share a directory. An exported
+local transcript can be supplied with `--transcript /path/session.jsonl`.
+
+Exit the old Claude CLI before using `--launch`. Partial edits stay in place;
+Heart does not reset, stash, commit, apply patches, or create a new worktree.
+Unfinished tool calls are marked uncertain so the replacement checks their
+actual outcome before repeating them. Parent links preserve the active branch
+of the conversation after a rewind; thinking blocks and raw tool-result bodies
+are excluded. Earlier user requests and the latest compaction summary remain
+in the full checkpoint even when the initial prompt preview must be shortened.
+
+For future sessions, start Claude through the supervisor:
+
+```bash
+heart session --repo /path/to/project "Finish the settings editor"
+heart session --repo /path/to/project --resume CLAUDE_SESSION_ID
+```
+
+This forwards the native terminal UI and supplies session-only checkpoint
+hooks alongside existing Claude hooks. Native transcripts remain the event
+log; structured checkpoints refresh as tool/turn events arrive. A typed
+`StopFailure` event with `error=rate_limit` stops the owned source process
+group, captures a final checkpoint, and performs the Codex handoff. Terminal
+output mentioning a limit does not trigger a switch. Authentication, server,
+and other error classes do not trigger automatic failover. A worktree lock
+prevents concurrent Heart supervisors, and Linux process checks reject a
+replacement while an unmanaged Claude CLI is still running in that directory.
+
+Codex must return the exact packet ID, task ID, and working directory plus a
+next action. Source transcript and worktree fingerprints must still match
+before edits are enabled. Codex continues with `workspace-write` and
+`on-request` approvals; a source in plan mode continues read-only. Source
+CLI-specific tool allow/deny settings are not translated: Codex applies its
+own policy and repository instructions. No permission-bypass flags are used.
+If preflight fails (including Codex being exhausted), the checkpoint remains
+available and no editing session is launched. This first implementation is
+one-way Claude-to-Codex; it does not cycle providers, import subagent sessions,
+or recover a Claude session lacking a local transcript. Automatic detection
+requires a Claude version supporting `StopFailure` and enabled command hooks;
+manual recovery works without those hooks. Existing sessions do not gain
+automatic failover until relaunched through `heart session --resume`.
+
+Checkpoints and local preflight diagnostics contain private task text. They
+live under `~/.vascular/state/heart/handoffs/` (or `$VASCULAR_HOME`), in private
+directories with checkpoints written atomically as mode 0600. Use
+`--directory /private/path` to select a different location outside the working
+tree. Native CLI records retain their own permissions and lifecycle. Read-only
+preflight consumes one Codex turn; it is resumed rather than starting a second
+thread. Heart's model router also treats availability and minimum context as
+hard constraints, including its difficulty fallback.
+
+Without a PATH installation, use `uv run --project /path/to/heart heart ...`
+or the checkout's `.venv/bin/heart` entrypoint.
+
+Episodes carry an outcome (`pass`, `fail`, `blocked`, `path_violation`, ...), not
+a reward. Reward assignment was removed on 2026-10-13 until marrow's link to
+pulse is reworked.
 
 ## What sets it apart
 
@@ -34,10 +108,10 @@ training data:
   (pytest, npm, cargo, go, plus ruff/mypy/tsc/eslint when configured), runs the
   agent's diff on a clean checkout, and scores it. `--apply` lands the change
   only when verification passes and the reviewer approves.
-- **Reward hacking is blocked by construction.** Verification happens on a fresh
+- **Gaming the verifier is blocked by construction.** Verification happens on a fresh
   worktree with only the diff applied; editing a test to make it pass doesn't
   travel. `allowed_paths`/`denied_paths` violations and a secret scanner both
-  zero the reward. `.github/workflows/` is never editable in a work run.
+  fail the episode. `.github/workflows/` is never editable in a work run.
 - **It is an RL environment, not just an orchestrator.** `heart mine` builds
   TaskSpecs from git history, `heart batch --candidates N` is best-of-N that
   doubles as a data engine, and `heart export`/`heart dataset` emit SFT and DPO
@@ -46,10 +120,10 @@ training data:
   `pulse health` (exit code as the alert primitive), a systemd health timer, and
   `pulse serve` — the whole factory floor as one localhost HTML page with live
   episode cards you can steer mid-run, no build step.
-- **Routing that learns.** `--agent auto` scores each model in a manifest against
+- **Routing by declared capability.** `--agent auto` scores each model in a manifest against
   the task's inferred skills, difficulty, and context size, filters to the ones
-  that can actually run it, and picks the cheapest capable match — with declared
-  scores corrected by a measured-reward sidecar so they can't drift unchecked.
+  that can actually run it, and picks the cheapest capable match by declared
+  capability.
 - **Orchestrator-worker over a dependency graph.** A decomposer breaks a task
   into subtasks with `depends_on` edges. Everything with no unmet dependency runs
   at once — each routed to its own model and effort, in its own isolated episode —
@@ -125,8 +199,8 @@ so `local` and `local-think` share one loaded model on one port — a fast
 executor and a thinking planner without a reload. `HEART_API_REASONING=1`
 forces it for a single run. When on, the token floor rises to 4000 so a
 reasoning trace can't consume the whole budget and return an empty answer.
-Point these at the [hot-swap model manager](../plexus/local_model_ideas/) and
-the model behind the fixed port swaps underneath without the profiles changing.
+Put a hot-swap model manager behind the fixed port and the model can change
+underneath without the profiles changing.
 
 CLI agents keep arteries memory/retrieval hooks alive if installed in the
 target repo (episode worktrees carry the repo's `.arteries/` and CLI hook
@@ -147,9 +221,8 @@ A tier is `small`, `mid` or `frontier`. A task demands one — from the difficul
 planner declared, or from a keyword heuristic when it declared none — and a model
 declares one in `models.json` along with the few `skills` it is notably strong or
 weak at, a context window and a difficulty ceiling. `pick` filters to the models
-that can actually run the task, then takes the cheapest capable match, with
-declared scores corrected by a measured-reward sidecar so they cannot drift
-unchecked.
+that can actually run the task, then takes the cheapest capable match by declared
+capability. Nothing measured corrects the declared scores yet.
 
 `defaults` names the model to use when something asks for a tier by name rather
 than by task: a role declaring `"tier": "small"` (the test-writing role does), or
@@ -232,7 +305,7 @@ Four coding-specific mechanisms, composable per run:
   APPROVE/REJECT). Custom pipelines via `--roles roles.json`; each role may set
   its own `agent`, `memory`, `prompt`, `verify_after`.
 - **Candidates** (`--candidates N`): N independent attempts in parallel
-  worktrees, best reward wins. Doubles as the RL data engine.
+  worktrees; a pass wins, ties go to the smallest diff.
 - **Orchestrator-worker** (`orchestrate.py`, Path A/B): a decomposer either keeps
   the task on the sequential role pipeline in one worktree (Path A, the safe
   default for coupled work) or splits it into workers — each run as an isolated
@@ -325,8 +398,8 @@ Operational switches:
   A host the agents need but the list omits is **not** scored. The proxy stamps
   `HEART_EGRESS_DENIED` on every refusal and heart raises on it, because a list
   missing a host is missing it for the whole batch. Without that, a denied host
-  arrived as an ordinary API error and the episode scored `no_change` at reward
-  0.0 — measured. Build the list by running a few episodes and reading the
+  arrived as an ordinary API error and the episode recorded `no_change` —
+  measured. Build the list by running a few episodes and reading the
   proxy's deny lines; Claude Code also reaches for `mcp-proxy.anthropic.com`
   and `http-intake.logs.us5.datadoghq.com`, and the episodes pass without them.
 
@@ -390,10 +463,10 @@ Operational switches:
 
   A refusal on ground the spec permitted emits `sandbox.denied` regardless of
   how the episode ends, and marks the record `scope_suspect` when the episode
-  still scored. The reward is never adjusted for it: the number stands, the
-  doubt is recorded next to it, and the consumer decides.
+  still produced a diff. The outcome is never adjusted for it: the verdict
+  stands, the doubt is recorded next to it, and the consumer decides.
 
-  Containment for accidents and reward hacking, not a boundary against a
+  Containment for accidents and verifier gaming, not a boundary against a
   hostile model: an allowlisted host is still a host, and a determined model
   with something to say can say it to an endpoint you permitted.
 
@@ -414,7 +487,7 @@ Operational switches:
 - **Resume**: `heart batch` skips episodes already recorded in the runs dir's
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
-- **Reward ingest**: after `run`/`work`/`batch`, heart calls `art ingest` on
+- **Episode ingest**: after `run`/`work`/`batch`, heart calls `art episodes` on
   the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
   stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
   re-runs the sweep any time (dedup makes it safe).
@@ -445,7 +518,7 @@ Operational switches:
   all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
 - **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
-  outcome/reward/cost, grouped from `episode.finished` events whose payload
+  outcome/cost, grouped from `episode.finished` events whose payload
   carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
   from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
 - **Steering + episode drill-down** (`pulse serve`): running-episode cards get
@@ -469,7 +542,7 @@ Operational switches:
 - **Guardrails**: `heart work` refuses to hand back or apply dangerous diffs.
   `guard.scan_secrets` scans added lines for AWS keys, private key headers,
   GitHub/Slack tokens, and generic `key/secret/token/password = "..."`
-  assignments — a hit zeroes reward with outcome `guardrail_violation`,
+  assignments — a hit fails the episode with outcome `guardrail_violation`,
   mirroring a path violation. A size fuse in `cmd_work --apply` refuses diffs
   over `HEART_MAX_DIFF_LINES` (default 2000) changed lines unless
   `--allow-large` is passed. `.github/workflows/` is always a denied path in
@@ -485,14 +558,14 @@ Operational switches:
 heart mine ~/some/repo --out tasks/        # TaskSpecs from git history
 heart check-task tasks/foo.json            # verifier determinism gate
 heart batch tasks/ --variants normal:on,clean:on,normal:off,clean:off --repeat 3 --parallel 4
-heart stats                                # pass rate / reward by ablation variant
+heart stats                                # pass rate by ablation variant
 heart export --out episodes.jsonl
 heart dataset sft --out sft.jsonl && heart dataset dpo --out dpo.jsonl
 ```
 
-Reward hacking is blocked structurally: verification happens on a fresh
+Gaming the verifier is blocked structurally: verification happens on a fresh
 worktree with only the agent's diff applied, and `allowed_paths` /
-`denied_paths` violations zero the reward. `tasks/holdout/` is never trained
+`denied_paths` violations fail the episode. `tasks/holdout/` is never trained
 on — it's the evaluation set for marrow checkpoints.
 
 ## Design notes

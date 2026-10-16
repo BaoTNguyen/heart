@@ -1,4 +1,4 @@
-"""End-to-end self-check: toy repo -> episode -> verify -> reward -> export -> datasets.
+"""End-to-end self-check: toy repo -> episode -> verify -> export -> datasets.
 Run: python3 tests/test_heart.py
 """
 from __future__ import annotations
@@ -19,7 +19,6 @@ import contextlib  # noqa: E402
 import io  # noqa: E402
 import os  # noqa: E402
 
-from heart import reward as reward_mod  # noqa: E402
 from heart.agents_api import resolve_config  # noqa: E402
 from heart.cli import main as cli_main  # noqa: E402
 from heart.detect import detect_verifiers  # noqa: E402
@@ -93,7 +92,6 @@ class TestHeart(unittest.TestCase):
     def test_pass_episode(self):
         ep = self.run_ep(FIX_CMD)
         self.assertEqual(ep["outcome"], "pass")
-        self.assertGreater(ep["reward"]["total"], 0.5)
         self.assertTrue((self.runs / ep["episode_id"] / "diff.patch").read_text().strip())
 
     def test_fail_no_change_violation(self):
@@ -101,7 +99,6 @@ class TestHeart(unittest.TestCase):
         self.assertEqual(self.run_ep("true")["outcome"], "no_change")
         ep = self.run_ep("sed -i 's/add(2, 3), 5/add(2, 3), -1/' test_calc.py")
         self.assertEqual(ep["outcome"], "path_violation")
-        self.assertEqual(ep["reward"]["total"], 0.0)
 
     # a real refusal, no container needed: a directory the agent itself made
     # unwritable. What matters is that the refusal reaches the log.
@@ -114,22 +111,20 @@ class TestHeart(unittest.TestCase):
         not starting was recorded nowhere -- and scored as a model failure."""
         ep = self.run_ep(f"{FIX_CMD}; {self._REFUSED}")
         self.assertEqual(ep["outcome"], "pass")
-        self.assertGreater(ep["reward"]["total"], 0.5)  # scored on its merits
         self.assertTrue(ep["scope_suspect"])            # and flagged anyway
         self.assertEqual(ep["scope_refused_paths"], ["locked/out.txt"])
 
-    def test_the_tag_is_for_episodes_that_carry_a_number(self):
-        # scope_denied already says it in the outcome and withholds the reward;
+    def test_the_tag_is_not_repeated_on_scope_denied(self):
+        # scope_denied already says it in the outcome;
         # tagging it too would just be the same fact twice
         ep = self.run_ep(self._REFUSED)
         self.assertEqual(ep["outcome"], "scope_denied")
-        self.assertIsNone(ep["reward"]["total"])
         self.assertFalse(ep["scope_suspect"])
         self.assertEqual(ep["scope_refused_paths"], ["locked/out.txt"])
 
     def test_a_refusal_naming_no_path_is_not_a_scope_problem(self):
-        """scope_denied is unscoreable: it withholds the reward on the grounds
-        that the sandbox refused writes the spec allowed. A refusal that names
+        """scope_denied excuses an episode on the grounds that the sandbox
+        refused writes the spec allowed. A refusal that names
         no path is not that. Codex, unable to write its own config directory
         because a mounted credential made the parent root-owned, produced
         `Permission denied (os error 13)` with no path in it -- and the episode
@@ -138,7 +133,6 @@ class TestHeart(unittest.TestCase):
         ep = self.run_ep("echo 'failed to initialize app-server: Permission denied (os error 13)'")
         self.assertEqual(ep["outcome"], "no_change")
         self.assertEqual(ep["scope_refused_paths"], [])
-        self.assertEqual(ep["reward"]["total"], 0.0)   # scored, not excused
 
     def test_a_forbidden_probe_is_never_reported_as_our_misconfiguration(self):
         # denied_paths is test_calc.py here; a refusal naming it is the agent's
@@ -160,24 +154,21 @@ class TestHeart(unittest.TestCase):
         if shutil.which("claude"):
             self.assertTrue(_agent_version("claude"))
 
-    def test_blocked_outcome_withholds_reward(self):
-        """An agent that declines to guess must not be scored. Without this,
-        reward.compute renormalizes over diff_quality + efficiency — small diff,
-        finished fast — which is precisely what blocking looks like, so a block
-        scored ~0.97 and taught the policy to block instead of work."""
+    def test_blocked_outcome_is_its_own_outcome(self):
+        """An agent that declines to guess is `blocked`, not a tiny diff."""
         task = TaskSpec(**{**self.task.__dict__,
                            "prompt": "echo 'PLEXUS_BLOCKED: sync or async?' > PLEXUS_BLOCKED",
                            "blocked_marker": "PLEXUS_BLOCKED:"})
         ep = run_episode(task, agent="shell", runs_dir=self.runs)
         self.assertEqual(ep["outcome"], "blocked")
         self.assertEqual(ep["blocked_reason"], "sync or async?")
-        self.assertIsNone(ep["reward"]["total"])
+        self.assertNotIn("reward", ep)
         # blocking beats no marker at all: "wrote nothing" and "asked instead of
         # writing" are different events even though both leave a tiny diff
         plain = run_episode(TaskSpec(**{**self.task.__dict__, "prompt": "true"}),
                             agent="shell", runs_dir=self.runs)
         self.assertEqual(plain["outcome"], "no_change")
-        # an unscored episode never wins best-of-N over one with a real score
+        # a pass always wins best-of-N over a non-pass
         self.assertEqual(best_episode([ep, self.run_ep(FIX_CMD)])["outcome"], "pass")
 
     def test_no_verifiers_is_unverified_not_pass(self):
@@ -187,7 +178,6 @@ class TestHeart(unittest.TestCase):
                            "prompt": "echo 'x = 1' > newfile.py"})
         ep = run_episode(task, agent="shell", runs_dir=self.runs)
         self.assertEqual(ep["outcome"], "unverified")
-        self.assertIsNone(ep["reward"]["total"])
 
     def test_guardrails_outrank_a_block(self):
         """A block must not launder a secret past the scanner."""
@@ -263,6 +253,11 @@ class TestHeart(unittest.TestCase):
         eps = run_candidates(self.task, 2, agent="shell", runs_dir=self.runs)
         self.assertEqual(len(eps), 2)
         self.assertEqual(best_episode(eps)["outcome"], "pass")
+        # pass first, then the smallest diff
+        picked = best_episode([{"outcome": "pass", "diff_lines": 9},
+                               {"outcome": "fail", "diff_lines": 1},
+                               {"outcome": "pass", "diff_lines": 3}])
+        self.assertEqual(picked["diff_lines"], 3)
         # parallel candidates run memory-isolated so they can't cross-feed
         for e in eps:
             self.assertEqual(e["env_snapshot"]["ARTERIES_EPHEMERAL"], "discard")
@@ -523,14 +518,6 @@ class TestHeart(unittest.TestCase):
         rows = (self.runs / "summary.csv").read_text().strip().splitlines()
         self.assertEqual(len(rows), 3)
 
-    def test_hidden_reward_weights(self):
-        passed = {"passed": True, "exit_code": 0, "duration_s": 1, "output_tail": ""}
-        failed = {**passed, "passed": False}
-        with_hidden = reward_mod.compute({"unit": passed}, "", 1, 100, hidden_results={"h": failed})
-        without = reward_mod.compute({"unit": passed}, "", 1, 100)
-        self.assertIn("hidden_tests", with_hidden["components"])
-        self.assertLess(with_hidden["total"], without["total"])
-
     def test_path_violations_match_at_boundaries(self):
         from heart.episode import path_violations
         diff = ("diff --git a/src_gen/x.py b/src_gen/x.py\n"
@@ -545,20 +532,6 @@ class TestHeart(unittest.TestCase):
         d2 = ("diff --git a/secretly/x.py b/secretly/x.py\n"
               "--- a/secretly/x.py\n+++ b/secretly/x.py\n@@ -0,0 +1 @@\n+x\n")
         self.assertEqual(path_violations(d2, [], ["secret"]), [])
-
-    def test_efficiency_only_credited_when_all_checks_pass(self):
-        passed = {"passed": True, "exit_code": 0, "duration_s": 1, "output_tail": ""}
-        failed = {**passed, "passed": False}
-        # a fast *failing* episode earns no speed credit — no reward for bailing early
-        self.assertEqual(
-            reward_mod.compute({"unit": failed}, "", 1, 100)["components"]["efficiency"], 0.0)
-        # a fast *passing* episode is rewarded for finishing quickly
-        self.assertGreater(
-            reward_mod.compute({"unit": passed}, "", 1, 100)["components"]["efficiency"], 0.0)
-        # public passes but hidden fails -> not correct -> still no speed credit
-        self.assertEqual(
-            reward_mod.compute({"unit": passed}, "", 1, 100,
-                               hidden_results={"h": failed})["components"]["efficiency"], 0.0)
 
     def test_event_spine(self):
         from heart import pulse
@@ -612,8 +585,6 @@ class TestHeart(unittest.TestCase):
         self.assertIn("Error", crashed[0]["payload"]["error"])
 
     def test_insights_and_health(self):
-        from heart import pulse
-
         self.run_ep(FIX_CMD)
         self.run_ep("sed -i 's/a - b/a * b/' calc.py")
         with contextlib.redirect_stdout(io.StringIO()) as buf:
@@ -982,22 +953,19 @@ class TestSandboxLive(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
-class TestRewardBridge(unittest.TestCase):
-    def test_heart_calls_the_reward_ingest_not_the_document_ingest(self):
+class TestEpisodeBridge(unittest.TestCase):
+    def test_heart_calls_the_episode_ingest_not_the_document_ingest(self):
         """`art ingest` is arteries' document ingester: it globs *.md and embeds
-        what it finds. heart called it for as long as the bridge existed, which
-        did nothing -- runs dirs held no markdown, so no reward was ever
-        ingested and nothing said so. The day heart wrote memory packets to
-        runs/<id>/context/*.md, the glob matched and arteries tried to embed an
-        agent's memory into the corpus as documentation."""
+        what it finds. Pointed at runs/, it would embed an agent's
+        runs/<id>/context/*.md memory packets into the corpus as documentation."""
         import inspect
 
         from heart import cli
 
-        src = inspect.getsource(cli._ingest_rewards)
-        assert '"rewards"' in src, "the reward ledger lives behind `art rewards`"
+        src = inspect.getsource(cli._ingest_episodes)
+        assert '"episodes"' in src, "the episode bridge lives behind `art episodes`"
         assert '"ingest"' not in src.split('"""')[-1], \
-            "`art ingest` embeds documents; it is not the credit-assignment bridge"
+            "`art ingest` embeds documents; it is not the episode bridge"
 
 
 class TestReviewerRotation(unittest.TestCase):
@@ -1618,7 +1586,6 @@ class TestGuardrails(unittest.TestCase):
         )
         ep = run_episode(task, agent="shell", runs_dir=self.runs)
         self.assertEqual(ep["outcome"], "guardrail_violation")
-        self.assertEqual(ep["reward"]["total"], 0.0)
         self.assertTrue(ep["violations"])
 
 
@@ -1742,43 +1709,16 @@ class TestGoalLineage(unittest.TestCase):
         with open(d / "20260101.ndjson", "a") as f:
             f.write(json.dumps(event) + "\n")
 
-    def test_emit_stamps_goal_lineage_from_env(self):
-        from heart.events import emit, journal_dir
-
-        old_goal = os.environ.get("PLEXUS_GOAL_ID")
-        old_feat = os.environ.get("PLEXUS_FEATURE_ID")
-        os.environ["PLEXUS_GOAL_ID"] = "g-env"
-        os.environ["PLEXUS_FEATURE_ID"] = "f-env"
-        try:
-            emit("heart", "episode.started", episode_id="ep-env", task_id="t-env")
-            # explicit payload kwargs are never overwritten by the env stamp
-            emit("heart", "episode.finished", episode_id="ep-env2", goal_id="explicit-g")
-        finally:
-            if old_goal is None:
-                os.environ.pop("PLEXUS_GOAL_ID", None)
-            else:
-                os.environ["PLEXUS_GOAL_ID"] = old_goal
-            if old_feat is None:
-                os.environ.pop("PLEXUS_FEATURE_ID", None)
-            else:
-                os.environ["PLEXUS_FEATURE_ID"] = old_feat
-
-        lines = sorted(journal_dir().glob("*.ndjson"))[0].read_text().splitlines()
-        events = {e["episode_id"]: e for e in map(json.loads, lines) if "episode_id" in e}
-        self.assertEqual(events["ep-env"]["payload"]["goal_id"], "g-env")
-        self.assertEqual(events["ep-env"]["payload"]["feature_id"], "f-env")
-        self.assertEqual(events["ep-env2"]["payload"]["goal_id"], "explicit-g")
-
     def test_goal_timeline_groups_by_feature_then_episode(self):
         from heart import pulse
 
         self._write(ts="2026-01-01T00:00:00+00:00", source="heart", kind="episode.finished",
                     episode_id="ep1", task_id="t1",
-                    payload={"outcome": "pass", "reward": 0.9, "cost_usd": 0.12,
+                    payload={"outcome": "pass", "cost_usd": 0.12,
                              "goal_id": "g1", "feature_id": "f1"})
         self._write(ts="2026-01-01T00:01:00+00:00", source="heart", kind="episode.finished",
                     episode_id="ep2", task_id="t2",
-                    payload={"outcome": "fail", "reward": 0.0, "cost_usd": 0.05,
+                    payload={"outcome": "fail", "cost_usd": 0.05,
                              "goal_id": "g1", "feature_id": "f2"})
         self._write(ts="2026-01-01T00:02:00+00:00", source="heart", kind="episode.finished",
                     episode_id="ep-other", task_id="t3",
@@ -1789,7 +1729,7 @@ class TestGoalLineage(unittest.TestCase):
         self.assertIn("pass=1", lines[0])
         self.assertIn("fail=1", lines[0])
         self.assertTrue(any(
-            "feature f1: episode ep1 outcome=pass reward=0.9 cost=$0.12" in l for l in lines))
+            "feature f1: episode ep1 outcome=pass cost=$0.12" in l for l in lines))
         self.assertTrue(any("feature f2: episode ep2 outcome=fail" in l for l in lines))
         self.assertFalse(any("ep-other" in l for l in lines))
 
@@ -1801,7 +1741,7 @@ class TestGoalLineage(unittest.TestCase):
     def test_cli_pulse_goal(self):
         self._write(ts="2026-01-01T00:00:00+00:00", source="heart", kind="episode.finished",
                     episode_id="ep1", task_id="t1",
-                    payload={"outcome": "pass", "reward": 1.0, "cost_usd": 0.1,
+                    payload={"outcome": "pass", "cost_usd": 0.1,
                              "goal_id": "g2", "feature_id": "f1"})
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             self.assertEqual(cli_main(["pulse", "goal", "g2"]), 0)
@@ -2190,7 +2130,6 @@ class TestProbesAndBaselines(unittest.TestCase):
     def test_failing_probe_blocks_before_the_agent_runs(self):
         ep = self._run(probes=[Verifier(name="pgvector", command="exit 3")])
         self.assertEqual(ep["outcome"], "blocked")
-        self.assertIsNone(ep["reward"]["total"])
         self.assertIn("precondition not met", ep["blocked_reason"])
         # the whole point: nothing was spent
         self.assertEqual(ep["roles"], [])
@@ -2287,7 +2226,7 @@ class TestContextPacketEnv(unittest.TestCase):
 class TestEgressProxyDiscovery(unittest.TestCase):
     """An --internal network without a proxy is unsatisfiable, not merely
     unconfigured. Round one of the sandboxed e2e run spent 250s per role proving
-    that, then recorded it as `no_change` at reward 0.0."""
+    that, then recorded it as `no_change`."""
 
     def setUp(self):
         from heart import sandbox
@@ -2420,8 +2359,7 @@ class TestCodexUsage(unittest.TestCase):
     """Every codex episode logged `usage: {}` and `cost_usd: null`, so a codex
     run was free to the ledger and to every budget that reads it -- while the
     same task on claude:haiku reported $1.45. The CLI does report it, behind
-    --json. (Reward is untouched: `efficiency` is wall-clock against the
-    timeout and never read tokens.)"""
+    --json."""
 
     #: a real stream, trimmed: `codex exec --json -s read-only --model gpt-5.6-luna`
     STREAM = "\n".join([
@@ -2487,3 +2425,4 @@ class TestCodexUsage(unittest.TestCase):
     def test_a_stream_with_no_usage_reports_none_rather_than_zero(self):
         usage, _, _ = self._extract('{"type":"thread.started"}')
         self.assertIsNone(usage["tokens_in"])
+

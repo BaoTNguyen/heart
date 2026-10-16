@@ -37,7 +37,7 @@ def run_verifiers(verifiers: list[Verifier], cwd: str, timeout: int,
     # the whole suite can't exceed HEART_VERIFY_SUITE_TIMEOUT — without it, N
     # verifiers run serially at `timeout` each, so a 4-linter repo can spend 4×
     # the budget in the verify phase. Off by default (unset) to avoid silently
-    # starving a legitimately slow second verifier and flipping its reward.
+    # starving a legitimately slow second verifier and flipping its verdict.
     suite_budget = float(os.environ.get("HEART_VERIFY_SUITE_TIMEOUT", "0") or 0)
     suite_start = time.monotonic()
     results: dict[str, dict] = {}
@@ -96,7 +96,7 @@ def _check_profile(task: TaskSpec, ws_path, journal: str):
 
 def check_task(task: TaskSpec, n: int = 3) -> dict:
     """Run public verifiers n times at base_commit (must be bit-stable) and once
-    at fix_commit if present (must pass). Flaky verifiers poison reward signal."""
+    at fix_commit if present (must pass). Flaky verifiers poison the verdict."""
     runs = []
     # under heart's workspace root, not /tmp: Docker Desktop shares only paths
     # it has been told about, and a bind it will not share fails the container
@@ -126,7 +126,7 @@ def check_task(task: TaskSpec, n: int = 3) -> dict:
                 ws.destroy()
 
     # verifiers that already pass at base make the task worthless as signal:
-    # a no-op diff earns full reward. Baseline verifiers are exempt and must be:
+    # a no-op diff passes. Baseline verifiers are exempt and must be:
     # a measurement command is *meant* to succeed at base -- that run is the
     # number the head run is compared against -- so judging it by the same rule
     # would condemn every task whose criteria are performance rather than

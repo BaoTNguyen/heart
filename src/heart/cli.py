@@ -17,11 +17,11 @@ from . import mine as mine_mod
 from .env import reclaim as env_reclaim
 from . import pulse as pulse_mod
 from . import vascular_paths
-from . import reward as reward_mod
 from .detect import detect_verifiers
 from .events import emit
 from .episode import DEFAULT_ROLES, best_episode, run_candidates, run_episode
 from .export import export_episodes
+from .guard import diff_changed_lines
 from .orchestrate import run_orchestrated
 from .runner import (load_models_json, model_pricing, models_json_path,
                      pricing_provenance, set_model_price)
@@ -58,34 +58,28 @@ def _episode_kwargs(args) -> dict:
     )
 
 
-def _ingest_rewards(runs_dir) -> None:
-    """Best-effort credit-assignment bridge: hand finished episodes to arteries'
-    reward ledger when its CLI is installed. A subprocess, not an import — heart
-    stays stdlib-only and works fine without arteries. HEART_INGEST=off skips.
+def _ingest_episodes(runs_dir) -> None:
+    """Best-effort bridge: hand finished episodes to arteries (`art episodes`),
+    which closes their rows, records their memory and tells capillaries how its
+    suggestions turned out. A subprocess, not an import — heart stays
+    stdlib-only and works fine without arteries. HEART_INGEST=off skips.
 
-    `art rewards`, not `art ingest`. `ingest` is arteries' *document* ingester:
-    it globs `*.md` and embeds what it finds as project documents. This called
-    it for as long as it has existed, which did nothing at all -- runs
-    directories held no markdown, so no episode reward was ever ingested and
-    nothing said so. The day heart started writing retrieved-memory packets to
-    `runs/<id>/context/*.md`, the glob matched and arteries tried to embed an
-    agent's memory back into the corpus as documentation.
-
-    A wrong subcommand that silently succeeds is worse than one that fails:
-    this one looked healthy for months by doing nothing.
+    Never `art ingest`: that is arteries' *document* ingester, which globs
+    `*.md` and would embed an agent's `runs/<id>/context/*.md` memory packets
+    back into the corpus as documentation.
     """
     art = shutil.which("art")
     if not art or os.environ.get("HEART_INGEST") == "off":
         return
     try:
         proc = subprocess.run(
-            [art, "rewards", str(runs_dir)], capture_output=True, text=True, timeout=120,
+            [art, "episodes", str(runs_dir)], capture_output=True, text=True, timeout=120,
         )
         tail = (proc.stdout + proc.stderr).strip().splitlines()
         if tail:
-            print(f"art rewards: {tail[-1]}")
-    except Exception as exc:  # rewards can always be re-ingested later
-        print(f"art rewards skipped: {exc}", file=sys.stderr)
+            print(f"art episodes: {tail[-1]}")
+    except Exception as exc:  # episodes can always be re-ingested later
+        print(f"art episodes skipped: {exc}", file=sys.stderr)
 
 
 def cmd_run(args) -> int:
@@ -97,8 +91,8 @@ def cmd_run(args) -> int:
                               agent_cmd=args.agent_cmd,
                               roles=None if getattr(args, "solo", False) else DEFAULT_ROLES)
         print(json.dumps({k: ep[k] for k in
-                          ("episode_id", "task_id", "outcome", "reward")}, indent=2))
-        _ingest_rewards(args.runs_dir)
+                          ("episode_id", "task_id", "outcome", "diff_lines")}, indent=2))
+        _ingest_episodes(args.runs_dir)
         return 0 if ep["outcome"] == "pass" else 1
     eps = run_candidates(
         task, args.candidates,
@@ -108,9 +102,9 @@ def cmd_run(args) -> int:
     ep = best_episode(eps)
     if len(eps) > 1:
         for e in eps:
-            print(f"  candidate {e['episode_id']}: {e['outcome']} reward={e['reward']['total']}")
-    print(json.dumps({k: ep[k] for k in ("episode_id", "task_id", "outcome", "reward")}, indent=2))
-    _ingest_rewards(args.runs_dir)
+            print(f"  candidate {e['episode_id']}: {e['outcome']} diff_lines={e['diff_lines']}")
+    print(json.dumps({k: ep[k] for k in ("episode_id", "task_id", "outcome", "diff_lines")}, indent=2))
+    _ingest_episodes(args.runs_dir)
     return 0 if ep["outcome"] == "pass" else 1
 
 
@@ -162,9 +156,9 @@ def cmd_work(args) -> int:
         ep = best_episode(run_candidates(task, args.candidates, **kwargs))
 
     ep_dir = Path(args.runs_dir) / ep["episode_id"]
-    print(json.dumps({k: ep[k] for k in ("episode_id", "outcome", "review_verdict", "reward")}, indent=2))
+    print(json.dumps({k: ep[k] for k in ("episode_id", "outcome", "review_verdict", "diff_lines")}, indent=2))
     print(f"diff: {ep_dir / 'diff.patch'}  logs: {ep_dir}/")
-    _ingest_rewards(args.runs_dir)
+    _ingest_episodes(args.runs_dir)
 
     if not args.apply:
         return 0 if ep["outcome"] == "pass" else 1
@@ -173,7 +167,7 @@ def cmd_work(args) -> int:
         return 1
     diff = (ep_dir / "diff.patch").read_text()
     max_lines = int(os.environ.get("HEART_MAX_DIFF_LINES", "2000"))
-    changed = reward_mod.diff_changed_lines(diff)
+    changed = diff_changed_lines(diff)
     if changed > max_lines and not args.allow_large:
         print(f"refusing to apply: diff changes {changed} lines (limit {max_lines}); "
               f"pass --allow-large to override")
@@ -214,7 +208,7 @@ def cmd_batch(args) -> int:
     with open(summary_path, "a", newline="") as f:
         writer = csv.writer(f)
         if new_file:
-            writer.writerow(["episode_id", "task_id", "memory", "retrieval", "repeat", "outcome", "reward"])
+            writer.writerow(["episode_id", "task_id", "memory", "retrieval", "repeat", "outcome"])
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
             futures = {
                 pool.submit(run_episode, task, memory_mode=mem, retrieval=ret, **kwargs):
@@ -237,23 +231,23 @@ def cmd_batch(args) -> int:
                     continue
                 emit("heart", "batch.progress", task_id=task.task_id,
                      done=done, total=len(jobs), outcome=ep["outcome"])
-                row = [ep["episode_id"], task.task_id, mem, ret, i, ep["outcome"], ep["reward"]["total"]]
+                row = [ep["episode_id"], task.task_id, mem, ret, i, ep["outcome"]]
                 writer.writerow(row)
                 f.flush()
                 print(",".join(str(x) for x in row))
     print(f"summary: {summary_path}")
-    _ingest_rewards(args.runs_dir)
+    _ingest_episodes(args.runs_dir)
     return 0
 
 
 def cmd_ingest(args) -> int:
-    """Reconciliation sweep: re-run reward ingest over a runs dir. `art ingest`
+    """Reconciliation sweep: re-run episode ingest over a runs dir. Arteries
     dedups by episode_id, so this is safe to run any time the best-effort
     per-run ingest may have missed episodes (Postgres down, art off PATH)."""
     if not shutil.which("art"):
         print("art CLI not on PATH; nothing ingested", file=sys.stderr)
         return 1
-    _ingest_rewards(args.runs_dir)
+    _ingest_episodes(args.runs_dir)
     return 0
 
 
@@ -404,8 +398,7 @@ def cmd_pulse(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    """Pass rates and mean reward grouped by ablation variant — the credit-
-    assignment view the whole exercise exists for."""
+    """Pass rates grouped by ablation variant."""
     groups: dict[str, list[dict]] = defaultdict(list)
     outcomes: dict[str, int] = defaultdict(int)
     for ep_file in sorted(Path(args.runs_dir).glob("*/episode.json")):
@@ -416,15 +409,11 @@ def cmd_stats(args) -> int:
     if not groups:
         print(f"no episodes under {args.runs_dir}")
         return 1
-    print(f"{'variant':<22}{'n':>4}{'pass%':>8}{'mean reward':>13}")
+    print(f"{'variant':<22}{'n':>4}{'pass%':>8}")
     for key in sorted(groups):
         eps = groups[key]
         passed = sum(e["outcome"] == "pass" for e in eps)
-        # blocked/unverified episodes carry no reward; averaging them in as 0
-        # would drag the mean down for episodes that were never scored at all
-        scored = [e["reward"]["total"] for e in eps if e["reward"]["total"] is not None]
-        mean_r = sum(scored) / len(scored) if scored else float("nan")
-        print(f"{key:<22}{len(eps):>4}{100 * passed / len(eps):>7.0f}%{mean_r:>13.3f}")
+        print(f"{key:<22}{len(eps):>4}{100 * passed / len(eps):>7.0f}%")
     print("outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
     return 0
 
@@ -486,6 +475,8 @@ def cmd_dataset(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="heart")
     sub = parser.add_subparsers(dest="command", required=True)
+    from .handoff import add_commands as add_handoff_commands
+    add_handoff_commands(sub)
 
     def add_agent_flags(p):
         p.add_argument(
@@ -548,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--parallel", type=int, default=1, help="episodes to run concurrently")
     p.set_defaults(func=cmd_batch)
 
-    p = sub.add_parser("stats", help="pass rate / mean reward by ablation variant")
+    p = sub.add_parser("stats", help="pass rate by ablation variant")
     p.add_argument("--runs-dir", default="runs")
     p.set_defaults(func=cmd_stats)
 
@@ -583,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="YYYY-MM-DD a scheduled change takes effect")
     p.set_defaults(func=cmd_models)
 
-    p = sub.add_parser("ingest", help="re-run reward ingest over a runs dir (safe: dedup)")
+    p = sub.add_parser("ingest", help="re-run episode ingest into arteries over a runs dir (safe: dedup)")
     p.add_argument("runs_dir", nargs="?", default=str(work_runs_dir()))
     p.set_defaults(func=cmd_ingest)
 
