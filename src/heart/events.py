@@ -27,6 +27,9 @@ def emit(
     task_id: str | None = None,
     role: str | None = None,
     duration_ms: int | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
+    trace_id: str | None = None,
     **payload,
 ) -> None:
     try:
@@ -46,6 +49,8 @@ def emit(
         pulse_emit.emit(
             source, kind, journal_dir(), vascular_paths.path("state", "pulse", "contexts"),
             episode_id=episode_id, task_id=task_id, role=role, duration_ms=duration_ms,
+            # None defers to pulse_emit's $PULSE_TRACE_ID/$PULSE_PARENT_SPAN fallback
+            span_id=span_id, parent_span_id=parent_span_id, trace_id=trace_id,
             # top-level copies are what pulse queries by; None (never "") drops the key
             goal_id=payload.get("goal_id") or None, feature_id=payload.get("feature_id") or None,
             payload=payload or None,
