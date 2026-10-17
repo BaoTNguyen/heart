@@ -2426,3 +2426,34 @@ class TestCodexUsage(unittest.TestCase):
         usage, _, _ = self._extract('{"type":"thread.started"}')
         self.assertIsNone(usage["tokens_in"])
 
+
+
+def _trace_span_journal(monkeypatch, tmp_path):
+    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path / "events"))
+    monkeypatch.setenv("VASCULAR_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PULSE_TRACE_ID", raising=False)
+    monkeypatch.delenv("PULSE_PARENT_SPAN", raising=False)
+    return tmp_path / "events"
+
+
+def _trace_span_lines(journal, kind):
+    return [ev for f in journal.glob("*.ndjson") for line in f.read_text().splitlines()
+            if (ev := json.loads(line))["kind"] == kind]
+
+
+def test_trace_span_emit_envelope_fields(monkeypatch, tmp_path):
+    from heart import events
+    journal = _trace_span_journal(monkeypatch, tmp_path)
+    events.emit("heart", "x.started", span_id="s1", parent_span_id="p1", trace_id="t1")
+    [ev] = _trace_span_lines(journal, "x.started")
+    assert (ev["span_id"], ev["parent_span_id"], ev["trace_id"]) == ("s1", "p1", "t1")
+    for key in ("span_id", "parent_span_id", "trace_id"):
+        assert key not in ev.get("payload", {})
+
+
+def test_trace_span_emit_absent_by_default(monkeypatch, tmp_path):
+    from heart import events
+    journal = _trace_span_journal(monkeypatch, tmp_path)
+    events.emit("heart", "x.plain")
+    [ev] = _trace_span_lines(journal, "x.plain")
+    assert not {"span_id", "parent_span_id", "trace_id"} & ev.keys()
