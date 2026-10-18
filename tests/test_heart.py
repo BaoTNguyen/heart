@@ -2526,3 +2526,34 @@ def test_trace_span_emit_absent_by_default(monkeypatch, tmp_path):
     events.emit("heart", "x.plain")
     [ev] = _trace_span_lines(journal, "x.plain")
     assert not {"span_id", "parent_span_id", "trace_id"} & ev.keys()
+
+
+def test_trace_span_sandbox_env(monkeypatch, tmp_path):
+    from heart import episode
+    monkeypatch.setenv("HEART_SANDBOX", episode.SANDBOX_MODE)
+    monkeypatch.setenv("PULSE_TRACE_ID", "t1")
+    monkeypatch.setenv("PULSE_PARENT_SPAN", "ep-span")
+    monkeypatch.setenv("PULSE_PROJECT", "heart")
+    monkeypatch.setenv("PULSE_SECRET_X", "nope")
+    monkeypatch.setenv("ARTERIES_FOO", "bar")
+    captured = []
+    monkeypatch.setattr(episode.sandbox, "inbox_for", lambda key: tmp_path / "inbox")
+    monkeypatch.setattr(episode.sandbox, "profile_for",
+                        lambda *a, env, **k: captured.append(env))
+    monkeypatch.setattr(episode.sandbox, "verifier_profile_for",
+                        lambda *a, env, **k: captured.append(env))
+    task = TaskSpec(task_id="t", repo_path=str(tmp_path), base_commit="HEAD", prompt="p")
+
+    episode._sandbox_profiles(task, tmp_path, "ep1", tmp_path / "out")
+    assert len(captured) == 2
+    for env in captured:
+        assert env == {"PULSE_TRACE_ID": "t1", "PULSE_PARENT_SPAN": "ep-span",
+                       "PULSE_PROJECT": "heart", "ARTERIES_FOO": "bar"} | {
+            k: v for k, v in os.environ.items() if k.startswith("ARTERIES_")}
+        assert "PULSE_SECRET_X" not in env
+
+    captured.clear()
+    monkeypatch.setenv("PULSE_PROJECT", "")
+    episode._sandbox_profiles(task, tmp_path, "ep1", tmp_path / "out")
+    assert captured and all("PULSE_PROJECT" not in env and env["PULSE_TRACE_ID"] == "t1"
+                            for env in captured)
