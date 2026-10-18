@@ -221,6 +221,75 @@ class TestHeart(unittest.TestCase):
         self.assertEqual([r["role"] for r in ep["roles"]], ["implement", "review.1"])
         self.assertEqual(ep["roles"][1]["memory"], "readonly")
 
+    def _trace_span_episode_env(self, **extra):
+        """A clean trace environment: no inherited trace or parent span."""
+        env = {"EVENT_JOURNAL_DIR": str(self.root / "journal"),
+               "VASCULAR_HOME": str(self.root / "vh"), **extra}
+        patch = unittest.mock.patch.dict(os.environ, env)
+        patch.start()
+        self.addCleanup(patch.stop)
+        if not extra:
+            os.environ.pop("PULSE_TRACE_ID", None)
+            os.environ.pop("PULSE_PARENT_SPAN", None)
+
+    def _trace_span_episode_lines(self, episode_id=None):
+        lines = [json.loads(line) for f in sorted((self.root / "journal").glob("*.ndjson"))
+                 for line in f.read_text().splitlines() if line.strip()]
+        return [e for e in lines if episode_id is None or e.get("episode_id") == episode_id]
+
+    _TRACE_ROLES = [{"name": "implement", "prompt": "{prompt}"},
+                    {"name": "review", "agent": "shell",
+                     "prompt": "echo APPROVE looks-correct"}]
+
+    def test_trace_span_episode_standalone(self):
+        import re
+        self._trace_span_episode_env()
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=self._TRACE_ROLES)
+        lines = self._trace_span_episode_lines(ep["episode_id"])
+        traces = {e.get("trace_id") for e in lines}
+        self.assertEqual(len(traces), 1)
+        self.assertRegex(traces.pop(), r"^[0-9a-f]{32}$")
+        by_kind = {}
+        for e in lines:
+            by_kind.setdefault(e["kind"], []).append(e)
+        started, = by_kind["episode.started"]
+        finished, = by_kind["episode.finished"]
+        span = started["span_id"]
+        self.assertEqual(finished["span_id"], span)
+        self.assertNotIn("parent_span_id", started)
+        self.assertNotIn("parent_span_id", finished)
+        role_done = {e["span_id"]: e for e in by_kind["role.finished"]}
+        self.assertTrue(by_kind["role.started"])
+        for e in by_kind["role.started"]:
+            self.assertEqual(e["parent_span_id"], span)
+            self.assertEqual(role_done[e["span_id"]]["parent_span_id"], span)
+        for e in lines:
+            if not re.match(r"episode\.|route\.decided$", e["kind"]):
+                self.assertEqual(e.get("parent_span_id"), span, e["kind"])
+        self.assertNotIn("PULSE_TRACE_ID", os.environ)
+        self.assertNotIn("PULSE_PARENT_SPAN", os.environ)
+
+    def test_trace_span_episode_under_parent(self):
+        self._trace_span_episode_env(PULSE_TRACE_ID="t-outer", PULSE_PARENT_SPAN="p-outer")
+        ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=self._TRACE_ROLES)
+        lines = self._trace_span_episode_lines(ep["episode_id"])
+        self.assertTrue(lines)
+        self.assertEqual({e.get("trace_id") for e in lines}, {"t-outer"})
+        started, = [e for e in lines if e["kind"] == "episode.started"]
+        self.assertEqual(started["parent_span_id"], "p-outer")
+        self.assertEqual(os.environ["PULSE_TRACE_ID"], "t-outer")
+        self.assertEqual(os.environ["PULSE_PARENT_SPAN"], "p-outer")
+
+    def test_trace_span_episode_failed_restores_env(self):
+        self._trace_span_episode_env()
+        bad = TaskSpec(**{**self.task.__dict__, "repo_path": str(self.root / "nonexistent")})
+        with self.assertRaises((RuntimeError, OSError)):
+            run_episode(bad, agent="shell", runs_dir=self.runs)
+        failed, = [e for e in self._trace_span_episode_lines() if e["kind"] == "episode.failed"]
+        self.assertTrue(failed.get("span_id"))
+        self.assertNotIn("PULSE_TRACE_ID", os.environ)
+        self.assertNotIn("PULSE_PARENT_SPAN", os.environ)
+
     def test_a_prompt_without_findings_falls_back_to_the_verdict_word(self):
         # a --roles file written before findings existed keeps working: no JSON
         # means the legacy APPROVE/REJECT read, not a silent approval.
