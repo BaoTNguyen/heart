@@ -25,6 +25,7 @@ import uuid
 from pathlib import Path
 
 from . import review as review_mod
+from . import pulse_emit
 from . import routing
 from .env import Workspace
 from .events import emit
@@ -306,6 +307,9 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
     Returning None outside docker mode is what keeps HEART_SANDBOX=off
     untouched -- sandbox_wrap returns the command unchanged when no profile
     arrives and no sandbox was asked for.
+
+    What reaches the container's env: ARTERIES_* plus PULSE_TRACE_ID,
+    PULSE_PARENT_SPAN and PULSE_PROJECT.
     """
     if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
         return None, None
@@ -316,6 +320,12 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
     context.mkdir(parents=True, exist_ok=True)
     inbox = sandbox.inbox_for(episode_id)
     env = {k: v for k, v in os.environ.items() if k.startswith("ARTERIES_")}
+    # These are ids, not secrets -- hence a literal tuple, never a PULSE_ prefix match.
+    # Profiles are built once per episode while PULSE_PARENT_SPAN is the episode
+    # span, so every container event parents to the episode span, not to a role span.
+    for name in ("PULSE_TRACE_ID", "PULSE_PARENT_SPAN", "PULSE_PROJECT"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
     return (
         sandbox.profile_for(task, ws_path, context, inbox, env=env),
         sandbox.verifier_profile_for(task, ws_path, inbox, env=env),
@@ -517,7 +527,7 @@ def _scope_note(task: TaskSpec) -> str:
 def _agent_turn(
     role: str, agent: str, prompt: str, ws: Workspace, env: dict,
     task: TaskSpec, out: Path, agent_cmd: str | None, runs_log: list[dict],
-    memory: str | None = None, profile=None,
+    memory: str | None = None, profile=None, span_id: str | None = None,
 ) -> dict:
     """One agent invocation: run, record in runs_log, emit role.finished."""
     r = run_agent(
@@ -528,8 +538,10 @@ def _agent_turn(
     runs_log.append(
         {"role": role, "agent": agent, **({"memory": memory} if memory else {}), **r}
     )
+    # fix-loop and review turns have no role.started; they still get a span
+    span_id = span_id or pulse_emit.new_span()
     emit("heart", "role.finished", episode_id=env.get("ARTERIES_EPISODE_ID"),
-         task_id=task.task_id, role=role, duration_ms=int(r["duration_s"] * 1000),
+         task_id=task.task_id, role=role, span_id=span_id, duration_ms=int(r["duration_s"] * 1000),
          agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"],
          tokens_in=r.get("tokens_in"), tokens_out=r.get("tokens_out"),
          cache_read=r.get("cache_read"), cache_write_5m=r.get("cache_write_5m"),
@@ -599,17 +611,36 @@ def run_episode(
         agent = choice.agent
         if escalate is None:
             escalate = routing.resolve("frontier", default=agent)
+    # ponytail: process-global env, safe because one episode runs per process
+    # in this path. run_candidates' thread pool (n>1) shares os.environ and can
+    # mis-parent concurrent candidates' events; contextvars passed to
+    # events.emit are the upgrade if episodes ever run concurrently in one process.
+    prev_trace = os.environ.get("PULSE_TRACE_ID")
+    prev_parent = os.environ.get("PULSE_PARENT_SPAN")
+    if not prev_trace:
+        os.environ["PULSE_TRACE_ID"] = os.urandom(16).hex()
+    ep_span = pulse_emit.new_span()
     try:
         return _run_episode(
             task, agent, memory_mode, retrieval, agent_cmd, roles,
             fix_rounds, escalate, episode_id, out, routed, isolated,
-            parent_agent_id, review_rounds,
+            parent_agent_id, review_rounds, ep_span=ep_span,
         )
     except Exception as exc:
         # a crash must be a visible error signal, not a silent gap in the journal
         emit("heart", "episode.failed", episode_id=episode_id, task_id=task.task_id,
-             error=f"{type(exc).__name__}: {exc}")
+             span_id=ep_span, error=f"{type(exc).__name__}: {exc}")
         raise
+    finally:
+        # backstop: _run_episode restores the parent itself unless it died early
+        if prev_trace:
+            os.environ["PULSE_TRACE_ID"] = prev_trace
+        else:
+            os.environ.pop("PULSE_TRACE_ID", None)
+        if prev_parent is None:
+            os.environ.pop("PULSE_PARENT_SPAN", None)
+        else:
+            os.environ["PULSE_PARENT_SPAN"] = prev_parent
 
 
 def _subagent_env(parent_agent_id: str) -> dict[str, str]:
@@ -673,7 +704,7 @@ def _run_episode(
     agent_cmd: str | None, roles: list[dict] | None,
     fix_rounds: int, escalate: str | None, episode_id: str, out: Path,
     routed: bool = False, isolated: bool = False, parent_agent_id: str | None = None,
-    review_rounds: int = 1,
+    review_rounds: int = 1, ep_span: str | None = None,
 ) -> dict:
     roles = _normalize_roles(roles)
     repo = Path(task.repo_path).resolve()
@@ -686,403 +717,415 @@ def _run_episode(
     env.update(_memory_env(memory_mode, retrieval, isolated, parent_agent_id))
 
     emit("heart", "episode.started", episode_id=episode_id, task_id=task.task_id,
-         agent=agent, memory_mode=memory_mode, retrieval=retrieval,
+         span_id=ep_span, agent=agent, memory_mode=memory_mode, retrieval=retrieval,
          base_commit=task.base_commit[:12], fix_rounds=fix_rounds,
          pipeline=[r["name"] for r in roles] if roles else "solo")
-    ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
-    agent_profile, verifier_profile = _sandbox_profiles(task, ws.path, episode_id, out)
-    # Before anything is planned or written. A failed probe stops the episode
-    # here, where it costs one command instead of a full build that discovers
-    # the same fact by crashing into it.
-    probe_failure, probe_facts = run_probes(task.probes, str(ws.path),
-                                            task.timeout_seconds, profile=agent_profile)
-    if task.probes:
-        emit("heart", "probes.finished", episode_id=episode_id, task_id=task.task_id,
-             count=len(task.probes), blocked=bool(probe_failure), reason=probe_failure)
-    if probe_facts:
-        # Onto the task, so every downstream prompt -- roles, fix loop, review --
-        # sees the same measurements without threading an argument through each.
-        # The recorded prompt carries them too: what the agent was told is what
-        # the episode should be reproducible from.
-        task = dataclasses.replace(task, prompt=task.prompt + probe_facts)
-    clean = None
-    runs_log: list[dict] = []
-    verify_rounds: list[dict] = []
-    review_verdict: str | None = None
-    verifier_results: dict[str, dict] = {}
-    hidden_results: dict[str, dict] = {}
-    blocked_reason: str | None = None
-    scope_refused: list[str] = []
-    packets: list[dict] = []
-    reviewer: str | None = None   # whatever the review role resolved to
-    review_findings: list = []    # what the reviewer found, whatever the verdict
-    # Every path any role was actually permitted to write. path_violations reads
-    # the finished diff and cannot see which role produced a hunk, so it has to
-    # judge against the union -- otherwise the mount table lets the test role
-    # write tests/ and the diff scan then scores the episode a violation for
-    # doing exactly what heart allowed. Two layers enforcing one policy have to
-    # agree on what the policy is.
-    effective_allowed: list[str] = list(task.allowed_paths)
-    diff = ""
-    can_fix = fix_rounds > 0 and bool(task.public_verifiers)
-    implement_blocked: str | None = None
+    # ponytail: process-global env, see the note in run_episode
+    prev_parent = os.environ.get("PULSE_PARENT_SPAN")
+    if ep_span:
+        os.environ["PULSE_PARENT_SPAN"] = ep_span
     try:
-        pipeline = [] if probe_failure else (roles or [
-            {"name": "solo", "memory": memory_mode,
-             "verify_after": can_fix, "prompt": "{prompt}"}])
-        for i, role in enumerate(pipeline):
-            role_env = dict(env)
-            mem = role.get("memory", memory_mode)
-            role_env.pop("ARTERIES_MEMORY", None)
-            if mem != "normal":
-                role_env["ARTERIES_MEMORY"] = mem
-            # A role's declared tier is honoured whether or not the goal asked
-            # for routing: `"tier": "small"` on the test role was silently ignored
-            # under an explicit --agent, so the config said cheap and never was.
-            role_agent = role.get("agent") or (
-                routing.resolve(role["tier"], default=agent)
-                if role.get("tier") else agent
-            )
-            # a role that declares extra paths gets its own mount table: the
-            # scope is per subtask, and the test writer needs somewhere the
-            # implementer does not
-            role_profile, role_task = agent_profile, task
-            # Only widen a scope that exists. An empty task.allowed_paths means
-            # "no restriction", so unioning a role's paths into it does not widen
-            # anything -- it invents a restriction out of nothing, and every path
-            # outside tests/ becomes a violation. That made `heart work` (and any
-            # plexus feature with pipeline = true) score path_violation for
-            # editing the file it was asked to edit, while the same task run solo
-            # passed.
-            if role.get("allowed_paths") and task.allowed_paths:
-                # role_task carries the widened scope so the scope note in the
-                # prompt matches the mount table. Telling an agent it may not
-                # write where it can is how you get a test role that never tries.
-                role_task = dataclasses.replace(
-                    task, allowed_paths=list(dict.fromkeys(
-                        list(task.allowed_paths) + list(role["allowed_paths"]))))
-                if agent_profile is not None:
-                    role_profile, _ = _sandbox_profiles(
-                        role_task, ws.path, episode_id, out)
-                effective_allowed = list(dict.fromkeys(
-                    effective_allowed + list(role["allowed_paths"])))
-            if role.get("review") and not role.get("agent"):
-                # a reviewer must not be the family that wrote the code: the
-                # same lineage brings the same blind spots to finding the bug it
-                # brought to writing it. An explicit `agent` on the role still
-                # wins -- this only fills in what nobody chose.
-                role_agent = review_mod.review_agent(role_agent)
-            if role.get("review"):
-                reviewer = role_agent
-            if role.get("review"):
-                # the review role's turns are run by review.phase below, which
-                # owns the assess/resolve/confirm sequence and its prompts
-                reviewer = role_agent
-                continue
-            prompt = role["prompt"].format(prompt=task.prompt)
-            packet = {"role": role["name"],
-                      **_context_packet(task, role["name"], mem, out, episode_id)}
-            packets.append(packet)
-            # Into the prompt, not just onto disk. /context was mounted read-only
-            # and filled for three turns before anyone noticed the agent never
-            # read it -- an `api:` agent does not go looking, so retrieval was
-            # being paid for and thrown away.
-            prompt += _retrieved_note(packet)
-            steer = _consume_steer(out)
-            if steer:
-                prompt += f"\n\nOperator note (mid-run steer): {steer}"
-                emit("heart", "steer.received", episode_id=episode_id, task_id=task.task_id,
-                     chars=len(steer))
-            emit("heart", "role.started", episode_id=episode_id, task_id=task.task_id,
-                 role=role["name"], agent=role_agent, memory=mem)
-            _agent_turn(role["name"], role_agent, prompt,
-                        ws, role_env, role_task, out, agent_cmd, runs_log,
-                        memory=mem, profile=role_profile)
-            marker = ws.path / BLOCKED_FILE
-            if role["name"] == "implement" and marker.is_file():
-                implement_blocked = _blocked_reason(
-                    marker.read_text(errors="replace"), BLOCKED_FILE + ":"
-                ) or "(no reason given)"
-                runs_log.extend({"role": r["name"], "skipped": True,
-                                 "reason": "implement blocked"}
-                                for r in pipeline[i + 1:])
-                break
-            if role.get("verify_after") and can_fix:
-                verify_rounds = _fix_loop(
-                    task, ws, out, agent, env, fix_rounds, escalate, agent_cmd, runs_log,
-                    agent_profile, verifier_profile
+        ws = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
+        agent_profile, verifier_profile = _sandbox_profiles(task, ws.path, episode_id, out)
+        # Before anything is planned or written. A failed probe stops the episode
+        # here, where it costs one command instead of a full build that discovers
+        # the same fact by crashing into it.
+        probe_failure, probe_facts = run_probes(task.probes, str(ws.path),
+                                                task.timeout_seconds, profile=agent_profile)
+        if task.probes:
+            emit("heart", "probes.finished", episode_id=episode_id, task_id=task.task_id,
+                 count=len(task.probes), blocked=bool(probe_failure), reason=probe_failure)
+        if probe_facts:
+            # Onto the task, so every downstream prompt -- roles, fix loop, review --
+            # sees the same measurements without threading an argument through each.
+            # The recorded prompt carries them too: what the agent was told is what
+            # the episode should be reproducible from.
+            task = dataclasses.replace(task, prompt=task.prompt + probe_facts)
+        clean = None
+        runs_log: list[dict] = []
+        verify_rounds: list[dict] = []
+        review_verdict: str | None = None
+        verifier_results: dict[str, dict] = {}
+        hidden_results: dict[str, dict] = {}
+        blocked_reason: str | None = None
+        scope_refused: list[str] = []
+        packets: list[dict] = []
+        reviewer: str | None = None   # whatever the review role resolved to
+        review_findings: list = []    # what the reviewer found, whatever the verdict
+        # Every path any role was actually permitted to write. path_violations reads
+        # the finished diff and cannot see which role produced a hunk, so it has to
+        # judge against the union -- otherwise the mount table lets the test role
+        # write tests/ and the diff scan then scores the episode a violation for
+        # doing exactly what heart allowed. Two layers enforcing one policy have to
+        # agree on what the policy is.
+        effective_allowed: list[str] = list(task.allowed_paths)
+        diff = ""
+        can_fix = fix_rounds > 0 and bool(task.public_verifiers)
+        implement_blocked: str | None = None
+        try:
+            pipeline = [] if probe_failure else (roles or [
+                {"name": "solo", "memory": memory_mode,
+                 "verify_after": can_fix, "prompt": "{prompt}"}])
+            for i, role in enumerate(pipeline):
+                role_env = dict(env)
+                mem = role.get("memory", memory_mode)
+                role_env.pop("ARTERIES_MEMORY", None)
+                if mem != "normal":
+                    role_env["ARTERIES_MEMORY"] = mem
+                # A role's declared tier is honoured whether or not the goal asked
+                # for routing: `"tier": "small"` on the test role was silently ignored
+                # under an explicit --agent, so the config said cheap and never was.
+                role_agent = role.get("agent") or (
+                    routing.resolve(role["tier"], default=agent)
+                    if role.get("tier") else agent
                 )
-        review_role = next((r for r in (roles or []) if r.get("review")), None)
-        if probe_failure or implement_blocked:
-            review_role = None  # nothing was written; there is nothing to review
-        if review_role is not None:
-            # Three jobs, each named for what it reads: assess reads the diff,
-            # resolve reads the findings, confirm reads the findings plus what
-            # the fixer claims it did. The verdict is derived from severities,
-            # so a reviewer cannot reject in prose and approve on the last line.
-            review_memory = review_role.get("memory", "readonly")
+                # a role that declares extra paths gets its own mount table: the
+                # scope is per subtask, and the test writer needs somewhere the
+                # implementer does not
+                role_profile, role_task = agent_profile, task
+                # Only widen a scope that exists. An empty task.allowed_paths means
+                # "no restriction", so unioning a role's paths into it does not widen
+                # anything -- it invents a restriction out of nothing, and every path
+                # outside tests/ becomes a violation. That made `heart work` (and any
+                # plexus feature with pipeline = true) score path_violation for
+                # editing the file it was asked to edit, while the same task run solo
+                # passed.
+                if role.get("allowed_paths") and task.allowed_paths:
+                    # role_task carries the widened scope so the scope note in the
+                    # prompt matches the mount table. Telling an agent it may not
+                    # write where it can is how you get a test role that never tries.
+                    role_task = dataclasses.replace(
+                        task, allowed_paths=list(dict.fromkeys(
+                            list(task.allowed_paths) + list(role["allowed_paths"]))))
+                    if agent_profile is not None:
+                        role_profile, _ = _sandbox_profiles(
+                            role_task, ws.path, episode_id, out)
+                    effective_allowed = list(dict.fromkeys(
+                        effective_allowed + list(role["allowed_paths"])))
+                if role.get("review") and not role.get("agent"):
+                    # a reviewer must not be the family that wrote the code: the
+                    # same lineage brings the same blind spots to finding the bug it
+                    # brought to writing it. An explicit `agent` on the role still
+                    # wins -- this only fills in what nobody chose.
+                    role_agent = review_mod.review_agent(role_agent)
+                if role.get("review"):
+                    reviewer = role_agent
+                if role.get("review"):
+                    # the review role's turns are run by review.phase below, which
+                    # owns the assess/resolve/confirm sequence and its prompts
+                    reviewer = role_agent
+                    continue
+                prompt = role["prompt"].format(prompt=task.prompt)
+                packet = {"role": role["name"],
+                          **_context_packet(task, role["name"], mem, out, episode_id)}
+                packets.append(packet)
+                # Into the prompt, not just onto disk. /context was mounted read-only
+                # and filled for three turns before anyone noticed the agent never
+                # read it -- an `api:` agent does not go looking, so retrieval was
+                # being paid for and thrown away.
+                prompt += _retrieved_note(packet)
+                steer = _consume_steer(out)
+                if steer:
+                    prompt += f"\n\nOperator note (mid-run steer): {steer}"
+                    emit("heart", "steer.received", episode_id=episode_id, task_id=task.task_id,
+                         chars=len(steer))
+                role_span = pulse_emit.new_span()
+                emit("heart", "role.started", episode_id=episode_id, task_id=task.task_id,
+                     span_id=role_span, role=role["name"], agent=role_agent, memory=mem)
+                _agent_turn(role["name"], role_agent, prompt,
+                            ws, role_env, role_task, out, agent_cmd, runs_log,
+                            memory=mem, profile=role_profile, span_id=role_span)
+                marker = ws.path / BLOCKED_FILE
+                if role["name"] == "implement" and marker.is_file():
+                    implement_blocked = _blocked_reason(
+                        marker.read_text(errors="replace"), BLOCKED_FILE + ":"
+                    ) or "(no reason given)"
+                    runs_log.extend({"role": r["name"], "skipped": True,
+                                     "reason": "implement blocked"}
+                                    for r in pipeline[i + 1:])
+                    break
+                if role.get("verify_after") and can_fix:
+                    verify_rounds = _fix_loop(
+                        task, ws, out, agent, env, fix_rounds, escalate, agent_cmd, runs_log,
+                        agent_profile, verifier_profile
+                    )
+            review_role = next((r for r in (roles or []) if r.get("review")), None)
+            if probe_failure or implement_blocked:
+                review_role = None  # nothing was written; there is nothing to review
+            if review_role is not None:
+                # Three jobs, each named for what it reads: assess reads the diff,
+                # resolve reads the findings, confirm reads the findings plus what
+                # the fixer claims it did. The verdict is derived from severities,
+                # so a reviewer cannot reject in prose and approve on the last line.
+                review_memory = review_role.get("memory", "readonly")
 
-            def _assess(name, prompt):
-                _agent_turn(name, reviewer or agent, prompt, ws,
-                            {**env, "ARTERIES_MEMORY": review_memory}, task, out,
-                            agent_cmd, runs_log, memory=review_memory,
-                            profile=agent_profile)
-                return out / f"{name}.log"
+                def _assess(name, prompt):
+                    _agent_turn(name, reviewer or agent, prompt, ws,
+                                {**env, "ARTERIES_MEMORY": review_memory}, task, out,
+                                agent_cmd, runs_log, memory=review_memory,
+                                profile=agent_profile)
+                    return out / f"{name}.log"
 
-            def _resolve(name, prompt):
-                _agent_turn(name, agent, prompt, ws, env, task, out,
-                            agent_cmd, runs_log, profile=agent_profile)
-                return out / f"{name}.log"
+                def _resolve(name, prompt):
+                    _agent_turn(name, agent, prompt, ws, env, task, out,
+                                agent_cmd, runs_log, profile=agent_profile)
+                    return out / f"{name}.log"
 
-            def _reverify():
-                nonlocal verify_rounds
-                verify_rounds += _fix_loop(
-                    task, ws, out, agent, env, 0, None, agent_cmd, runs_log,
-                    agent_profile, verifier_profile)
+                def _reverify():
+                    nonlocal verify_rounds
+                    verify_rounds += _fix_loop(
+                        task, ws, out, agent, env, 0, None, agent_cmd, runs_log,
+                        agent_profile, verifier_profile)
 
-            outcome_of_review = review_mod.phase(
-                task.prompt,
-                assess=_assess, resolve=_resolve, verify=_reverify,
-                legacy_verdict=_review_verdict,
-                assess_prompt=review_role["prompt"],
-                rounds=review_rounds if can_fix else 0)
-            review_verdict = outcome_of_review.verdict
-            review_findings = outcome_of_review.findings
-            emit("heart", "review.findings", episode_id=episode_id,
-                 task_id=task.task_id, verdict=review_verdict,
-                 rounds=outcome_of_review.rounds,
-                 fell_back=outcome_of_review.fell_back,
-                 findings=[{"severity": f.severity, "file": f.file, "line": f.line,
-                            "claim": f.claim} for f in review_findings])
+                outcome_of_review = review_mod.phase(
+                    task.prompt,
+                    assess=_assess, resolve=_resolve, verify=_reverify,
+                    legacy_verdict=_review_verdict,
+                    assess_prompt=review_role["prompt"],
+                    rounds=review_rounds if can_fix else 0)
+                review_verdict = outcome_of_review.verdict
+                review_findings = outcome_of_review.findings
+                emit("heart", "review.findings", episode_id=episode_id,
+                     task_id=task.task_id, verdict=review_verdict,
+                     rounds=outcome_of_review.rounds,
+                     fell_back=outcome_of_review.fell_back,
+                     findings=[{"severity": f.severity, "file": f.file, "line": f.line,
+                                "claim": f.claim} for f in review_findings])
 
-        diff = ws.diff()
-        (out / "diff.patch").write_text(diff)
-        # The commit is the artifact; the patch stays because serve, cli
-        # and orchestrate all still read diff.patch, and because a text diff is
-        # what the path/secret scanners below know how to inspect.
-        commit_sha = ws.commit(f"heart episode {episode_id}: {task.prompt[:64]}",
-                               ref=f"episodes/{episode_id}")
-        if commit_sha:
-            (out / "commit").write_text(commit_sha + "\n")
-        emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
-             diff_lines=diff_changed_lines(diff), commit=commit_sha)
+            diff = ws.diff()
+            (out / "diff.patch").write_text(diff)
+            # The commit is the artifact; the patch stays because serve, cli
+            # and orchestrate all still read diff.patch, and because a text diff is
+            # what the path/secret scanners below know how to inspect.
+            commit_sha = ws.commit(f"heart episode {episode_id}: {task.prompt[:64]}",
+                                   ref=f"episodes/{episode_id}")
+            if commit_sha:
+                (out / "commit").write_text(commit_sha + "\n")
+            emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
+                 diff_lines=diff_changed_lines(diff), commit=commit_sha)
 
-        # the marker is how an agent asks, not an edit: a scope that never
-        # listed it must not turn the question into a path_violation
-        violations = [v for v in path_violations(diff, effective_allowed, task.denied_paths)
-                      if v != BLOCKED_FILE]
-        secret_hits = scan_secrets(diff)
-        blocked_reason = (probe_failure or implement_blocked
-                          or _blocked_reason(diff, task.blocked_marker))
+            # the marker is how an agent asks, not an edit: a scope that never
+            # listed it must not turn the question into a path_violation
+            violations = [v for v in path_violations(diff, effective_allowed, task.denied_paths)
+                          if v != BLOCKED_FILE]
+            secret_hits = scan_secrets(diff)
+            blocked_reason = (probe_failure or implement_blocked
+                              or _blocked_reason(diff, task.blocked_marker))
 
-        # Scanned before the ladder, not inside it. The ladder only ever asked
-        # about refusals when the diff came back empty, which meant the only
-        # scopes anyone learned about were the ones so tight the agent produced
-        # nothing -- and the common case, a scope tight enough to stop an agent
-        # finishing but not starting, was recorded nowhere at all. A refusal is
-        # worth reporting whether or not it changed the outcome; what it must
-        # not do is change the outcome, which is why the ladder below is
-        # untouched.
-        denials = _scope_denials(out)
-        probed_forbidden = _probed_forbidden(denials, task.denied_paths)
-        if not probed_forbidden:
-            scope_refused = _refused_paths(denials)
-        if scope_refused:
-            emit("heart", "sandbox.denied", episode_id=episode_id, task_id=task.task_id,
-                 allowed_paths=task.allowed_paths, denied_paths=task.denied_paths,
-                 network=getattr(task, "network", "none"),
-                 paths=scope_refused, evidence=denials[:5])
-        if violations:
-            outcome = "path_violation"
-        elif secret_hits:
-            # mirrors path_violation handling: a secret in the diff fails the
-            # episode exactly like an out-of-bounds edit, no verify run
-            outcome = "guardrail_violation"
-            emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
-                 rules=sorted({h.split(":", 1)[0] for h in secret_hits}))
-        elif blocked_reason:
-            # the agent declined to act rather than guess. Checked before
-            # no_change because a block is usually an (almost) empty diff, and
-            # "wrote nothing" and "asked instead of writing" are not the same event.
-            outcome = "blocked"
-        elif not diff.strip() and denials and (probed_forbidden or scope_refused):
-            # An empty diff plus the kernel refusing writes is a sandbox that
-            # was drawn too tight, not an agent that had nothing to say -- unless
-            # nothing was refused that the spec had allowed. A refusal naming no
-            # worktree path is not a scope problem: codex failing to write its
-            # own config directory recorded `scope_denied` with
-            # `scope_refused_paths: []`, and scope_denied is unscoreable, so the
-            # episode escaped being scored for an ordinary crash. Measured on
-            # 20260915-105917-3e7002ab. Unless
-            # the refusal names ground the spec forbade, in which case the agent
-            # went where it was told not to and that is a violation like any
-            # other. Without this branch, scope_denied is an escape hatch from
-            # being scored.
-            if probed_forbidden:
+            # Scanned before the ladder, not inside it. The ladder only ever asked
+            # about refusals when the diff came back empty, which meant the only
+            # scopes anyone learned about were the ones so tight the agent produced
+            # nothing -- and the common case, a scope tight enough to stop an agent
+            # finishing but not starting, was recorded nowhere at all. A refusal is
+            # worth reporting whether or not it changed the outcome; what it must
+            # not do is change the outcome, which is why the ladder below is
+            # untouched.
+            denials = _scope_denials(out)
+            probed_forbidden = _probed_forbidden(denials, task.denied_paths)
+            if not probed_forbidden:
+                scope_refused = _refused_paths(denials)
+            if scope_refused:
+                emit("heart", "sandbox.denied", episode_id=episode_id, task_id=task.task_id,
+                     allowed_paths=task.allowed_paths, denied_paths=task.denied_paths,
+                     network=getattr(task, "network", "none"),
+                     paths=scope_refused, evidence=denials[:5])
+            if violations:
                 outcome = "path_violation"
-                violations = sorted({p for line in denials for p in _denial_paths(line)
-                                     if any(_within(p, d) for d in task.denied_paths)})
+            elif secret_hits:
+                # mirrors path_violation handling: a secret in the diff fails the
+                # episode exactly like an out-of-bounds edit, no verify run
+                outcome = "guardrail_violation"
                 emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
-                     rules=["denied_path_probe"], paths=violations)
+                     rules=sorted({h.split(":", 1)[0] for h in secret_hits}))
+            elif blocked_reason:
+                # the agent declined to act rather than guess. Checked before
+                # no_change because a block is usually an (almost) empty diff, and
+                # "wrote nothing" and "asked instead of writing" are not the same event.
+                outcome = "blocked"
+            elif not diff.strip() and denials and (probed_forbidden or scope_refused):
+                # An empty diff plus the kernel refusing writes is a sandbox that
+                # was drawn too tight, not an agent that had nothing to say -- unless
+                # nothing was refused that the spec had allowed. A refusal naming no
+                # worktree path is not a scope problem: codex failing to write its
+                # own config directory recorded `scope_denied` with
+                # `scope_refused_paths: []`, and scope_denied is unscoreable, so the
+                # episode escaped being scored for an ordinary crash. Measured on
+                # 20260915-105917-3e7002ab. Unless
+                # the refusal names ground the spec forbade, in which case the agent
+                # went where it was told not to and that is a violation like any
+                # other. Without this branch, scope_denied is an escape hatch from
+                # being scored.
+                if probed_forbidden:
+                    outcome = "path_violation"
+                    violations = sorted({p for line in denials for p in _denial_paths(line)
+                                         if any(_within(p, d) for d in task.denied_paths)})
+                    emit("heart", "guardrail.hit", episode_id=episode_id, task_id=task.task_id,
+                         rules=["denied_path_probe"], paths=violations)
+                else:
+                    outcome = "scope_denied"  # sandbox.denied already emitted above
+            elif not diff.strip():
+                outcome = "no_change"
             else:
-                outcome = "scope_denied"  # sandbox.denied already emitted above
-        elif not diff.strip():
-            outcome = "no_change"
-        else:
-            # verify on a clean worktree with only the agent's diff applied —
-            # leftover workspace state (edited tests, caches) can't game the verifier
-            clean = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
-            try:
-                clean.apply(diff)
-            except RuntimeError:
-                outcome = "apply_failed"
-            else:
-                # a fresh workspace means a fresh mount table: the profile
-                # above points at ws, and verifying the applied diff must read
-                # the tree it was applied to
-                _, clean_profile = _sandbox_profiles(task, clean.path, episode_id, out)
-                verifier_results = run_verifiers(
-                    task.public_verifiers, str(clean.path), task.timeout_seconds,
-                    profile=clean_profile
-                )
-                baselined = [v for v in task.public_verifiers if v.baseline]
-                if baselined:
-                    # The same commands, at base_commit, with the diff absent.
-                    # A criterion like "recall must not drop" has no absolute
-                    # form -- only the pair of measurements says whether the
-                    # change was worth shipping, and taking them by hand is the
-                    # part of a migration that gets skipped when it is late.
-                    base_ws = Workspace(task.repo_path, task.base_commit,
-                                        overlay=task.overlay_files)
-                    try:
-                        _, base_profile = _sandbox_profiles(
-                            task, base_ws.path, episode_id, out)
-                        base_results = run_verifiers(
-                            baselined, str(base_ws.path), task.timeout_seconds,
-                            profile=base_profile)
-                    finally:
-                        base_ws.destroy()
-                    for v in baselined:
-                        head, base = verifier_results[v.name], base_results[v.name]
-                        ok, why = compare_baseline(
-                            v.baseline, base["output_tail"], head["output_tail"])
-                        head["baseline"] = {"mode": v.baseline, "passed": ok,
-                                            "detail": why,
-                                            "base_tail": base["output_tail"][-1000:]}
-                        # Both halves have to hold: the command must succeed AND
-                        # the comparison must. Overwriting `passed` is what makes
-                        # a regression score like a test failure rather than
-                        # riding along inside a green episode.
-                        head["passed"] = head["passed"] and ok
-                        emit("heart", "baseline.compared", episode_id=episode_id,
-                             task_id=task.task_id, verifier=v.name,
-                             mode=v.baseline, passed=ok, detail=why[:300])
-                if task.hidden_verifiers:
-                    hidden_results = run_verifiers(
-                        task.hidden_verifiers, str(clean.path), task.timeout_seconds,
+                # verify on a clean worktree with only the agent's diff applied —
+                # leftover workspace state (edited tests, caches) can't game the verifier
+                clean = Workspace(task.repo_path, task.base_commit, overlay=task.overlay_files)
+                try:
+                    clean.apply(diff)
+                except RuntimeError:
+                    outcome = "apply_failed"
+                else:
+                    # a fresh workspace means a fresh mount table: the profile
+                    # above points at ws, and verifying the applied diff must read
+                    # the tree it was applied to
+                    _, clean_profile = _sandbox_profiles(task, clean.path, episode_id, out)
+                    verifier_results = run_verifiers(
+                        task.public_verifiers, str(clean.path), task.timeout_seconds,
                         profile=clean_profile
                     )
-                if not verifier_results:
-                    # all([]) is True, so "pass" here would be a vacuous claim:
-                    # nothing was checked. check_task already refuses tasks whose
-                    # verifiers pass at base for the same reason — absence of
-                    # evidence must not score like evidence of correctness.
-                    outcome = "unverified"
-                else:
-                    outcome = ("pass" if all(r["passed"] for r in verifier_results.values())
-                               else "fail")
+                    baselined = [v for v in task.public_verifiers if v.baseline]
+                    if baselined:
+                        # The same commands, at base_commit, with the diff absent.
+                        # A criterion like "recall must not drop" has no absolute
+                        # form -- only the pair of measurements says whether the
+                        # change was worth shipping, and taking them by hand is the
+                        # part of a migration that gets skipped when it is late.
+                        base_ws = Workspace(task.repo_path, task.base_commit,
+                                            overlay=task.overlay_files)
+                        try:
+                            _, base_profile = _sandbox_profiles(
+                                task, base_ws.path, episode_id, out)
+                            base_results = run_verifiers(
+                                baselined, str(base_ws.path), task.timeout_seconds,
+                                profile=base_profile)
+                        finally:
+                            base_ws.destroy()
+                        for v in baselined:
+                            head, base = verifier_results[v.name], base_results[v.name]
+                            ok, why = compare_baseline(
+                                v.baseline, base["output_tail"], head["output_tail"])
+                            head["baseline"] = {"mode": v.baseline, "passed": ok,
+                                                "detail": why,
+                                                "base_tail": base["output_tail"][-1000:]}
+                            # Both halves have to hold: the command must succeed AND
+                            # the comparison must. Overwriting `passed` is what makes
+                            # a regression score like a test failure rather than
+                            # riding along inside a green episode.
+                            head["passed"] = head["passed"] and ok
+                            emit("heart", "baseline.compared", episode_id=episode_id,
+                                 task_id=task.task_id, verifier=v.name,
+                                 mode=v.baseline, passed=ok, detail=why[:300])
+                    if task.hidden_verifiers:
+                        hidden_results = run_verifiers(
+                            task.hidden_verifiers, str(clean.path), task.timeout_seconds,
+                            profile=clean_profile
+                        )
+                    if not verifier_results:
+                        # all([]) is True, so "pass" here would be a vacuous claim:
+                        # nothing was checked. check_task already refuses tasks whose
+                        # verifiers pass at base for the same reason — absence of
+                        # evidence must not score like evidence of correctness.
+                        outcome = "unverified"
+                    else:
+                        outcome = ("pass" if all(r["passed"] for r in verifier_results.values())
+                                   else "fail")
+        finally:
+            ws.destroy()
+            if clean is not None:
+                clean.destroy()
+
+        ran = [r for r in runs_log if not r.get("skipped")]
+        agent_result = {
+            "exit_code": 0 if all(r["exit_code"] == 0 for r in ran) else 1,
+            "timed_out": any(r["timed_out"] for r in ran),
+            "duration_s": round(sum(r["duration_s"] for r in ran), 2),
+        }
+        def _sum(key: str) -> float | int | None:
+            vals = [r[key] for r in runs_log if r.get(key) is not None]
+            return sum(vals) if vals else None
+
+        cost_total = _sum("cost_usd")
+        usage = {
+            "tokens_in": _sum("tokens_in"), "tokens_out": _sum("tokens_out"),
+            # cache traffic rolls up alongside, never folded into tokens_in: they
+            # are billed at different rates, so a consumer that adds them would be
+            # overcharging reads tenfold
+            "cache_read": _sum("cache_read"),
+            "cache_write_5m": _sum("cache_write_5m"),
+            "cache_write_1h": _sum("cache_write_1h"),
+            "cost_usd": round(cost_total, 6) if cost_total is not None else None,
+        }
+
+        episode = {
+            "episode_id": episode_id,
+            "task_id": task.task_id,
+            "prompt": task.prompt,
+            "repo_path": task.repo_path,
+            "base_commit": task.base_commit,
+            "agent": agent,
+            "memory_mode": memory_mode,
+            "retrieval": retrieval,
+            "outcome": outcome,
+            "blocked_reason": blocked_reason,
+            "violations": violations if outcome == "path_violation"
+            else secret_hits if outcome == "guardrail_violation" else [],
+            # Tagged, not reclassified. An episode where the sandbox refused a write
+            # the spec permitted and the agent still produced a diff is judged on
+            # that diff -- but the verdict may be measuring our mount table rather
+            # than the model, and a consumer deserves to know. Reclassifying these
+            # as scope_denied would reopen the escape hatch: the agent would only
+            # have to write something small, then probe.
+            #
+            # False when the outcome already says it (scope_denied, path_violation).
+            # The plugin has no network flag, so heart detaches the sandbox from
+            # bridge and re-attaches it to the network the spec asked for, between
+            # creating it and running anything in it. Both steps are fatal, so a
+            # recorded episode is one where the boundary held.
+            "network": getattr(task, "network", "none"),
+            "scope_suspect": bool(scope_refused)
+            and outcome not in ("scope_denied", "path_violation"),
+            "scope_refused_paths": scope_refused,
+            # what each role was given to work from, and whether it arrived. An
+            # episode that ran without its memory scores a different experiment
+            # from one that had it, and a training set that mixes them silently is
+            # comparing two populations.
+            "context_packets": [
+                {k: v for k, v in p.items() if k not in ("memories", "text")}
+                | {"memory_count": len(p.get("memories") or []),
+                   "packet_chars": len(p.get("text") or ""),
+                   "corpus": {k: v for k, v in (p.get("corpus") or {}).items()
+                              if k != "text"}}
+                for p in packets],
+            "agent_result": agent_result,
+            "roles": runs_log,
+            "verify_rounds": verify_rounds,
+            "review_verdict": review_verdict,
+            # every finding, not only the blocking ones: an approval used to discard
+            # what the reviewer noticed on the way past
+            "review_findings": [{"severity": f.severity, "file": f.file,
+                                 "line": f.line, "claim": f.claim,
+                                 "evidence": f.evidence} for f in review_findings],
+            "env_snapshot": {k: v for k, v in env.items() if k.startswith("ARTERIES_")},
+            "verifier_results": verifier_results,
+            "hidden_verifier_results": hidden_results,
+            "diff_lines": diff_changed_lines(diff),
+            "usage": usage,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        (out / "episode.json").write_text(json.dumps(episode, indent=2))
+        usage_payload = {k: v for k, v in usage.items() if v is not None}
+        # skills/difficulty ride the event so a consumer can group outcomes by
+        # (model, skill, difficulty). Empty skills (unrouted task) are left off.
+        route_payload = {}
+        if getattr(task, "skills", None):
+            route_payload = {"skills": task.skills, "difficulty": task.difficulty}
     finally:
-        ws.destroy()
-        if clean is not None:
-            clean.destroy()
-
-    ran = [r for r in runs_log if not r.get("skipped")]
-    agent_result = {
-        "exit_code": 0 if all(r["exit_code"] == 0 for r in ran) else 1,
-        "timed_out": any(r["timed_out"] for r in ran),
-        "duration_s": round(sum(r["duration_s"] for r in ran), 2),
-    }
-    def _sum(key: str) -> float | int | None:
-        vals = [r[key] for r in runs_log if r.get(key) is not None]
-        return sum(vals) if vals else None
-
-    cost_total = _sum("cost_usd")
-    usage = {
-        "tokens_in": _sum("tokens_in"), "tokens_out": _sum("tokens_out"),
-        # cache traffic rolls up alongside, never folded into tokens_in: they
-        # are billed at different rates, so a consumer that adds them would be
-        # overcharging reads tenfold
-        "cache_read": _sum("cache_read"),
-        "cache_write_5m": _sum("cache_write_5m"),
-        "cache_write_1h": _sum("cache_write_1h"),
-        "cost_usd": round(cost_total, 6) if cost_total is not None else None,
-    }
-
-    episode = {
-        "episode_id": episode_id,
-        "task_id": task.task_id,
-        "prompt": task.prompt,
-        "repo_path": task.repo_path,
-        "base_commit": task.base_commit,
-        "agent": agent,
-        "memory_mode": memory_mode,
-        "retrieval": retrieval,
-        "outcome": outcome,
-        "blocked_reason": blocked_reason,
-        "violations": violations if outcome == "path_violation"
-        else secret_hits if outcome == "guardrail_violation" else [],
-        # Tagged, not reclassified. An episode where the sandbox refused a write
-        # the spec permitted and the agent still produced a diff is judged on
-        # that diff -- but the verdict may be measuring our mount table rather
-        # than the model, and a consumer deserves to know. Reclassifying these
-        # as scope_denied would reopen the escape hatch: the agent would only
-        # have to write something small, then probe.
-        #
-        # False when the outcome already says it (scope_denied, path_violation).
-        # The plugin has no network flag, so heart detaches the sandbox from
-        # bridge and re-attaches it to the network the spec asked for, between
-        # creating it and running anything in it. Both steps are fatal, so a
-        # recorded episode is one where the boundary held.
-        "network": getattr(task, "network", "none"),
-        "scope_suspect": bool(scope_refused)
-        and outcome not in ("scope_denied", "path_violation"),
-        "scope_refused_paths": scope_refused,
-        # what each role was given to work from, and whether it arrived. An
-        # episode that ran without its memory scores a different experiment
-        # from one that had it, and a training set that mixes them silently is
-        # comparing two populations.
-        "context_packets": [
-            {k: v for k, v in p.items() if k not in ("memories", "text")}
-            | {"memory_count": len(p.get("memories") or []),
-               "packet_chars": len(p.get("text") or ""),
-               "corpus": {k: v for k, v in (p.get("corpus") or {}).items()
-                          if k != "text"}}
-            for p in packets],
-        "agent_result": agent_result,
-        "roles": runs_log,
-        "verify_rounds": verify_rounds,
-        "review_verdict": review_verdict,
-        # every finding, not only the blocking ones: an approval used to discard
-        # what the reviewer noticed on the way past
-        "review_findings": [{"severity": f.severity, "file": f.file,
-                             "line": f.line, "claim": f.claim,
-                             "evidence": f.evidence} for f in review_findings],
-        "env_snapshot": {k: v for k, v in env.items() if k.startswith("ARTERIES_")},
-        "verifier_results": verifier_results,
-        "hidden_verifier_results": hidden_results,
-        "diff_lines": diff_changed_lines(diff),
-        "usage": usage,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    (out / "episode.json").write_text(json.dumps(episode, indent=2))
-    usage_payload = {k: v for k, v in usage.items() if v is not None}
-    # skills/difficulty ride the event so a consumer can group outcomes by
-    # (model, skill, difficulty). Empty skills (unrouted task) are left off.
-    route_payload = {}
-    if getattr(task, "skills", None):
-        route_payload = {"skills": task.skills, "difficulty": task.difficulty}
+        # episode.finished keeps the caller's parent, like episode.started
+        if prev_parent is None:
+            os.environ.pop("PULSE_PARENT_SPAN", None)
+        else:
+            os.environ["PULSE_PARENT_SPAN"] = prev_parent
     emit("heart", "episode.finished", episode_id=episode_id, task_id=task.task_id,
-         duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
+         span_id=ep_span, duration_ms=int(agent_result["duration_s"] * 1000), outcome=outcome,
          review_verdict=review_verdict, agent=agent,
          blocked_reason=blocked_reason, **usage_payload, **route_payload)
     return episode
@@ -1105,5 +1148,4 @@ def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel or n) as pool:
         futures = [pool.submit(run_episode, task, isolated=True, **kwargs) for _ in range(n)]
         return [f.result() for f in futures]
-
 
