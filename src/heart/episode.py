@@ -307,6 +307,9 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
     Returning None outside docker mode is what keeps HEART_SANDBOX=off
     untouched -- sandbox_wrap returns the command unchanged when no profile
     arrives and no sandbox was asked for.
+
+    What reaches the container's env: ARTERIES_* plus PULSE_TRACE_ID,
+    PULSE_PARENT_SPAN and PULSE_PROJECT.
     """
     if os.environ.get("HEART_SANDBOX") != SANDBOX_MODE:
         return None, None
@@ -317,6 +320,12 @@ def _sandbox_profiles(task: TaskSpec, ws_path, episode_id: str, out: Path):
     context.mkdir(parents=True, exist_ok=True)
     inbox = sandbox.inbox_for(episode_id)
     env = {k: v for k, v in os.environ.items() if k.startswith("ARTERIES_")}
+    # These are ids, not secrets -- hence a literal tuple, never a PULSE_ prefix match.
+    # Profiles are built once per episode while PULSE_PARENT_SPAN is the episode
+    # span, so every container event parents to the episode span, not to a role span.
+    for name in ("PULSE_TRACE_ID", "PULSE_PARENT_SPAN", "PULSE_PROJECT"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
     return (
         sandbox.profile_for(task, ws_path, context, inbox, env=env),
         sandbox.verifier_profile_for(task, ws_path, inbox, env=env),
@@ -1139,5 +1148,4 @@ def run_candidates(task: TaskSpec, n: int, parallel: int | None = None, **kwargs
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel or n) as pool:
         futures = [pool.submit(run_episode, task, isolated=True, **kwargs) for _ in range(n)]
         return [f.result() for f in futures]
-
 
