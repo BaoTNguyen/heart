@@ -1,6 +1,7 @@
 """heart pulse compare: one day of socket events vs journal events."""
 import http.server
 import json
+import os
 import shutil
 import socketserver
 import tempfile
@@ -84,3 +85,21 @@ def test_bad_and_missing_day(home, capsys):
     assert capsys.readouterr().out.splitlines() == ["bad --day: nope"]
     assert main(["pulse", "compare"]) == 2
     assert "usage: heart pulse compare --day YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_pulse_format_and_derived_ids_still_match(home, collector, capsys):
+    # what the real collector sends: UTC as Z, and an id it derived
+    line = {"ts": "2026-01-01T00:00:01+00:00", "source": "heart", "kind": "a"}
+    (Path(os.environ["EVENT_JOURNAL_DIR"]) / "2026-01-01.ndjson").write_text(json.dumps(line) + "\n")
+    collector([{"ts": "2026-01-01T00:00:01Z", "source": "heart", "kind": "a",
+                "id": "f9e2b5eb-9001-5794-b4b6-793b9405d58c"}])
+    assert main(["pulse", "compare", "--day", "2026-01-01"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "match"
+
+
+def test_backfilled_goal_id_still_matches(home, collector, capsys):
+    line = {"ts": "2026-01-01T00:00:01+00:00", "source": "plexus", "kind": "a",
+            "payload": {"goal_id": "g"}}
+    (Path(os.environ["EVENT_JOURNAL_DIR"]) / "2026-01-01.ndjson").write_text(json.dumps(line) + "\n")
+    collector([dict(line, goal_id="g")])
+    assert main(["pulse", "compare", "--day", "2026-01-01"]) == 0

@@ -83,6 +83,11 @@ def socket_events(
             events.extend(page)
         for e in events:
             e.pop("seq", None)
+            # pulse writes UTC as Z; the journal and every ts cutoff here use
+            # +00:00, and readers compare ts as strings
+            ts = e.get("ts")
+            if isinstance(ts, str) and ts.endswith("Z"):
+                e["ts"] = ts[:-1] + "+00:00"
         events.sort(key=lambda e: e.get("ts", ""))
     except (OSError, http.client.HTTPException, ValueError, AttributeError, TypeError):
         return None  # ValueError covers bad JSON; the rest a malformed body
@@ -426,6 +431,15 @@ def health(hours: float = 24, zombie_minutes: float = 10) -> tuple[list[str], in
     return [f"OK  {len(events)} events, no zombies, no failures, no degradation"], 0
 
 
+def _comparable(e: dict) -> dict:
+    """What both paths must agree on. pulse derives an id (from file:offset)
+    for a line written without one, and P2b copied payload goal_id/feature_id
+    onto the envelope of older rows; neither is a difference in the event."""
+    payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+    return {k: v for k, v in e.items()
+            if k != "id" and not (k in ("goal_id", "feature_id") and payload.get(k) == v)}
+
+
 def compare(day: str, show: int = 5) -> tuple[list[str], int]:
     """One UTC day of events, collector socket vs journal files, as multisets."""
     try:
@@ -437,7 +451,7 @@ def compare(day: str, show: int = 5) -> tuple[list[str], int]:
     if sock is None:
         return ["pulse socket unavailable; nothing to compare", f"file: {len(file)} events"], 2
     sock = [e for e in sock if e.get("ts", "").startswith(day)]
-    key = lambda e: json.dumps(e, sort_keys=True)  # noqa: E731
+    key = lambda e: json.dumps(_comparable(e), sort_keys=True)  # noqa: E731
     s, f = Counter(map(key, sock)), Counter(map(key, file))
     only_s, only_f = list((s - f).elements()), list((f - s).elements())
     lines = [f"day {day}: socket {len(sock)} events, file {len(file)} events"]
