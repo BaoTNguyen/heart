@@ -238,8 +238,8 @@ class TestHeart(unittest.TestCase):
         return [e for e in lines if episode_id is None or e.get("episode_id") == episode_id]
 
     _TRACE_ROLES = [{"name": "implement", "prompt": "{prompt}"},
-                    {"name": "review", "agent": "shell",
-                     "prompt": "echo APPROVE looks-correct"}]
+                    {"name": "review", "agent": "shell", "review": True,
+                     "prompt": "echo '{\"findings\": []}'"}]
 
     def test_trace_span_episode_standalone(self):
         import re
@@ -259,7 +259,9 @@ class TestHeart(unittest.TestCase):
         self.assertNotIn("parent_span_id", started)
         self.assertNotIn("parent_span_id", finished)
         role_done = {e["span_id"]: e for e in by_kind["role.finished"]}
-        self.assertTrue(by_kind["role.started"])
+        # every turn opens its span, review included, or pulse's spans view drops it (F90)
+        self.assertEqual({e["span_id"] for e in by_kind["role.started"]}, set(role_done))
+        self.assertIn("review.1", {e["role"] for e in by_kind["role.started"]})
         for e in by_kind["role.started"]:
             self.assertEqual(e["parent_span_id"], span)
             self.assertEqual(role_done[e["span_id"]]["parent_span_id"], span)
