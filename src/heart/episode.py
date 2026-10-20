@@ -31,7 +31,7 @@ from .env import Workspace
 from .events import emit
 from .guard import diff_changed_lines, scan_secrets
 from . import sandbox
-from .runner import SANDBOX_MODE, run_agent
+from .runner import SANDBOX_MODE, local_server_down, run_agent
 from .taskspec import TaskSpec
 from .verify import compare_baseline, run_probes, run_verifiers
 
@@ -527,9 +527,14 @@ def _scope_note(task: TaskSpec) -> str:
 def _agent_turn(
     role: str, agent: str, prompt: str, ws: Workspace, env: dict,
     task: TaskSpec, out: Path, agent_cmd: str | None, runs_log: list[dict],
-    memory: str | None = None, profile=None, span_id: str | None = None,
+    memory: str | None = None, profile=None,
 ) -> dict:
-    """One agent invocation: run, record in runs_log, emit role.finished."""
+    """One agent invocation: run, record in runs_log, emit role.started and
+    role.finished under one span. Pipeline, fix-loop and review turns all come
+    through here, so none of them is missing from pulse's spans view."""
+    span_id = pulse_emit.new_span()
+    emit("heart", "role.started", episode_id=env.get("ARTERIES_EPISODE_ID"),
+         task_id=task.task_id, span_id=span_id, role=role, agent=agent, memory=memory)
     r = run_agent(
         agent, prompt + _scope_note(task), str(ws.path), {**env, "HEART_ROLE": role},
         task.timeout_seconds, out / f"{role}.log", agent_cmd=agent_cmd,
@@ -538,8 +543,6 @@ def _agent_turn(
     runs_log.append(
         {"role": role, "agent": agent, **({"memory": memory} if memory else {}), **r}
     )
-    # fix-loop and review turns have no role.started; they still get a span
-    span_id = span_id or pulse_emit.new_span()
     emit("heart", "role.finished", episode_id=env.get("ARTERIES_EPISODE_ID"),
          task_id=task.task_id, role=role, span_id=span_id, duration_ms=int(r["duration_s"] * 1000),
          agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"],
@@ -779,6 +782,16 @@ def _run_episode(
                     routing.resolve(role["tier"], default=agent)
                     if role.get("tier") else agent
                 )
+                # A tier that routes to a local server that is down falls back to
+                # the episode's agent. run_agent would refuse to spawn it, and that
+                # crashed the whole episode on its test role (llama-swap down).
+                # A role that names its agent outright is left to fail loudly.
+                if (not role.get("agent") and role_agent != agent
+                        and local_server_down(role_agent)):
+                    emit("heart", "route.failover", episode_id=episode_id,
+                         task_id=task.task_id, role=role["name"], wanted=role_agent,
+                         agent=agent, reason="local model server not answering")
+                    role_agent = agent
                 # a role that declares extra paths gets its own mount table: the
                 # scope is per subtask, and the test writer needs somewhere the
                 # implementer does not
@@ -829,12 +842,9 @@ def _run_episode(
                     prompt += f"\n\nOperator note (mid-run steer): {steer}"
                     emit("heart", "steer.received", episode_id=episode_id, task_id=task.task_id,
                          chars=len(steer))
-                role_span = pulse_emit.new_span()
-                emit("heart", "role.started", episode_id=episode_id, task_id=task.task_id,
-                     span_id=role_span, role=role["name"], agent=role_agent, memory=mem)
                 _agent_turn(role["name"], role_agent, prompt,
                             ws, role_env, role_task, out, agent_cmd, runs_log,
-                            memory=mem, profile=role_profile, span_id=role_span)
+                            memory=mem, profile=role_profile)
                 marker = ws.path / BLOCKED_FILE
                 if role["name"] == "implement" and marker.is_file():
                     implement_blocked = _blocked_reason(

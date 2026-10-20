@@ -174,6 +174,19 @@ def _default_local_slots(endpoint: str | None = None) -> int:
     return slots
 
 
+def local_server_down(agent: str) -> bool:
+    """Whether `agent` is an api: profile on a local model server that is not
+    answering. False for anything else, and for any probe it can't make."""
+    base, _, profile = agent.partition(":")
+    if base != "api":
+        return False
+    try:
+        ep = agents_api.endpoint_for(profile)
+        return agents_api.is_local_endpoint(ep) and not _endpoint_reachable(ep)
+    except Exception:
+        return False
+
+
 def _endpoint_reachable(endpoint: str, timeout: float = 1.0) -> bool:
     """Whether a local model server is answering at all.
 

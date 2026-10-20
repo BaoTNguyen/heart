@@ -238,8 +238,8 @@ class TestHeart(unittest.TestCase):
         return [e for e in lines if episode_id is None or e.get("episode_id") == episode_id]
 
     _TRACE_ROLES = [{"name": "implement", "prompt": "{prompt}"},
-                    {"name": "review", "agent": "shell",
-                     "prompt": "echo APPROVE looks-correct"}]
+                    {"name": "review", "agent": "shell", "review": True,
+                     "prompt": "echo '{\"findings\": []}'"}]
 
     def test_trace_span_episode_standalone(self):
         import re
@@ -259,7 +259,9 @@ class TestHeart(unittest.TestCase):
         self.assertNotIn("parent_span_id", started)
         self.assertNotIn("parent_span_id", finished)
         role_done = {e["span_id"]: e for e in by_kind["role.finished"]}
-        self.assertTrue(by_kind["role.started"])
+        # every turn opens its span, review included, or pulse's spans view drops it (F90)
+        self.assertEqual({e["span_id"] for e in by_kind["role.started"]}, set(role_done))
+        self.assertIn("review.1", {e["role"] for e in by_kind["role.started"]})
         for e in by_kind["role.started"]:
             self.assertEqual(e["parent_span_id"], span)
             self.assertEqual(role_done[e["span_id"]]["parent_span_id"], span)
@@ -268,6 +270,27 @@ class TestHeart(unittest.TestCase):
                 self.assertEqual(e.get("parent_span_id"), span, e["kind"])
         self.assertNotIn("PULSE_TRACE_ID", os.environ)
         self.assertNotIn("PULSE_PARENT_SPAN", os.environ)
+
+    def test_a_tier_on_a_down_local_server_falls_back_to_the_episode_agent(self):
+        """llama-swap down used to crash the episode on its test role: run_agent
+        refuses to spawn an api: agent with no server to talk to."""
+        self._trace_span_episode_env(HEART_TIER_SMALL="api:local")
+        roles = [{"name": "implement", "tier": "small", "prompt": "{prompt}"}]
+        with unittest.mock.patch("heart.episode.local_server_down",
+                                 lambda a: a == "api:local"):
+            ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
+        self.assertEqual([r["agent"] for r in ep["roles"]], ["shell"])
+        failover, = [e for e in self._trace_span_episode_lines(ep["episode_id"])
+                     if e["kind"] == "route.failover"]
+        self.assertEqual((failover["payload"]["wanted"], failover["payload"]["agent"]),
+                         ("api:local", "shell"))
+
+    def test_local_server_down_probes_only_local_api_agents(self):
+        from heart.runner import local_server_down
+        self.assertFalse(local_server_down("shell"))
+        self.assertFalse(local_server_down("claude:opus"))
+        with unittest.mock.patch.dict(os.environ, {"HEART_API_ENDPOINT": "http://127.0.0.1:9/v1"}):
+            self.assertTrue(local_server_down("api:nosuchprofile"))
 
     def test_trace_span_episode_under_parent(self):
         self._trace_span_episode_env(PULSE_TRACE_ID="t-outer", PULSE_PARENT_SPAN="p-outer")
