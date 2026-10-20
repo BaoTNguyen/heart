@@ -28,7 +28,7 @@ from . import review as review_mod
 from . import pulse_emit
 from . import routing
 from .env import Workspace
-from .events import emit
+from .events import artifact, emit
 from .guard import diff_changed_lines, scan_secrets
 from . import sandbox
 from .runner import SANDBOX_MODE, local_server_down, run_agent
@@ -533,10 +533,12 @@ def _agent_turn(
     role.finished under one span. Pipeline, fix-loop and review turns all come
     through here, so none of them is missing from pulse's spans view."""
     span_id = pulse_emit.new_span()
+    full = prompt + _scope_note(task)
     emit("heart", "role.started", episode_id=env.get("ARTERIES_EPISODE_ID"),
-         task_id=task.task_id, span_id=span_id, role=role, agent=agent, memory=memory)
+         task_id=task.task_id, span_id=span_id, role=role, agent=agent, memory=memory,
+         prompt_artifact=artifact(full.encode()))
     r = run_agent(
-        agent, prompt + _scope_note(task), str(ws.path), {**env, "HEART_ROLE": role},
+        agent, full, str(ws.path), {**env, "HEART_ROLE": role},
         task.timeout_seconds, out / f"{role}.log", agent_cmd=agent_cmd,
         profile=profile,
     )
@@ -549,7 +551,7 @@ def _agent_turn(
          tokens_in=r.get("tokens_in"), tokens_out=r.get("tokens_out"),
          cache_read=r.get("cache_read"), cache_write_5m=r.get("cache_write_5m"),
          cache_write_1h=r.get("cache_write_1h"),
-         cost_usd=r.get("cost_usd"))
+         cost_usd=r.get("cost_usd"), output_artifact=artifact(out / f"{role}.log"))
     return r
 
 
@@ -567,7 +569,8 @@ def _fix_loop(
         passed = all(r["passed"] for r in results.values())
         rounds.append({"attempt": attempt, "passed": passed})
         emit("heart", "verify.round", episode_id=episode_id, task_id=task.task_id,
-             attempt=attempt, passed=passed)
+             attempt=attempt, passed=passed,
+             output_artifact=artifact(json.dumps(results, sort_keys=True, default=str).encode()))
         if passed or attempt == fix_rounds:
             break
         fix_agent = escalate if (escalate and attempt == fix_rounds - 1) else agent
@@ -912,7 +915,8 @@ def _run_episode(
             if commit_sha:
                 (out / "commit").write_text(commit_sha + "\n")
             emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
-                 diff_lines=diff_changed_lines(diff), commit=commit_sha)
+                 diff_lines=diff_changed_lines(diff), commit=commit_sha,
+                 diff_artifact=artifact(out / "diff.patch"))
 
             # the marker is how an agent asks, not an edit: a scope that never
             # listed it must not turn the question into a path_violation
