@@ -19,6 +19,15 @@ def journal_dir() -> Path:
     return vascular_paths.journal_dir()
 
 
+def artifact(data: bytes | Path) -> str | None:
+    """Store `data` under <journal_dir()>/artifacts/<sha256>; return the digest
+    or None. A Path is streamed, never read whole. Never raises."""
+    try:
+        return pulse_emit.artifact(data, journal_dir())
+    except Exception:
+        return None
+
+
 def emit(
     source: str,
     kind: str,
@@ -30,6 +39,7 @@ def emit(
     span_id: str | None = None,
     parent_span_id: str | None = None,
     trace_id: str | None = None,
+    origin: str | None = None,
     **payload,
 ) -> None:
     try:
@@ -51,6 +61,8 @@ def emit(
             episode_id=episode_id, task_id=task_id, role=role, duration_ms=duration_ms,
             # None defers to pulse_emit's $PULSE_TRACE_ID/$PULSE_PARENT_SPAN fallback
             span_id=span_id, parent_span_id=parent_span_id, trace_id=trace_id,
+            # operator|agent|external, passed through unchecked; None drops the key
+            origin=origin,
             # top-level copies are what pulse queries by; None (never "") drops the key
             goal_id=payload.get("goal_id") or None, feature_id=payload.get("feature_id") or None,
             payload=payload or None,
