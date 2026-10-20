@@ -8,11 +8,15 @@ drill-down, `insights` is the dashboard. Percentiles, never averages.
 from __future__ import annotations
 
 import datetime
+import http.client
 import json
 import os
+import socket
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 
+from . import vascular_paths
 from .events import journal_dir
 
 
@@ -25,6 +29,72 @@ def _matches(e: dict, episode: str | None, task: str | None, source: str | None)
 
 
 def load_events(
+    episode: str | None = None, task: str | None = None, source: str | None = None
+) -> list[dict]:
+    """Events from the pulse collector's socket, or the journal files when
+    the collector is down or HEART_PULSE=file."""
+    if os.environ.get("HEART_PULSE") != "file":
+        events = socket_events(episode, task, source)
+        if events is not None:
+            return events
+    return file_events(episode, task, source)
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, sock_path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.sock_path = sock_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.sock_path)
+
+
+def socket_events(
+    episode: str | None = None,
+    task: str | None = None,
+    source: str | None = None,
+    timeout: float = 2.0,
+) -> list[dict] | None:
+    """Page through the collector's /events; None on any failure so the
+    caller can fall back to the files."""
+    sock_path = str(vascular_paths.path("state", "pulse", "pulse.sock"))
+    query = {k: v for k, v in (("episode", episode), ("task", task), ("source", source)) if v}
+    query["limit"] = 5000
+    events: list[dict] = []
+    try:
+        while True:
+            conn = _UnixHTTPConnection(sock_path, timeout)
+            try:
+                conn.request("GET", "/events?" + urllib.parse.urlencode(query))
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status != 200:
+                    return None
+            finally:
+                conn.close()
+            data = json.loads(body)
+            page = data if isinstance(data, list) else data.get("events") or []
+            if not page:
+                break
+            nxt = None if isinstance(data, list) else data.get("next")
+            query["after"] = nxt if nxt is not None else page[-1].get("seq")
+            events.extend(page)
+        for e in events:
+            e.pop("seq", None)
+            # pulse writes UTC as Z; the journal and every ts cutoff here use
+            # +00:00, and readers compare ts as strings
+            ts = e.get("ts")
+            if isinstance(ts, str) and ts.endswith("Z"):
+                e["ts"] = ts[:-1] + "+00:00"
+        events.sort(key=lambda e: e.get("ts", ""))
+    except (OSError, http.client.HTTPException, ValueError, AttributeError, TypeError):
+        return None  # ValueError covers bad JSON; the rest a malformed body
+    return events
+
+
+def file_events(
     episode: str | None = None, task: str | None = None, source: str | None = None
 ) -> list[dict]:
     events = []
@@ -359,3 +429,35 @@ def health(hours: float = 24, zombie_minutes: float = 10) -> tuple[list[str], in
     if warns:
         return warns, 1
     return [f"OK  {len(events)} events, no zombies, no failures, no degradation"], 0
+
+
+def _comparable(e: dict) -> dict:
+    """What both paths must agree on. pulse derives an id (from file:offset)
+    for a line written without one, and P2b copied payload goal_id/feature_id
+    onto the envelope of older rows; neither is a difference in the event."""
+    payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+    return {k: v for k, v in e.items()
+            if k != "id" and not (k in ("goal_id", "feature_id") and payload.get(k) == v)}
+
+
+def compare(day: str, show: int = 5) -> tuple[list[str], int]:
+    """One UTC day of events, collector socket vs journal files, as multisets."""
+    try:
+        day = datetime.date.fromisoformat(day).isoformat()
+    except ValueError:
+        return [f"bad --day: {day}"], 2
+    file = [e for e in file_events() if e.get("ts", "").startswith(day)]
+    sock = socket_events()
+    if sock is None:
+        return ["pulse socket unavailable; nothing to compare", f"file: {len(file)} events"], 2
+    sock = [e for e in sock if e.get("ts", "").startswith(day)]
+    key = lambda e: json.dumps(_comparable(e), sort_keys=True)  # noqa: E731
+    s, f = Counter(map(key, sock)), Counter(map(key, file))
+    only_s, only_f = list((s - f).elements()), list((f - s).elements())
+    lines = [f"day {day}: socket {len(sock)} events, file {len(file)} events"]
+    if not only_s and not only_f:
+        return lines + ["match"], 0
+    lines.append(f"mismatch: {len(only_s)} only in socket, {len(only_f)} only in file")
+    lines += [f"  socket only: {render(json.loads(k))}" for k in only_s[:show]]
+    lines += [f"  file only: {render(json.loads(k))}" for k in only_f[:show]]
+    return lines, 1
