@@ -8,11 +8,15 @@ drill-down, `insights` is the dashboard. Percentiles, never averages.
 from __future__ import annotations
 
 import datetime
+import http.client
 import json
 import os
+import socket
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 
+from . import vascular_paths
 from .events import journal_dir
 
 
@@ -25,6 +29,67 @@ def _matches(e: dict, episode: str | None, task: str | None, source: str | None)
 
 
 def load_events(
+    episode: str | None = None, task: str | None = None, source: str | None = None
+) -> list[dict]:
+    """Events from the pulse collector's socket, or the journal files when
+    the collector is down or HEART_PULSE=file."""
+    if os.environ.get("HEART_PULSE") != "file":
+        events = socket_events(episode, task, source)
+        if events is not None:
+            return events
+    return file_events(episode, task, source)
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, sock_path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.sock_path = sock_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.sock_path)
+
+
+def socket_events(
+    episode: str | None = None,
+    task: str | None = None,
+    source: str | None = None,
+    timeout: float = 2.0,
+) -> list[dict] | None:
+    """Page through the collector's /events; None on any failure so the
+    caller can fall back to the files."""
+    sock_path = str(vascular_paths.path("state", "pulse", "pulse.sock"))
+    query = {k: v for k, v in (("episode", episode), ("task", task), ("source", source)) if v}
+    query["limit"] = 5000
+    events: list[dict] = []
+    try:
+        while True:
+            conn = _UnixHTTPConnection(sock_path, timeout)
+            try:
+                conn.request("GET", "/events?" + urllib.parse.urlencode(query))
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status != 200:
+                    return None
+            finally:
+                conn.close()
+            data = json.loads(body)
+            page = data if isinstance(data, list) else data.get("events") or []
+            if not page:
+                break
+            nxt = None if isinstance(data, list) else data.get("next")
+            query["after"] = nxt if nxt is not None else page[-1].get("seq")
+            events.extend(page)
+        for e in events:
+            e.pop("seq", None)
+        events.sort(key=lambda e: e.get("ts", ""))
+    except (OSError, http.client.HTTPException, ValueError, AttributeError, TypeError):
+        return None  # ValueError covers bad JSON; the rest a malformed body
+    return events
+
+
+def file_events(
     episode: str | None = None, task: str | None = None, source: str | None = None
 ) -> list[dict]:
     events = []
