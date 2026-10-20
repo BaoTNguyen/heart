@@ -271,6 +271,27 @@ class TestHeart(unittest.TestCase):
         self.assertNotIn("PULSE_TRACE_ID", os.environ)
         self.assertNotIn("PULSE_PARENT_SPAN", os.environ)
 
+    def test_a_tier_on_a_down_local_server_falls_back_to_the_episode_agent(self):
+        """llama-swap down used to crash the episode on its test role: run_agent
+        refuses to spawn an api: agent with no server to talk to."""
+        self._trace_span_episode_env(HEART_TIER_SMALL="api:local")
+        roles = [{"name": "implement", "tier": "small", "prompt": "{prompt}"}]
+        with unittest.mock.patch("heart.episode.local_server_down",
+                                 lambda a: a == "api:local"):
+            ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=roles)
+        self.assertEqual([r["agent"] for r in ep["roles"]], ["shell"])
+        failover, = [e for e in self._trace_span_episode_lines(ep["episode_id"])
+                     if e["kind"] == "route.failover"]
+        self.assertEqual((failover["payload"]["wanted"], failover["payload"]["agent"]),
+                         ("api:local", "shell"))
+
+    def test_local_server_down_probes_only_local_api_agents(self):
+        from heart.runner import local_server_down
+        self.assertFalse(local_server_down("shell"))
+        self.assertFalse(local_server_down("claude:opus"))
+        with unittest.mock.patch.dict(os.environ, {"HEART_API_ENDPOINT": "http://127.0.0.1:9/v1"}):
+            self.assertTrue(local_server_down("api:nosuchprofile"))
+
     def test_trace_span_episode_under_parent(self):
         self._trace_span_episode_env(PULSE_TRACE_ID="t-outer", PULSE_PARENT_SPAN="p-outer")
         ep = run_episode(self.task, agent="shell", runs_dir=self.runs, roles=self._TRACE_ROLES)

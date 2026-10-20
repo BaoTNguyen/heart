@@ -71,6 +71,7 @@ take down the observed.
 | `episode.started/finished/failed` | heart | agent, memory_mode, retrieval, pipeline; outcome; error |
 | `role.started/finished` | heart | agent, memory, exit_code, timed_out |
 | `route.decided` | heart | tier, agent, reason (heuristic signals or task.difficulty) |
+| `route.failover` | heart | role, wanted (the tier's local agent), agent (used instead), reason |
 | `verify.round` | heart | attempt, passed |
 | `diff.captured` | heart | diff_lines |
 | `sandbox.denied` | heart | `paths` (worktree-relative, refused), allowed_paths, denied_paths, network, `evidence` (the raw refusal lines) |

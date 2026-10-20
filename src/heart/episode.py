@@ -31,7 +31,7 @@ from .env import Workspace
 from .events import emit
 from .guard import diff_changed_lines, scan_secrets
 from . import sandbox
-from .runner import SANDBOX_MODE, run_agent
+from .runner import SANDBOX_MODE, local_server_down, run_agent
 from .taskspec import TaskSpec
 from .verify import compare_baseline, run_probes, run_verifiers
 
@@ -782,6 +782,16 @@ def _run_episode(
                     routing.resolve(role["tier"], default=agent)
                     if role.get("tier") else agent
                 )
+                # A tier that routes to a local server that is down falls back to
+                # the episode's agent. run_agent would refuse to spawn it, and that
+                # crashed the whole episode on its test role (llama-swap down).
+                # A role that names its agent outright is left to fail loudly.
+                if (not role.get("agent") and role_agent != agent
+                        and local_server_down(role_agent)):
+                    emit("heart", "route.failover", episode_id=episode_id,
+                         task_id=task.task_id, role=role["name"], wanted=role_agent,
+                         agent=agent, reason="local model server not answering")
+                    role_agent = agent
                 # a role that declares extra paths gets its own mount table: the
                 # scope is per subtask, and the test writer needs somewhere the
                 # implementer does not
