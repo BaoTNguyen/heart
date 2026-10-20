@@ -2,8 +2,9 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
-from heart.episode import run_episode
+from heart.episode import _origin, run_episode
 from heart.events import journal_dir
 from heart.taskspec import TaskSpec, Verifier
 
@@ -108,9 +109,6 @@ def test_origin_follows_the_network_lane(tmp_path, monkeypatch):
 
 
 def test_origin_normalises_like_the_lane_env():
-    from types import SimpleNamespace
-
-    from heart.episode import _origin
     assert _origin(SimpleNamespace(network=" WEB ")) == "external"
     for network in (None, "", "none", "proxy", "webby"):
         assert _origin(SimpleNamespace(network=network)) == "agent", network
