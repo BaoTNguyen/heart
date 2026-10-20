@@ -116,6 +116,10 @@ every container. Corrected in place. `0.0.0.0` is right here and its cost is
 real: the model server answers on other host interfaces too. That is a
 host firewall job.
 
+Fixed 2026-09-24: llama-server binds `127.0.0.1`, and containers still reach
+it because Docker Desktop forwards `host.docker.internal` to the host's
+loopback.
+
 ## Resolved alongside: the allowlist ignored ports
 
 `contrib/egress-proxy.py permitted()` matched on hostname only. `ALLOW` carries
