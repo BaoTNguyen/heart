@@ -385,6 +385,14 @@ def cmd_pulse(args) -> int:
         for line in pulse_mod.insights(hours=args.hours):
             print(line)
         return 0
+    if args.what == "compare":
+        if not args.day:
+            print("usage: heart pulse compare --day YYYY-MM-DD", file=sys.stderr)
+            return 2
+        lines, code = pulse_mod.compare(args.day)
+        for line in lines:
+            print(line)
+        return code
     if args.what == "health":
         lines, code = pulse_mod.health(hours=args.hours)
         for line in lines:
@@ -543,9 +551,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--runs-dir", default="runs")
     p.set_defaults(func=cmd_stats)
 
-    p = sub.add_parser("pulse", help="event spine: tail | episode <id> | goal <id> | insights | health")
+    p = sub.add_parser("pulse", help="event spine: tail | episode <id> | goal <id> | insights | health | compare --day D")
     p.add_argument("what", nargs="?", default="tail",
-                   choices=["tail", "episode", "goal", "insights", "health", "serve"])
+                   choices=["tail", "episode", "goal", "insights", "health", "compare", "serve"])
     p.add_argument("--port", type=int, default=7717, help="port for `pulse serve`")
     p.add_argument("--runs-dir", dest="serve_runs_dir", default=None,
                    help="runs dir `pulse serve` writes steer.txt into (default ~/.vascular/state/heart/runs)")
@@ -556,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--task", default=None, help="filter by task id")
     p.add_argument("--source", default=None, help="filter by source (heart|arteries|marrow|agent)")
     p.add_argument("--once", action="store_true", help="print and exit; don't follow")
+    p.add_argument("--day", default=None, help="UTC day YYYY-MM-DD for `pulse compare`")
     p.set_defaults(func=cmd_pulse)
 
     p = sub.add_parser("models", help="rate card: check | set-price")

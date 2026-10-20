@@ -424,3 +424,26 @@ def health(hours: float = 24, zombie_minutes: float = 10) -> tuple[list[str], in
     if warns:
         return warns, 1
     return [f"OK  {len(events)} events, no zombies, no failures, no degradation"], 0
+
+
+def compare(day: str, show: int = 5) -> tuple[list[str], int]:
+    """One UTC day of events, collector socket vs journal files, as multisets."""
+    try:
+        day = datetime.date.fromisoformat(day).isoformat()
+    except ValueError:
+        return [f"bad --day: {day}"], 2
+    file = [e for e in file_events() if e.get("ts", "").startswith(day)]
+    sock = socket_events()
+    if sock is None:
+        return ["pulse socket unavailable; nothing to compare", f"file: {len(file)} events"], 2
+    sock = [e for e in sock if e.get("ts", "").startswith(day)]
+    key = lambda e: json.dumps(e, sort_keys=True)  # noqa: E731
+    s, f = Counter(map(key, sock)), Counter(map(key, file))
+    only_s, only_f = list((s - f).elements()), list((f - s).elements())
+    lines = [f"day {day}: socket {len(sock)} events, file {len(file)} events"]
+    if not only_s and not only_f:
+        return lines + ["match"], 0
+    lines.append(f"mismatch: {len(only_s)} only in socket, {len(only_f)} only in file")
+    lines += [f"  socket only: {render(json.loads(k))}" for k in only_s[:show]]
+    lines += [f"  file only: {render(json.loads(k))}" for k in only_f[:show]]
+    return lines, 1
