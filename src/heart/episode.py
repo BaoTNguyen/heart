@@ -524,6 +524,12 @@ def _scope_note(task: TaskSpec) -> str:
     return "\n".join(lines)
 
 
+def _origin(task) -> str:
+    """Envelope origin: a web-lane agent's output may carry fetched content."""
+    web = (getattr(task, "network", "") or "none").strip().lower() == "web"
+    return "external" if web else "agent"
+
+
 def _agent_turn(
     role: str, agent: str, prompt: str, ws: Workspace, env: dict,
     task: TaskSpec, out: Path, agent_cmd: str | None, runs_log: list[dict],
@@ -547,6 +553,7 @@ def _agent_turn(
     )
     emit("heart", "role.finished", episode_id=env.get("ARTERIES_EPISODE_ID"),
          task_id=task.task_id, role=role, span_id=span_id, duration_ms=int(r["duration_s"] * 1000),
+         origin=_origin(task),
          agent=agent, exit_code=r["exit_code"], timed_out=r["timed_out"],
          tokens_in=r.get("tokens_in"), tokens_out=r.get("tokens_out"),
          cache_read=r.get("cache_read"), cache_write_5m=r.get("cache_write_5m"),
@@ -569,7 +576,7 @@ def _fix_loop(
         passed = all(r["passed"] for r in results.values())
         rounds.append({"attempt": attempt, "passed": passed})
         emit("heart", "verify.round", episode_id=episode_id, task_id=task.task_id,
-             attempt=attempt, passed=passed,
+             attempt=attempt, passed=passed, origin=_origin(task),
              output_artifact=artifact(json.dumps(results, sort_keys=True, default=str).encode()))
         if passed or attempt == fix_rounds:
             break
@@ -915,7 +922,7 @@ def _run_episode(
             if commit_sha:
                 (out / "commit").write_text(commit_sha + "\n")
             emit("heart", "diff.captured", episode_id=episode_id, task_id=task.task_id,
-                 diff_lines=diff_changed_lines(diff), commit=commit_sha,
+                 diff_lines=diff_changed_lines(diff), commit=commit_sha, origin=_origin(task),
                  diff_artifact=artifact(out / "diff.patch"))
 
             # the marker is how an agent asks, not an edit: a scope that never

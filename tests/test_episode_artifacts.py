@@ -26,10 +26,10 @@ def _make_repo(root: Path) -> tuple[Path, str]:
     return repo, head
 
 
-def _episode(root: Path) -> dict:
+def _episode(root: Path, **spec) -> dict:
     repo, head = _make_repo(root)
     task = TaskSpec(
-        task_id="artifacts", repo_path=str(repo), base_commit=head,
+        **spec, task_id="artifacts", repo_path=str(repo), base_commit=head,
         prompt="sed -i 's/a - b/a + b/' calc.py",
         public_verifiers=[Verifier(name="unit", command="python3 -m unittest -q test_calc")],
     )
@@ -86,3 +86,32 @@ def test_unwritable_journal_does_not_change_outcome(tmp_path, monkeypatch):
     broken = _episode(tmp_path / "broken")
 
     assert control["outcome"] == broken["outcome"] == "pass"
+
+
+def test_origin_follows_the_network_lane(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("HEART_SANDBOX", raising=False)
+    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path / "journal"))
+    for name, spec, want in (("web", {"network": "web"}, "external"), ("default", {}, "agent")):
+        ep = _episode(tmp_path / name, **spec)
+        events = [json.loads(line)
+                  for f in sorted(journal_dir().glob("*.ndjson"))
+                  for line in f.read_text().splitlines() if line.strip()]
+        events = [e for e in events if e.get("episode_id") == ep["episode_id"]]
+        kinds = {e["kind"] for e in events}
+        assert {"role.started", "role.finished", "diff.captured", "verify.round"} <= kinds, kinds
+        for e in events:
+            if e["kind"] in ("role.finished", "diff.captured", "verify.round"):
+                assert e.get("origin") == want, (name, e)
+            elif e["kind"] == "role.started":
+                assert "origin" not in e, e
+
+
+def test_origin_normalises_like_the_lane_env():
+    from types import SimpleNamespace
+
+    from heart.episode import _origin
+    assert _origin(SimpleNamespace(network=" WEB ")) == "external"
+    for network in (None, "", "none", "proxy", "webby"):
+        assert _origin(SimpleNamespace(network=network)) == "agent", network
+    assert _origin(object()) == "agent"

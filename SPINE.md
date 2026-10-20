@@ -69,11 +69,11 @@ take down the observed.
 | Kind | Source | Notable payload |
 |---|---|---|
 | `episode.started/finished/failed` | heart | agent, memory_mode, retrieval, pipeline; outcome; error |
-| `role.started/finished` | heart | agent, memory, exit_code, timed_out, prompt_artifact (started), output_artifact (finished) |
+| `role.started/finished` | heart | agent, memory, exit_code, timed_out, prompt_artifact (started), output_artifact (finished); envelope `origin` on finished only (`agent`, `external` if network=web) |
 | `route.decided` | heart | tier, agent, reason (heuristic signals or task.difficulty) |
 | `route.failover` | heart | role, wanted (the tier's local agent), agent (used instead), reason |
-| `verify.round` | heart | attempt, passed, output_artifact |
-| `diff.captured` | heart | diff_lines, diff_artifact |
+| `verify.round` | heart | attempt, passed, output_artifact; envelope `origin` (`agent`/`external`) |
+| `diff.captured` | heart | diff_lines, diff_artifact; envelope `origin` (`agent`/`external`) |
 | `sandbox.denied` | heart | `paths` (worktree-relative, refused), allowed_paths, denied_paths, network, `evidence` (the raw refusal lines) |
 | `guardrail.hit` | heart | `rules` (`denied_path_probe`, or the secret-scan rules), `paths` (worktree-relative) |
 | `batch.progress` | heart | done, total, outcome |
