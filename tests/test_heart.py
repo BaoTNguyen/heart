@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import contextlib  # noqa: E402
 import io  # noqa: E402
 import os  # noqa: E402
+import time  # noqa: E402
 
 from heart.agents_api import resolve_config  # noqa: E402
 from heart.cli import main as cli_main  # noqa: E402
@@ -1174,6 +1175,20 @@ class TestReclaim(unittest.TestCase):
         (stray / "junk.txt").write_text("x")
         self.assertEqual(reclaim(), 1)
         self.assertFalse(stray.exists())
+
+    def test_a_fresh_run_contained_inbox_is_not_reclaimed(self):
+        # a second plexus run's startup reap removed the first run's acceptance
+        # inbox before its container started
+        from heart.env import reclaim
+
+        inbox = self.ws_root / "heart-cmd-abc123"
+        inbox.mkdir()
+        self.assertEqual(reclaim(), 0)
+        self.assertTrue(inbox.is_dir())
+        day_old = time.time() - 2 * 86400
+        os.utime(inbox, (day_old, day_old))
+        self.assertEqual(reclaim(), 1)
+        self.assertFalse(inbox.exists())
 
     def test_an_orphan_whose_repo_is_gone_is_still_reclaimed(self):
         """85 of 86 leaks in one real backlog belonged to task clones and temp

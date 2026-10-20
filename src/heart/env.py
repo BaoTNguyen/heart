@@ -6,6 +6,7 @@ import fcntl
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -143,6 +144,12 @@ def reclaim(repo: str | Path | None = None, older_than: float | None = None) -> 
         if not worktree.is_dir():
             continue
         try:
+            # run_contained's sandbox inbox: it holds no lock, but a live
+            # TemporaryDirectory owns it, and removing it mid-start fails that
+            # check with "workspace does not exist". Only a day-old one leaked.
+            if (worktree.name.startswith("heart-cmd-")
+                    and time.time() - worktree.stat().st_mtime < 86400):
+                continue
             if older_than is not None and worktree.stat().st_mtime >= older_than:
                 continue
         except OSError:
