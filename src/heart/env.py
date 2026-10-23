@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -11,6 +12,9 @@ import uuid
 from pathlib import Path
 
 from . import vascular_paths
+
+
+_WS_NAME = re.compile(r"[0-9a-f]{12}")  # Workspace's uuid4().hex[:12]
 
 
 def _ws_root() -> Path:
@@ -136,12 +140,17 @@ def reclaim(repo: str | Path | None = None, older_than: float | None = None) -> 
     Best-effort: returns how many it removed.
     """
     ws_root = _ws_root()
-    if not ws_root.is_dir():
+    # an empty HEART_WS_ROOT is the cwd; in a checkout every unlocked directory
+    # there, .git and src included, looked like a leak (HEART-B21)
+    if not ws_root.is_dir() or (ws_root / ".git").exists():
         return 0
     repo = str(Path(repo).resolve()) if repo else None
     removed, repos = 0, set()
     for worktree in ws_root.iterdir():
-        if not worktree.is_dir():
+        # only names heart makes: Workspace's uuid hex and run_contained's inbox;
+        # anything else (a heart-check- journal, a stranger's dir) is not ours
+        if not worktree.is_dir() or not (_WS_NAME.fullmatch(worktree.name)
+                                         or worktree.name.startswith("heart-cmd-")):
             continue
         try:
             # run_contained's sandbox inbox: it holds no lock, but a live
