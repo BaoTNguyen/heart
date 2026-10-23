@@ -491,7 +491,7 @@ Operational switches:
   the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
   stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
   re-runs the sweep any time (dedup makes it safe).
-- `heart pulse insights` includes a routing scorecard (pass rate per tier) —
+- `heart observe insights` includes a routing scorecard (pass rate per tier) —
   a `small` tier that keeps failing means the classifier thresholds need moving.
 - **Cost capture**: `runner.run_agent` extracts tokens and, from a
   `~/.vascular/config/heart/models.json` `"pricing"` map keyed by agent string, dollars
@@ -513,11 +513,14 @@ Operational switches:
     ```
     (rates are illustrative — set them to the current published API price of the
     model behind each seat.)
-- **`heart pulse serve`**: the factory floor as a local web page
+- **`heart observe`** (was `heart pulse`, still accepted): heart's own episode
+  analysis. Its generic `tail` and `episode <id>` timeline hand off to
+  `pulse tail --text` / `pulse events --text` when pulse is installed.
+- **`heart observe serve`**: the factory floor as a local web page
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
   all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
   one HTML file, no build step, localhost-only.
-- **`heart pulse goal <goal-id>`**: goal lineage — features → episodes →
+- **`heart observe goal <goal-id>`**: goal lineage — features → episodes →
   outcome/cost, grouped from `episode.finished` events whose payload
   carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
   from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
@@ -528,7 +531,7 @@ Operational switches:
   Clicking a card's episode id opens a drill-down overlay with the full
   timeline, the captured diff, and per-role log tails.
 - **Health alerting timer**: `contrib/heart-health.timer` + `.service` are
-  systemd **user** units (no sudo) that run `heart pulse health --hours 1`
+  systemd **user** units (no sudo) that run `heart observe health --hours 1`
   every 10 minutes and fire a `notify-send` (plus an optional `ntfy.sh` push
   via `NTFY_TOPIC`) on the first WARN line. `pulse health` also now flags a
   review2-reject streak (3 most recent reviewed episodes all rejected), a

@@ -1,4 +1,4 @@
-"""`heart pulse serve` — the factory floor, as a local web page.
+"""`heart observe serve` — the factory floor, as a local web page.
 
 One stdlib HTTP server on localhost: serves a single HTML file, streams the
 event journal over Server-Sent Events, and exposes insights/health as JSON.
@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import pulse
+from . import observe as pulse
 from .cli import work_runs_dir
 
 PAGE = Path(__file__).with_name("pulse.html")
@@ -150,7 +150,7 @@ def serve(port: int = 7717, runs_dir: str | Path | None = None) -> None:
     global RUNS_DIR
     RUNS_DIR = Path(runs_dir) if runs_dir is not None else work_runs_dir()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"heart pulse: http://127.0.0.1:{port}  (Ctrl-C to stop)")
+    print(f"heart observe: http://127.0.0.1:{port}  (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
