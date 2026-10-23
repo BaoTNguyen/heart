@@ -157,14 +157,19 @@ def _announce(source: str, journal: Path, state: Path | None) -> None:
     processes such as hooks would otherwise announce on every run."""
     ctx = context(source)
     cid = context_id(ctx)
+    # Keyed by journal as well: a marker for one journal must not stop the
+    # announcement in another. A self-check writing a temp journal used to
+    # leave the shared marker behind, so real events with that context_id
+    # never got a contexts row (PULSE-B03).
+    key = f"{cid}-{hashlib.sha256(str(journal.resolve()).encode()).hexdigest()[:12]}"
     with _lock:
-        if cid in _announced:
+        if key in _announced:
             return
-        _announced.add(cid)
+        _announced.add(key)
     if state is not None:
         try:
             state.mkdir(parents=True, exist_ok=True)
-            os.close(os.open(state / cid, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+            os.close(os.open(state / key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
         except FileExistsError:
             return
     append(event(source, "context.started", payload=ctx), journal)
