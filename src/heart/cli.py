@@ -400,7 +400,7 @@ def cmd_pulse(args) -> int:
         return code
     pulse_mod.tail(
         n=args.n, episode=args.episode, task=args.task,
-        source=args.source, follow=not args.once,
+        source=args.source, live=not args.once,
     )
     return 0
 
