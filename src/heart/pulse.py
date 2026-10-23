@@ -140,23 +140,35 @@ def tail(
     episode: str | None = None,
     task: str | None = None,
     source: str | None = None,
-    follow: bool = True,
+    live: bool = True,
 ) -> None:
-    for e in load_events(episode, task, source)[-n:]:
+    # `live`, not `follow`: the parameter shadowed follow() below and every
+    # `heart pulse tail` crashed after its history (HEART-B19)
+    history = load_events(episode, task, source)
+    for e in history[-n:]:
         print(render(e))
-    if not follow:
+    if not live:
         return
     try:
-        for e in follow():
+        for e in follow(seen=_ids(history)):
             if e is not None and _matches(e, episode, task, source):
                 print(render(e), flush=True)
     except KeyboardInterrupt:
         pass
 
 
-def follow(interval: float = 0.5):
+def _ids(events: list[dict]) -> set[str]:
+    return {e["id"] for e in events if e.get("id")}
+
+
+def follow(interval: float = 0.5, seen: set[str] | None = None):
     """Yield events appended to the journal from now on, and None after each
     poll that found nothing more, so a caller can send a keepalive.
+
+    With `seen` (the ids of the history the caller just printed), start from
+    the top of the last two day files instead and skip those ids. History
+    comes from the collector, which lags the spool; starting at the files' end
+    dropped whatever it had not ingested yet (HEART-B20).
 
     The offset kept is the byte after the last complete line read, not a size
     measured before reading: a line still being written waits for the next
@@ -164,7 +176,8 @@ def follow(interval: float = 0.5):
     read twice. A file that appears mid-follow -- a new UTC day -- is read
     from its start. History before the call is the caller's to print.
     """
-    offsets = {p: p.stat().st_size for p in sorted(journal_dir().glob("*.ndjson"))[-2:]}
+    offsets = {} if seen is not None else {
+        p: p.stat().st_size for p in sorted(journal_dir().glob("*.ndjson"))[-2:]}
     while True:
         for path in sorted(journal_dir().glob("*.ndjson"))[-2:]:  # today + rollover
             pos = offsets.get(path, 0)
@@ -178,9 +191,12 @@ def follow(interval: float = 0.5):
                     pos += len(raw)
                     offsets[path] = pos
                     try:
-                        yield json.loads(raw)
+                        e = json.loads(raw)
                     except ValueError:  # junk or undecodable bytes
                         continue
+                    if seen and e.get("id") in seen:
+                        continue
+                    yield e
         yield None
         time.sleep(interval)
 

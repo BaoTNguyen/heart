@@ -52,3 +52,25 @@ def test_follow_survives_non_ascii_and_junk(tmp_path, monkeypatch):
         f.write(_line(2))
     assert _drain(gen) == [1, 2]
     assert _drain(gen) == []
+
+
+def test_follow_with_history_covers_the_collectors_lag(tmp_path, monkeypatch):
+    # HEART-B20: history comes from the collector, which lags the spool; an
+    # event in the files but not yet ingested must still be shown, once
+    monkeypatch.setenv("EVENT_JOURNAL_DIR", str(tmp_path))
+    rec = lambda n: (json.dumps({"id": f"e{n}", "kind": "x", "n": n}) + "\n").encode()  # noqa: E731
+    (tmp_path / "20260101.ndjson").write_bytes(rec(0) + rec(1))
+    gen = pulse.follow(interval=0, seen={"e0"})  # the collector had only e0
+    assert _drain(gen) == [1]
+    with open(tmp_path / "20260101.ndjson", "ab") as f:
+        f.write(rec(2))
+    assert _drain(gen) == [2]
+
+
+def test_tail_prints_history_then_follows(tmp_path, monkeypatch, capsys):
+    # HEART-B19: the `follow` parameter shadowed follow() and tail crashed
+    monkeypatch.setattr(pulse, "load_events", lambda *a: [{"id": "e0", "kind": "x"}])
+    monkeypatch.setattr(pulse, "follow", lambda **kw: iter([{"id": "e1", "kind": "y"}]))
+    pulse.tail(n=5)
+    out = capsys.readouterr().out
+    assert " x" in out and " y" in out
