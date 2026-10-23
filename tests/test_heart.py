@@ -1227,6 +1227,25 @@ class TestReclaim(unittest.TestCase):
             if stray.exists():
                 (stray / "locked").chmod(0o700)
 
+    def test_only_directories_heart_names_are_reclaimed(self):
+        # HEART-B21/B14: an empty HEART_WS_ROOT is the cwd, so .git and src
+        # were "leaks"; a live heart-check- journal was too
+        from heart.env import reclaim
+
+        for name in ("src", ".git-ish", "heart-check-abcd", "DEADBEEFCAFE"):
+            (self.ws_root / name).mkdir()
+        self.assertEqual(reclaim(), 0)
+        for name in ("src", ".git-ish", "heart-check-abcd", "DEADBEEFCAFE"):
+            self.assertTrue((self.ws_root / name).is_dir(), name)
+
+    def test_a_checkout_is_never_swept(self):
+        from heart.env import reclaim
+
+        (self.ws_root / ".git").mkdir()
+        (self.ws_root / "deadbeefcafe").mkdir()
+        self.assertEqual(reclaim(), 0)
+        self.assertTrue((self.ws_root / "deadbeefcafe").is_dir())
+
     def test_a_lock_whose_worktree_is_gone_is_litter(self):
         from heart.env import reclaim
 
@@ -2310,6 +2329,20 @@ class TestContextPacketEnv(unittest.TestCase):
                 result = ep._context_packet(task, "implement", "normal",
                                             Path(tmp), "ep-1")
         return captured, result
+
+    def test_an_episode_with_retrieval_off_retrieves_nothing(self):
+        # HEART-B01: `:off` variants set ARTERIES_RETRIEVAL only in the
+        # episode's env dict, so the process env still read "on"
+        from heart import episode as ep
+
+        task = TaskSpec(task_id="t", repo_path=".", base_commit="0" * 40, prompt="p")
+        with tempfile.TemporaryDirectory() as tmp, \
+             unittest.mock.patch.object(ep.subprocess, "run",
+                                        side_effect=AssertionError("retrieved")), \
+             unittest.mock.patch.dict(os.environ, {"ARTERIES_RETRIEVAL": "on"}):
+            result = ep._context_packet(task, "implement", "normal", Path(tmp),
+                                        "ep-1", retrieval=False)
+        self.assertEqual(result["status"], "skipped")
 
     def test_session_id_is_the_task_id(self):
         captured, _ = self._run()

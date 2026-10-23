@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -164,6 +165,18 @@ def defaults() -> dict:
     for legacy, name in (data.get("tiers") or {}).items():
         out.setdefault(_LEGACY_TIERS.get(legacy, legacy), name)
     return out
+
+
+def route_models() -> list[str]:
+    """The operator's routing allowlist: models.json's top-level `route_models`,
+    or [] when it is absent, empty, or not a list of strings. Review ignores it."""
+    try:
+        names = load_models_json().get("route_models")
+    except Exception:
+        return []
+    if isinstance(names, list) and names and all(isinstance(n, str) for n in names):
+        return names
+    return []
 
 
 def resolve(name: str, default: str | None = None) -> str:
@@ -297,6 +310,7 @@ def pick(
     available=None,
     default: str | None = None,
     episode_id: str | None = None,
+    route_models: list[str] | None = None,
 ) -> Choice:
     """Stage two: the model that serves `want`.
 
@@ -305,6 +319,9 @@ def pick(
     difficulty, and availability if a probe is given. Then score the survivors by
     mean declared skill match, breaking ties toward the cheaper model — don't send
     easy work to the expensive one.
+
+    `route_models` restricts the choice to those manifest names; None reads the
+    operator's list from models.json, [] turns the filter off.
     """
     manifest = manifest if manifest is not None else load_manifest()
     skills, difficulty = want.skills, want.difficulty
@@ -333,10 +350,22 @@ def pick(
             effort=want.effort, tier=want.tier, skills=skills,
             difficulty=difficulty, reason="no model manifest; tier default"))
 
+    if route_models is None:
+        route_models = globals()["route_models"]()  # the parameter shadows the function
+    allowed = set()
+    for name in route_models:
+        if name in manifest:
+            allowed.add(name)
+        else:
+            print(f"heart: route_models: unknown model {name!r} ignored", file=sys.stderr)
+
     scored: list[dict] = []
     filtered: list[str] = []
     runnable: list[tuple[str, dict]] = []
     for name, m in manifest.items():
+        if allowed and name not in allowed:
+            filtered.append(f"{name}:not in route_models")
+            continue
         # Availability is physical, not a preference we can relax on fallback.
         if available is not None and not available(m["agent"]):
             filtered.append(f"{name}:unavailable")
@@ -354,6 +383,19 @@ def pick(
         score = sum(per_skill) / len(per_skill)
         scored.append({"name": name, "agent": m["agent"], "score": round(score, 4),
                        "cost": m["cost"]})
+
+    if not scored and allowed:
+        # never leave the allowlist; relax context and difficulty, not availability
+        usable = [(n, m) for n, m in manifest.items() if n in allowed
+                  and (available is None or available(m["agent"]))]
+        if not usable:
+            raise ValueError("no available model satisfies context constraints; " + "; ".join(filtered))
+        best = max(usable, key=lambda kv: (drank(kv[1]["max_difficulty"]), kv[1]["context"]))
+        return decided(Choice(
+            agent=best[1]["agent"], effort="high", tier=want.tier,
+            skills=skills, difficulty=difficulty, name=best[0],
+            reason=f"no model cleared constraints ({'; '.join(filtered)}); "
+                   f"forced highest-ceiling route_models entry"), filtered)
 
     if not scored:
         if not runnable:
