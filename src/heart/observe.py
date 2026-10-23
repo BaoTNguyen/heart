@@ -28,16 +28,37 @@ def _matches(e: dict, episode: str | None, task: str | None, source: str | None)
     )
 
 
+class PulseUnavailable(RuntimeError):
+    """The pulse collector's socket did not answer."""
+
+
+def _unavailable() -> PulseUnavailable:
+    sock = vascular_paths.path("state", "pulse", "pulse.sock")
+    return PulseUnavailable(
+        f"pulse is not answering on {sock}: start it with `systemctl --user start "
+        "pulse.service`, or set HEART_PULSE=file to read the journal files")
+
+
+def _file_mode() -> bool:
+    return os.environ.get("HEART_PULSE") == "file"
+
+
 def load_events(
-    episode: str | None = None, task: str | None = None, source: str | None = None
+    episode: str | None = None, task: str | None = None, source: str | None = None,
+    since: str | None = None,
 ) -> list[dict]:
-    """Events from the pulse collector's socket, or the journal files when
-    the collector is down or HEART_PULSE=file."""
-    if os.environ.get("HEART_PULSE") != "file":
-        events = socket_events(episode, task, source)
-        if events is not None:
-            return events
-    return file_events(episode, task, source)
+    """Events from the pulse collector's socket, `since` an ISO timestamp.
+
+    No silent fallback to the journal files (B11): two read paths drifted
+    apart, and a scan of every day file hid a collector that was down.
+    HEART_PULSE=file reads the files on purpose (tests, offline debugging)."""
+    if _file_mode():
+        return [e for e in file_events(episode, task, source)
+                if not since or e.get("ts", "") >= since]
+    events = socket_events(episode, task, source, since=since)
+    if events is None:
+        raise _unavailable()
+    return events
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -51,47 +72,72 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.sock_path)
 
 
-def socket_events(
-    episode: str | None = None,
-    task: str | None = None,
-    source: str | None = None,
-    timeout: float = 2.0,
-) -> list[dict] | None:
-    """Page through the collector's /events; None on any failure so the
-    caller can fall back to the files."""
+def _page(query: dict, timeout: float = 2.0) -> tuple[list[dict], int | None] | None:
+    """One GET /events: its events and the `next` cursor; None on any failure."""
     sock_path = str(vascular_paths.path("state", "pulse", "pulse.sock"))
-    query = {k: v for k, v in (("episode", episode), ("task", task), ("source", source)) if v}
-    query["limit"] = 5000
-    events: list[dict] = []
     try:
-        while True:
-            conn = _UnixHTTPConnection(sock_path, timeout)
-            try:
-                conn.request("GET", "/events?" + urllib.parse.urlencode(query))
-                resp = conn.getresponse()
-                body = resp.read()
-                if resp.status != 200:
-                    return None
-            finally:
-                conn.close()
-            data = json.loads(body)
-            page = data if isinstance(data, list) else data.get("events") or []
-            if not page:
-                break
-            nxt = None if isinstance(data, list) else data.get("next")
-            query["after"] = nxt if nxt is not None else page[-1].get("seq")
-            events.extend(page)
-        for e in events:
+        conn = _UnixHTTPConnection(sock_path, timeout)
+        try:
+            conn.request("GET", "/events?" + urllib.parse.urlencode(query))
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status != 200:
+                return None
+        finally:
+            conn.close()
+        data = json.loads(body)
+        page = data if isinstance(data, list) else data.get("events") or []
+        nxt = None if isinstance(data, list) else data.get("next")
+        if nxt is None and page:
+            nxt = page[-1].get("seq")
+        for e in page:
             e.pop("seq", None)
             # pulse writes UTC as Z; the journal and every ts cutoff here use
             # +00:00, and readers compare ts as strings
             ts = e.get("ts")
             if isinstance(ts, str) and ts.endswith("Z"):
                 e["ts"] = ts[:-1] + "+00:00"
-        events.sort(key=lambda e: e.get("ts", ""))
+        return page, nxt
     except (OSError, http.client.HTTPException, ValueError, AttributeError, TypeError):
         return None  # ValueError covers bad JSON; the rest a malformed body
+
+
+def socket_events(
+    episode: str | None = None,
+    task: str | None = None,
+    source: str | None = None,
+    timeout: float = 2.0,
+    since: str | None = None,
+) -> list[dict] | None:
+    """Page through the collector's /events; None on any failure."""
+    query = {k: v for k, v in (("episode", episode), ("task", task), ("source", source),
+                               ("since", since)) if v}
+    query["limit"] = 5000
+    events: list[dict] = []
+    while True:
+        got = _page(query, timeout)
+        if got is None:
+            return None
+        page, nxt = got
+        if not page:
+            break
+        query["after"] = nxt
+        events.extend(page)
+    events.sort(key=lambda e: e.get("ts", ""))
     return events
+
+
+def cursor() -> int | None:
+    """pulse's newest seq: take it before loading history, then follow(after=)
+    from it, skipping the history's ids, and nothing falls between the two.
+    None in file mode."""
+    if _file_mode():
+        return None
+    got = _page({"order": "desc", "limit": 1})
+    if got is None:
+        raise _unavailable()
+    page, nxt = got
+    return nxt or 0
 
 
 def file_events(
@@ -144,13 +190,14 @@ def tail(
 ) -> None:
     # `live`, not `follow`: the parameter shadowed follow() below and every
     # `heart pulse tail` crashed after its history (HEART-B19)
+    after = cursor() if live else None
     history = load_events(episode, task, source)
     for e in history[-n:]:
         print(render(e))
     if not live:
         return
     try:
-        for e in follow(seen=_ids(history)):
+        for e in follow(seen=_ids(history), after=after):
             if e is not None and _matches(e, episode, task, source):
                 print(render(e), flush=True)
     except KeyboardInterrupt:
@@ -161,9 +208,38 @@ def _ids(events: list[dict]) -> set[str]:
     return {e["id"] for e in events if e.get("id")}
 
 
-def follow(interval: float = 0.5, seen: set[str] | None = None):
-    """Yield events appended to the journal from now on, and None after each
-    poll that found nothing more, so a caller can send a keepalive.
+def follow(interval: float = 0.5, seen: set[str] | None = None, after: int | None = None):
+    """Yield events from now on, and None after each poll that found nothing
+    more, so a caller can send a keepalive.
+
+    From pulse's socket, past the `after` cursor (see cursor()), skipping
+    `seen` ids. HEART_PULSE=file tails the journal files instead, below.
+    """
+    if not _file_mode():
+        yield from _follow_socket(interval, seen, after)
+        return
+    yield from _follow_files(interval, seen)
+
+
+def _follow_socket(interval: float, seen: set[str] | None, after: int | None):
+    pos = cursor() if after is None else after
+    while True:
+        got = _page({"after": pos, "limit": 5000})
+        if got is None:
+            raise _unavailable()
+        page, nxt = got
+        for e in page:
+            if not (seen and e.get("id") in seen):
+                yield e
+        if page:
+            pos = nxt
+            continue
+        yield None
+        time.sleep(interval)
+
+
+def _follow_files(interval: float, seen: set[str] | None):
+    """The journal files, for HEART_PULSE=file.
 
     With `seen` (the ids of the history the caller just printed), start from
     the top of the last two day files instead and skip those ids. History
@@ -263,7 +339,7 @@ def _cutoff_iso(hours: float) -> str:
 def _window(hours: float) -> list[dict]:
     # all emitters write UTC isoformat, so lexicographic compare is safe
     cutoff = _cutoff_iso(hours)
-    return [e for e in load_events() if e.get("ts", "") >= cutoff]
+    return [e for e in load_events(since=cutoff) if e.get("ts", "") >= cutoff]
 
 
 def _payload(e: dict) -> dict:
