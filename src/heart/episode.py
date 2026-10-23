@@ -339,7 +339,7 @@ CORPUS_TIMEOUT = 20
 
 
 def _context_packet(task: TaskSpec, role: str, memory: str, out: Path,
-                    episode_id: str) -> dict:
+                    episode_id: str, retrieval: bool = True) -> dict:
     """Retrieve this subtask's memory on the host and write it into /context.
 
     Built here rather than fetched by the agent, which is what sandbox.py's
@@ -364,8 +364,12 @@ def _context_packet(task: TaskSpec, role: str, memory: str, out: Path,
     """
     context = out / "context"
     context.mkdir(parents=True, exist_ok=True)
-    if memory == "clean" or os.environ.get("ARTERIES_RETRIEVAL") == "off":
+    if memory == "clean":
         return {"status": "skipped", "reason": f"memory={memory}", "memories": []}
+    # the episode's retrieval=False lives in its own env dict, not os.environ,
+    # so checking only the process env let `:off` variants retrieve (HEART-B01)
+    if not retrieval or os.environ.get("ARTERIES_RETRIEVAL") == "off":
+        return {"status": "skipped", "reason": "retrieval=off", "memories": []}
 
     situation = _situation(task)
     env = {**os.environ, "ARTERIES_EPISODE_ID": episode_id,
@@ -840,7 +844,8 @@ def _run_episode(
                     continue
                 prompt = role["prompt"].format(prompt=task.prompt)
                 packet = {"role": role["name"],
-                          **_context_packet(task, role["name"], mem, out, episode_id)}
+                          **_context_packet(task, role["name"], mem, out, episode_id,
+                                            retrieval)}
                 packets.append(packet)
                 # Into the prompt, not just onto disk. /context was mounted read-only
                 # and filled for three turns before anyone noticed the agent never

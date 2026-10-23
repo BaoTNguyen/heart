@@ -2330,6 +2330,20 @@ class TestContextPacketEnv(unittest.TestCase):
                                             Path(tmp), "ep-1")
         return captured, result
 
+    def test_an_episode_with_retrieval_off_retrieves_nothing(self):
+        # HEART-B01: `:off` variants set ARTERIES_RETRIEVAL only in the
+        # episode's env dict, so the process env still read "on"
+        from heart import episode as ep
+
+        task = TaskSpec(task_id="t", repo_path=".", base_commit="0" * 40, prompt="p")
+        with tempfile.TemporaryDirectory() as tmp, \
+             unittest.mock.patch.object(ep.subprocess, "run",
+                                        side_effect=AssertionError("retrieved")), \
+             unittest.mock.patch.dict(os.environ, {"ARTERIES_RETRIEVAL": "on"}):
+            result = ep._context_packet(task, "implement", "normal", Path(tmp),
+                                        "ep-1", retrieval=False)
+        self.assertEqual(result["status"], "skipped")
+
     def test_session_id_is_the_task_id(self):
         captured, _ = self._run()
         # plexus names task ids <goal>-<feature>-a<attempt>, so roles of one
