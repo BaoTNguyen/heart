@@ -175,18 +175,23 @@ def _announce(source: str, journal: Path, state: Path | None) -> None:
     append(event(source, "context.started", payload=ctx), journal)
 
 
-def emit(source: str, kind: str, journal: Path, state: Path | None = None, **fields) -> None:
+def emit(source: str, kind: str, journal: Path, state: Path | None = None,
+         **fields) -> dict | None:
     """Write `kind` from `source` to the journal directory. Never raises.
 
     `fields` are envelope fields (episode_id, task_id, origin, ...) and/or
     `payload=` (a dict). `state` is a shared directory recording which contexts
     were already announced; pass vascular_paths.path("state", "pulse", "contexts").
+    Returns the line as written, or None if it was not, so a caller can
+    project exactly what the journal holds.
     """
     try:
         _announce(source, journal, state)
-        append(event(source, kind, **fields), journal)
+        ev = event(source, kind, **fields)
+        append(ev, journal)
+        return ev
     except Exception:
-        pass
+        return None
 
 
 def new_span() -> str:
