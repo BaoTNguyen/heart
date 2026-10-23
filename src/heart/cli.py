@@ -267,7 +267,7 @@ def _models_seen(hours: float) -> "defaultdict[str, int]":
     cutoff = (datetime.datetime.now(datetime.timezone.utc)
               - datetime.timedelta(hours=hours)).isoformat()
     seen: defaultdict[str, int] = defaultdict(int)
-    for event in pulse_mod.load_events():
+    for event in pulse_mod.load_events(since=cutoff):
         if str(event.get("ts") or "") < cutoff:
             continue
         model = (event.get("payload") or {}).get("model")

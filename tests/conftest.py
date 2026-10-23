@@ -48,3 +48,11 @@ def _journal_to_a_tmpdir(_isolated_state_dirs, monkeypatch):
     events, vascular = _isolated_state_dirs
     monkeypatch.setenv("EVENT_JOURNAL_DIR", str(events))
     monkeypatch.setenv("VASCULAR_HOME", str(vascular))
+
+
+@pytest.fixture(autouse=True)
+def _read_the_test_journal(monkeypatch):
+    """Readers take events from pulse's socket with no silent file fallback
+    (B11), and no collector serves a test's tmp journal: read its files on
+    purpose. Socket tests delenv this."""
+    monkeypatch.setenv("HEART_PULSE", "file")

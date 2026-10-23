@@ -127,12 +127,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         cutoff = pulse._cutoff_iso(hours)
         try:
-            history = pulse.load_events()
+            after = pulse.cursor()  # before history: nothing falls between
+            history = pulse.load_events(since=cutoff)
             for e in history:
                 if e.get("ts", "") >= cutoff:
                     self._event(e)
-            # the same tail `pulse tail` reads, covering the collector's lag
-            for e in pulse.follow(interval=1, seen=pulse._ids(history)):
+            for e in pulse.follow(interval=1, seen=pulse._ids(history), after=after):
                 if e is not None:
                     self._event(e)
                     continue
