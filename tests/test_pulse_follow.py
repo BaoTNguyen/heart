@@ -5,7 +5,7 @@ for good, and a file born mid-follow (UTC midnight) lost its first events."""
 
 import json
 
-from heart import pulse
+from heart import observe as pulse
 
 
 def _line(n: int) -> bytes:

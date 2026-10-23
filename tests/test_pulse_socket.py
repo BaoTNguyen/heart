@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from heart import pulse
+from heart import observe as pulse
 
 PAGES = [
     {"events": [{"seq": 1, "ts": "2026-10-20T00:00:03", "source": "heart", "kind": "b"},

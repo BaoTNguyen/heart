@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import mine as mine_mod
 from .env import reclaim as env_reclaim
-from . import pulse as pulse_mod
+from . import observe as pulse_mod
 from . import vascular_paths
 from .detect import detect_verifiers
 from .events import emit
@@ -361,7 +361,17 @@ def cmd_models(args) -> int:
     return 0
 
 
-def cmd_pulse(args) -> int:
+def _pulse_cli(argv: list[str]) -> int | None:
+    """Run the pulse CLI in place of this process; None when it isn't
+    installed, so the caller falls back to reading in-process. The generic
+    tail and timeline are pulse's now (A6)."""
+    exe = shutil.which("pulse")
+    if exe is None:
+        return None
+    os.execv(exe, [exe, *argv, "--text"])
+
+
+def cmd_observe(args) -> int:
     if args.what == "serve":
         # serve imports cli at module scope; lazy here breaks the cycle.
         from . import serve as serve_mod
@@ -369,14 +379,15 @@ def cmd_pulse(args) -> int:
         return 0
     if args.what == "episode":
         if not args.id:
-            print("usage: heart pulse episode <episode-id>", file=sys.stderr)
+            print("usage: heart observe episode <episode-id>", file=sys.stderr)
             return 2
+        _pulse_cli(["events", "--episode", args.id])
         for line in pulse_mod.episode_timeline(args.id):
             print(line)
         return 0
     if args.what == "goal":
         if not args.id:
-            print("usage: heart pulse goal <goal-id>", file=sys.stderr)
+            print("usage: heart observe goal <goal-id>", file=sys.stderr)
             return 2
         for line in pulse_mod.goal_timeline(args.id):
             print(line)
@@ -387,7 +398,7 @@ def cmd_pulse(args) -> int:
         return 0
     if args.what == "compare":
         if not args.day:
-            print("usage: heart pulse compare --day YYYY-MM-DD", file=sys.stderr)
+            print("usage: heart observe compare --day YYYY-MM-DD", file=sys.stderr)
             return 2
         lines, code = pulse_mod.compare(args.day)
         for line in lines:
@@ -398,6 +409,15 @@ def cmd_pulse(args) -> int:
         for line in lines:
             print(line)
         return code
+    if not args.once and shutil.which("pulse"):
+        # history first, as heart's tail always did; pulse tail starts at the
+        # newest event. ponytail: an event landing during the exec is missed
+        pulse_mod.tail(n=args.n, episode=args.episode, task=args.task,
+                       source=args.source, live=False)
+        sys.stdout.flush()
+        filters = [x for flag, v in (("--episode", args.episode), ("--task", args.task),
+                                     ("--source", args.source)) if v for x in (flag, v)]
+        _pulse_cli(["tail", *filters])
     pulse_mod.tail(
         n=args.n, episode=args.episode, task=args.task,
         source=args.source, live=not args.once,
@@ -551,7 +571,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--runs-dir", default="runs")
     p.set_defaults(func=cmd_stats)
 
-    p = sub.add_parser("pulse", help="event spine: tail | episode <id> | goal <id> | insights | health | compare --day D")
+    p = sub.add_parser("observe", aliases=["pulse"],
+                       help="episode analysis: tail | episode <id> | goal <id> | insights | health | compare --day D | serve")
     p.add_argument("what", nargs="?", default="tail",
                    choices=["tail", "episode", "goal", "insights", "health", "compare", "serve"])
     p.add_argument("--port", type=int, default=7717, help="port for `pulse serve`")
@@ -565,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", default=None, help="filter by source (heart|arteries|marrow|agent)")
     p.add_argument("--once", action="store_true", help="print and exit; don't follow")
     p.add_argument("--day", default=None, help="UTC day YYYY-MM-DD for `pulse compare`")
-    p.set_defaults(func=cmd_pulse)
+    p.set_defaults(func=cmd_observe)
 
     p = sub.add_parser("models", help="rate card: check | set-price")
     p.add_argument("what", nargs="?", default="check", choices=["check", "set-price"])

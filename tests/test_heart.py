@@ -436,7 +436,7 @@ class TestHeart(unittest.TestCase):
             os.environ.update(old)
 
     def test_auto_routing_runs_episode(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         old = dict(os.environ)
         try:
@@ -573,7 +573,7 @@ class TestHeart(unittest.TestCase):
             self.assertEqual((out / "steer.txt").read_text(), "")  # truncated after consuming
 
     def test_steer_mid_run_appends_to_next_role_and_emits_event(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         # role1's own shell script drops a steer note into its own out dir
         # (known via $ARTERIES_EPISODE_ID + the fixed runs_dir); episode.py's
@@ -627,7 +627,7 @@ class TestHeart(unittest.TestCase):
         self.assertEqual(path_violations(d2, [], ["secret"]), [])
 
     def test_event_spine(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         ep = self.run_ep(FIX_CMD)
         events = pulse.load_events(episode=ep["episode_id"])
@@ -651,7 +651,7 @@ class TestHeart(unittest.TestCase):
         self.assertIn("episode.started", buf.getvalue())
 
     def test_render(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         e = {"ts": "2026-07-19T10:00:01.500000+00:00", "source": "heart",
              "kind": "role.finished", "role": "dev", "duration_ms": 42,
@@ -668,7 +668,7 @@ class TestHeart(unittest.TestCase):
         self.assertIn("10:00:01", pulse.render(e))
 
     def test_episode_crash_emits_failed(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         bad = TaskSpec(**{**self.task.__dict__, "repo_path": str(self.root / "nonexistent")})
         with self.assertRaises((RuntimeError, OSError)):
@@ -1606,7 +1606,7 @@ class TestCost(unittest.TestCase):
                 os.environ["VASCULAR_HOME"] = old
 
     def test_episode_usage_is_none_for_shell_agent_and_insights_survives(self):
-        from heart import pulse
+        from heart import observe as pulse
         from heart.episode import run_episode
 
         old_journal = os.environ.get("EVENT_JOURNAL_DIR")
@@ -1836,7 +1836,7 @@ class TestGoalLineage(unittest.TestCase):
             f.write(json.dumps(event) + "\n")
 
     def test_goal_timeline_groups_by_feature_then_episode(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         self._write(ts="2026-01-01T00:00:00+00:00", source="heart", kind="episode.finished",
                     episode_id="ep1", task_id="t1",
@@ -1860,7 +1860,7 @@ class TestGoalLineage(unittest.TestCase):
         self.assertFalse(any("ep-other" in l for l in lines))
 
     def test_goal_timeline_empty(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         self.assertEqual(pulse.goal_timeline("nope"), ["no events for goal nope"])
 
@@ -1897,7 +1897,7 @@ class TestHealthRules(unittest.TestCase):
             f.write(json.dumps(event) + "\n")
 
     def test_review2_reject_streak_warns(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         now = datetime.datetime.now(datetime.timezone.utc)
         for i, verdict in enumerate(["approve", "reject", "reject", "reject"]):
@@ -1909,7 +1909,7 @@ class TestHealthRules(unittest.TestCase):
         self.assertTrue(any("reject" in l.lower() and "streak" in l.lower() for l in lines))
 
     def test_review2_reject_streak_ok_when_mixed(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         now = datetime.datetime.now(datetime.timezone.utc)
         for i, verdict in enumerate(["reject", "approve", "reject"]):
@@ -1920,7 +1920,7 @@ class TestHealthRules(unittest.TestCase):
         self.assertFalse(any("streak" in l.lower() for l in lines))
 
     def test_cost_alert(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         self._write(ts=now, source="heart", kind="episode.finished", episode_id="ep1",
@@ -1940,7 +1940,7 @@ class TestHealthRules(unittest.TestCase):
         self.assertTrue(any("cost" in l.lower() and "10.00" in l for l in lines))
 
     def test_silent_stall_warns_when_goal_active(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         old_ts = "2026-01-01T00:00:00+00:00"
         self._write(ts=old_ts, source="heart", kind="episode.started", episode_id="ep-old")
@@ -1957,7 +1957,7 @@ class TestHealthRules(unittest.TestCase):
         self.assertTrue(any("stall" in l.lower() for l in lines))
 
     def test_silent_stall_inert_without_env(self):
-        from heart import pulse
+        from heart import observe as pulse
 
         old_ts = "2026-01-01T00:00:00+00:00"
         self._write(ts=old_ts, source="heart", kind="episode.started", episode_id="ep-old")
@@ -1982,7 +1982,7 @@ class TestPulseServe(unittest.TestCase):
         try:
             base = f"http://127.0.0.1:{httpd.server_address[1]}"
             page = urllib.request.urlopen(base + "/").read().decode()
-            self.assertIn("heart pulse", page)
+            self.assertIn("heart observe", page)
             api = json.loads(urllib.request.urlopen(base + "/api/insights?hours=1").read())
             self.assertIn("insights", api)
             self.assertIn("health", api)
