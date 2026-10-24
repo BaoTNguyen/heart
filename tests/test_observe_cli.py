@@ -37,3 +37,10 @@ def test_without_pulse_the_timeline_is_read_in_process(capsys):
             patch.object(cli.pulse_mod, "episode_timeline", return_value=["line"]):
         assert cli.main(["observe", "episode", "ep-1"]) == 0
     assert capsys.readouterr().out == "line\n"
+
+
+def test_the_old_module_name_still_imports():
+    # replaying old plexus commits imports heart.pulse (F28)
+    from heart.pulse import load_events
+    from heart.observe import load_events as current
+    assert load_events is current
