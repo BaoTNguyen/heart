@@ -230,3 +230,8 @@ tasks/mined-*/
 .marrow/
 .claude/settings.local.json
 .codex/config.toml
+
+# Private, never committed anywhere: agent reasoning traces and compaction
+# transcripts (DIRECTION §14).
+*reasoning_trace*
+.compaction-corpus/
