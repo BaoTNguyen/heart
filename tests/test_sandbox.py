@@ -117,6 +117,17 @@ def test_a_verifier_never_gets_the_network_even_when_the_task_asks():
     assert _verifier(_task(network="build")).network == "none"
 
 
+def test_a_verifier_reads_journals_the_way_an_unsandboxed_one_would(monkeypatch):
+    """HEART_PULSE picks how journals are read; a verifier on the host inherits
+    it, so one in a container must too, and nothing else of the host env."""
+    monkeypatch.setenv("HEART_PULSE", "file")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-x")
+    env = _verifier(_task()).env
+    assert env["HEART_PULSE"] == "file" and "ANTHROPIC_API_KEY" not in env
+    monkeypatch.delenv("HEART_PULSE")
+    assert "HEART_PULSE" not in _verifier(_task()).env
+
+
 def test_a_verifier_cannot_read_the_continuity_packet():
     """It judges code, not memory. A verifier that can read the packet can be
     steered by it."""
