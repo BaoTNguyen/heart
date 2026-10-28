@@ -1066,6 +1066,9 @@ def verifier_profile_for(
             # must never decide whether a verifier passes
             "PYTHONDONTWRITEBYTECODE": "1",
             **CACHE_ENV,
+            # how journals are read, not a credential: an unsandboxed verifier
+            # inherits it, and old suites need it (plexus replay, 2026-10-28)
+            **({"HEART_PULSE": os.environ["HEART_PULSE"]} if os.environ.get("HEART_PULSE") else {}),
         },
         memory=os.getenv("HEART_SANDBOX_MEMORY", "4g"),
         cpus=os.getenv("HEART_SANDBOX_CPUS", "2"),
