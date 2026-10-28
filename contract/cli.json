@@ -1,0 +1,63 @@
+{
+ "about": "Black-box cases for the heart CLI, run against whatever $HEART_BIN names (default: this checkout's `heart`). No model is needed: episodes use the shell agent, which runs the task prompt as bash. Each case starts from a fresh copy of `repo` committed once, with `task` written to task.json (repo_path and base_commit filled in, `prompt` overridden per step). A step runs `heart <args>` from the case dir, `{task}` and `{runs}` replaced by the task file and a runs dir private to the case, and checks the exit code and that stdout contains every `stdout_has` string. `stdout_json` keys must equal the fields of the JSON object on stdout. After `heart run`, the newest run dir must hold every `artifacts` file and its episode.json every `episode_fields` key. v1 and v2 pass the same cases (DIRECTION §13).",
+ "repo": {
+  "calc.py": "def add(a, b):\n    return a - b\n",
+  "test_calc.py": "import unittest\nfrom calc import add\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n"
+ },
+ "task": {
+  "task_id": "toy",
+  "denied_paths": ["test_calc.py"],
+  "public_verifiers": [{"name": "unit", "command": "python3 -m unittest -q test_calc"}],
+  "timeout_seconds": 60
+ },
+ "artifacts": ["episode.json", "diff.patch"],
+ "episode_fields": ["episode_id", "task_id", "agent", "outcome", "blocked_reason", "diff_lines",
+                    "verifier_results", "review_verdict", "review_findings", "roles", "usage"],
+ "cases": [
+  {
+   "name": "a fix that turns the verifier green passes and exits 0",
+   "steps": [
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "sed -i 's/a - b/a + b/' calc.py",
+     "exit": 0, "stdout_json": {"task_id": "toy", "outcome": "pass", "diff_lines": 2}}
+   ]
+  },
+  {
+   "name": "a change the verifier rejects fails and exits 1",
+   "steps": [
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "sed -i 's/a - b/a * b/' calc.py",
+     "exit": 1, "stdout_json": {"outcome": "fail"}}
+   ]
+  },
+  {
+   "name": "an agent that changes nothing is no_change and exits 1",
+   "steps": [
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "true",
+     "exit": 1, "stdout_json": {"outcome": "no_change", "diff_lines": 0}}
+   ]
+  },
+  {
+   "name": "editing a denied path is a path_violation and exits 1",
+   "steps": [
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "echo '# x' >> test_calc.py",
+     "exit": 1, "stdout_json": {"outcome": "path_violation"}}
+   ]
+  },
+  {
+   "name": "stats and export read back the runs dir",
+   "steps": [
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "sed -i 's/a - b/a + b/' calc.py", "exit": 0},
+    {"args": ["run", "{task}", "--agent", "shell", "--runs-dir", "{runs}"],
+     "prompt": "true", "exit": 1},
+    {"args": ["stats", "--runs-dir", "{runs}"],
+     "exit": 0, "stdout_has": ["pass%", "no_change=1", "pass=1"]},
+    {"args": ["export", "--runs-dir", "{runs}", "--out", "out.jsonl"],
+     "exit": 0, "stdout_has": ["2 episodes -> out.jsonl"]}
+   ]
+  }
+ ]
+}
