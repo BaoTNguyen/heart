@@ -19,3 +19,5 @@ table is stale.
 | Decision | Date |
 |---|---|
 | [GitHub enforces PR plus CI on main](https://github.com/BaoTNguyen/vascular/blob/main/docs/adr/2026-10-30-protect-main.md) | 2026-10-30 |
+| [A feature lives in the repo whose question it answers](https://github.com/BaoTNguyen/vascular/blob/main/docs/adr/2026-07-20-ownership-by-question.md) | 2026-07-20 |
+| [Seams are pinned by contract tests in each repo](https://github.com/BaoTNguyen/vascular/blob/main/docs/adr/2026-07-20-contract-tests.md) | 2026-07-20 |
