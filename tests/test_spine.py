@@ -1,5 +1,5 @@
-"""Spine conformance + env-propagation contract tests (STACK_READINESS.md §1.2
-items 1 and 3). Separate from test_heart.py by request.
+"""Spine conformance + env-propagation contract tests (vascular docs/adr/
+2026-07-20-contract-tests.md). Separate from test_heart.py by request.
 
 Run: python3 -m unittest discover -s tests -q
 """
