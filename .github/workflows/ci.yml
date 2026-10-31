@@ -13,6 +13,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: heart
+      - run: python3 heart/docs/adr/index.py --check
 
       # heart's own import of arteries is optional (episode.py guards it), but
       # two tests assert the arteries subagent contract on purpose — that seam is
