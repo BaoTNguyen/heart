@@ -1,12 +1,12 @@
-# heart
+# About
 
-Agent orchestration and RL environment runtime for coding. Heart runs coding
-agents in isolated git worktrees, orchestrates them through coding-specific
-workflows, verifies their work against real test suites, scores it, and exports
-the results as training data.
+heart is part of [vascular](https://github.com/BaoTNguyen/vascular), the software factory
+monorepo. This repo acts as the runtime that runs coding agents and checks their work
+against real test suites.
 
-heart is part of [vascular](https://github.com/BaoTNguyen/vascular), the
-monorepo that holds the whole stack in one clone.
+Heart runs coding agents in isolated git worktrees, orchestrates them through
+coding-specific workflows, verifies their work against real test suites, scores
+it, and exports the results as training data.
 
 Stdlib-only on purpose: it installs anywhere in seconds, and other code can
 import it as a library.
