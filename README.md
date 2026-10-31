@@ -5,18 +5,11 @@ agents in isolated git worktrees, orchestrates them through coding-specific
 workflows, verifies their work against real test suites, scores it, and exports
 the results as training data.
 
-It sits on top of two sibling systems and below two:
+heart is part of [vascular](https://github.com/BaoTNguyen/vascular), the
+monorepo that holds the whole stack in one clone.
 
-```text
-capillaries  prompt/skill retrieval   (rides along via arteries)
-arteries     memory + trace substrate (rides along via CLI hooks)
-heart        orchestration + environment + verify   <- this repo
-plexus       goal decomposition + acceptance loop (imports heart as a library)
-marrow       RL training on heart's exported episodes (separate repo)
-```
-
-Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
-as a library.
+Stdlib-only on purpose: it installs anywhere in seconds, and other code can
+import it as a library.
 
 ## Recovering a CLI session after a usage limit
 
@@ -89,8 +82,7 @@ Without a PATH installation, use `uv run --project /path/to/heart heart ...`
 or the checkout's `.venv/bin/heart` entrypoint.
 
 Episodes carry an outcome (`pass`, `fail`, `blocked`, `path_violation`, ...), not
-a reward. Reward assignment was removed on 2026-10-13 until marrow's link to
-pulse is reworked.
+a reward. Reward assignment was removed on 2026-10-13.
 
 ## What sets it apart
 
@@ -115,10 +107,10 @@ training data:
 - **It is an RL environment, not just an orchestrator.** `heart mine` builds
   TaskSpecs from git history, `heart batch --candidates N` is best-of-N that
   doubles as a data engine, and `heart export`/`heart dataset` emit SFT and DPO
-  files. Marrow trains on exactly what heart ran.
+  files. A trainer sees exactly what heart ran.
 - **Observability built for unattended runs.** An append-only NDJSON spine feeds
-  `pulse health` (exit code as the alert primitive), a systemd health timer, and
-  `pulse serve` — the whole factory floor as one localhost HTML page with live
+  `heart observe health` (exit code as the alert primitive), a systemd health timer, and
+  `heart observe serve` — the whole factory floor as one localhost HTML page with live
   episode cards you can steer mid-run, no build step.
 - **Routing by declared capability.** `--agent auto` scores each model in a manifest against
   the task's inferred skills, difficulty, and context size, filters to the ones
@@ -148,10 +140,8 @@ enough): inside the sandbox the verifier inherits `EVENT_JOURNAL_DIR=/journal`,
 which is the real inbox. A test that needs a specific journal sets it with
 `monkeypatch` inside the test.
 
-heart stands alone. With [arteries](https://github.com/BaoTNguyen/arteries)
-installed beside it (`uv tool install --editable . --with-editable ../arteries`),
-orchestration workers also share memory; the whole stack
-comes as one clone with `git clone --recursive https://github.com/BaoTNguyen/vascular`.
+heart stands alone. Installed as part of
+[vascular](https://github.com/BaoTNguyen/vascular), its workers also share memory.
 
 ## Daily use
 
@@ -202,10 +192,10 @@ reasoning trace can't consume the whole budget and return an empty answer.
 Put a hot-swap model manager behind the fixed port and the model can change
 underneath without the profiles changing.
 
-CLI agents keep arteries memory/retrieval hooks alive if installed in the
-target repo (episode worktrees carry the repo's `.arteries/` and CLI hook
-config); the `api` agent calls the repo's observe hook itself, and is also how
-a marrow-trained model acts as the coding agent.
+CLI agents keep a target repo's memory hooks alive (episode worktrees carry
+the repo's `.vascular/` hook files and CLI hook config); the `api` agent calls
+the repo's observe hook itself, and is also how a locally trained model acts as
+the coding agent.
 
 ### Model routing (`--agent auto`)
 
@@ -247,7 +237,7 @@ quality is auditable in the journal and can later train a learned gate.
 ### Fleet concurrency: one local model, many callers
 
 `HEART_MAX_AGENTS` bounds one process. When several processes run at once — a
-`heart batch`, or a few `plexus run` goals working different repos — they each
+`heart batch`, or a few goal loops driving heart in different repos — they each
 get their own cap, and if they route `small`-tier work to the *same* local model
 server they sum to N×8 requests against one GPU. Two knobs bound the total,
 both opt-in (unset or `0` changes nothing):
@@ -287,7 +277,7 @@ seat (`claude`, `codex`). What routing optimizes depends on that mix:
   Keep concurrency modest on subscription tiers — window throttling surfaces
   as slow/failing turns, not clean retryable errors.
 - **Local models**: near-free capacity that doubles as the RL data engine —
-  `small`-tier episodes are marrow's training traffic, and trained checkpoints
+  `small`-tier episodes are training traffic, and trained checkpoints
   redeploy into the same profile slot.
 
 Routing can't see remaining subscription quota (no CLI exposes it); when a
@@ -317,7 +307,7 @@ Four coding-specific mechanisms, composable per run:
 
 Operational switches:
 
-- **Sandbox** (`HEART_SANDBOX=docker`): every agent role and every verifier
+- **Sandbox** (`HEART_SANDBOX=docker-sbx`): every agent role and every verifier
   runs in a container whose mount table is derived from the task spec —
   `allowed_paths` writable, `denied_paths` read-only, the rest of the worktree
   read-only, no host home, no rootfs writes, all capabilities dropped. The
@@ -387,7 +377,7 @@ Operational switches:
         --entrypoint python3 heart-agent:latest /proxy.py
       docker network connect heart-egress egress
 
-      HEART_SANDBOX=docker HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
+      HEART_SANDBOX=docker-sbx HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
 
   `--restart unless-stopped` is not decoration: a Docker Desktop update killed
   the proxy with 137 mid-session and the next run had no route out.
@@ -488,7 +478,7 @@ Operational switches:
   `summary.csv`, so an interrupted batch continues where it died. Fresh runs
   dir = full re-run.
 - **Episode ingest**: after `run`/`work`/`batch`, heart calls `art episodes` on
-  the runs dir when arteries' CLI is on PATH (best-effort subprocess; heart
+  the runs dir when that memory CLI is on PATH (best-effort subprocess; heart
   stays stdlib-only). `HEART_INGEST=off` disables. `heart ingest [runs-dir]`
   re-runs the sweep any time (dedup makes it safe).
 - `heart observe insights` includes a routing scorecard (pass rate per tier) —
@@ -502,7 +492,7 @@ Operational switches:
   - **Everything else prices at the map's API rates, including subscription
     seats.** A Claude Pro/Max seat's marginal cost is zero, but pricing `claude`
     at Anthropic's published rates records the spend it *would* cost, so routing
-    and `pulse insights` compare tiers on real dollars. Give each seat its own
+    and `heart observe insights` compare tiers on real dollars. Give each seat its own
     API-equivalent entry:
     ```json
     "pricing": {
@@ -515,7 +505,7 @@ Operational switches:
     model behind each seat.)
 - **`heart observe`** (was `heart pulse`, still accepted): heart's own episode
   analysis. Its generic `tail` and `episode <id>` timeline hand off to
-  `pulse tail --text` / `pulse events --text` when pulse is installed.
+  the stack's event store (`tail --text` / `events --text`) when it is installed.
 - **`heart observe serve`**: the factory floor as a local web page
   (http://127.0.0.1:7717) — live episode board, event stream, and insights,
   all from the same NDJSON journal the terminal tools read. Stdlib HTTP + SSE,
@@ -523,8 +513,8 @@ Operational switches:
 - **`heart observe goal <goal-id>`**: goal lineage — features → episodes →
   outcome/cost, grouped from `episode.finished` events whose payload
   carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
-  from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
-- **Steering + episode drill-down** (`pulse serve`): running-episode cards get
+  from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env, which a goal loop sets when it dispatches).
+- **Steering + episode drill-down** (`heart observe serve`): running-episode cards get
   a one-line text box — `POST /api/steer?episode=<id>` drops a note into that
   episode's runs dir, which the next role turn (or fix-loop attempt) appends
   to its prompt as an operator note and logs a `steer.received` event.
@@ -533,9 +523,9 @@ Operational switches:
 - **Health alerting timer**: `contrib/heart-health.timer` + `.service` are
   systemd **user** units (no sudo) that run `heart observe health --hours 1`
   every 10 minutes and fire a `notify-send` (plus an optional `ntfy.sh` push
-  via `NTFY_TOPIC`) on the first WARN line. `pulse health` also now flags a
+  via `NTFY_TOPIC`) on the first WARN line. `heart observe health` also flags a
   review2-reject streak (3 most recent reviewed episodes all rejected), a
-  `HEART_COST_ALERT` dollar ceiling on window spend, and (once plexus wires
+  `HEART_COST_ALERT` dollar ceiling on window spend, and (once a goal loop sets
   `PLEXUS_GOAL_ACTIVE`) a silently-stalled factory.
 - **Static verifiers**: `detect_verifiers` also picks up `ruff`, `mypy`,
   `tsc`, `eslint`, and `biome` when both the tool's config and the tool
@@ -569,7 +559,7 @@ heart dataset sft --out sft.jsonl && heart dataset dpo --out dpo.jsonl
 Gaming the verifier is blocked structurally: verification happens on a fresh
 worktree with only the agent's diff applied, and `allowed_paths` /
 `denied_paths` violations fail the episode. `tasks/holdout/` is never trained
-on — it's the evaluation set for marrow checkpoints.
+on — it's the evaluation set for trained checkpoints.
 
 ## Design notes
 
