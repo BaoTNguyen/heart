@@ -13,6 +13,7 @@ arteries     memory + trace substrate (rides along via CLI hooks)
 heart        orchestration + environment + verify   <- this repo
 plexus       goal decomposition + acceptance loop (imports heart as a library)
 marrow       RL training on heart's exported episodes (separate repo)
+pulse        event journal: collection, store, queries
 ```
 
 Stdlib-only on purpose: it installs anywhere in seconds, and marrow imports it
@@ -117,8 +118,8 @@ training data:
   doubles as a data engine, and `heart export`/`heart dataset` emit SFT and DPO
   files. Marrow trains on exactly what heart ran.
 - **Observability built for unattended runs.** An append-only NDJSON spine feeds
-  `pulse health` (exit code as the alert primitive), a systemd health timer, and
-  `pulse serve` — the whole factory floor as one localhost HTML page with live
+  `heart observe health` (exit code as the alert primitive), a systemd health timer, and
+  `heart observe serve` — the whole factory floor as one localhost HTML page with live
   episode cards you can steer mid-run, no build step.
 - **Routing by declared capability.** `--agent auto` scores each model in a manifest against
   the task's inferred skills, difficulty, and context size, filters to the ones
@@ -317,7 +318,7 @@ Four coding-specific mechanisms, composable per run:
 
 Operational switches:
 
-- **Sandbox** (`HEART_SANDBOX=docker`): every agent role and every verifier
+- **Sandbox** (`HEART_SANDBOX=docker-sbx`): every agent role and every verifier
   runs in a container whose mount table is derived from the task spec —
   `allowed_paths` writable, `denied_paths` read-only, the rest of the worktree
   read-only, no host home, no rootfs writes, all capabilities dropped. The
@@ -387,7 +388,7 @@ Operational switches:
         --entrypoint python3 heart-agent:latest /proxy.py
       docker network connect heart-egress egress
 
-      HEART_SANDBOX=docker HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
+      HEART_SANDBOX=docker-sbx HEART_SANDBOX_PROXY=http://egress:8888 heart run task.json
 
   `--restart unless-stopped` is not decoration: a Docker Desktop update killed
   the proxy with 137 mid-session and the next run had no route out.
@@ -502,7 +503,7 @@ Operational switches:
   - **Everything else prices at the map's API rates, including subscription
     seats.** A Claude Pro/Max seat's marginal cost is zero, but pricing `claude`
     at Anthropic's published rates records the spend it *would* cost, so routing
-    and `pulse insights` compare tiers on real dollars. Give each seat its own
+    and `heart observe insights` compare tiers on real dollars. Give each seat its own
     API-equivalent entry:
     ```json
     "pricing": {
@@ -524,7 +525,7 @@ Operational switches:
   outcome/cost, grouped from `episode.finished` events whose payload
   carries `goal_id`/`feature_id` (stamped automatically by `events.emit()`
   from `PLEXUS_GOAL_ID`/`PLEXUS_FEATURE_ID` env when plexus is dispatching).
-- **Steering + episode drill-down** (`pulse serve`): running-episode cards get
+- **Steering + episode drill-down** (`heart observe serve`): running-episode cards get
   a one-line text box — `POST /api/steer?episode=<id>` drops a note into that
   episode's runs dir, which the next role turn (or fix-loop attempt) appends
   to its prompt as an operator note and logs a `steer.received` event.
@@ -533,7 +534,7 @@ Operational switches:
 - **Health alerting timer**: `contrib/heart-health.timer` + `.service` are
   systemd **user** units (no sudo) that run `heart observe health --hours 1`
   every 10 minutes and fire a `notify-send` (plus an optional `ntfy.sh` push
-  via `NTFY_TOPIC`) on the first WARN line. `pulse health` also now flags a
+  via `NTFY_TOPIC`) on the first WARN line. `heart observe health` also flags a
   review2-reject streak (3 most recent reviewed episodes all rejected), a
   `HEART_COST_ALERT` dollar ceiling on window spend, and (once plexus wires
   `PLEXUS_GOAL_ACTIVE`) a silently-stalled factory.
